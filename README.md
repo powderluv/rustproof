@@ -72,6 +72,6 @@ cargo xtask run                            # build → image → VFIO-bind (no-F
 
 ## License
 
-Dual-licensed under either **MIT** or **Apache-2.0** at your option — the standard Rust-ecosystem convention. This is a default and can change; nothing about the project depends on it yet.
+Licensed under the **MIT License** — see [`LICENSE`](LICENSE).
 
-*Unless you state otherwise, any contribution you submit is dual-licensed as above, per Apache-2.0 §5.*
+*Unless you state otherwise, any contribution you submit is licensed under MIT.*
