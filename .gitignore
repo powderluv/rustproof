@@ -26,7 +26,7 @@ firmware/
 .vscode/*
 !.vscode/extensions.json
 
-# Local env (shark-a creds live in gitignored env files, never in scripts)
+# Local env (gpu-host creds live in gitignored env files, never in scripts)
 *.env
 !example.env
 vm.env

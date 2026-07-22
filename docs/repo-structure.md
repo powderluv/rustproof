@@ -1,6 +1,6 @@
 # `docs/repo-structure.md` — Rustproof: Repo Structure, Cargo Workspace, Toolchain & Boot
 
-> Scope of this doc: the on-disk layout, the Cargo workspace, toolchain pinning for reproducible Verus proofs, the bare-metal build targets, the KVM/libvirt boot path on `shark-a`, how the untrusted C++ `lite::` driver is vendored and hosted, and exactly what compiles at scaffold time vs. what is a stub. It does **not** re-litigate the decided architecture (new ~6–8K-SLOC Rust+Verus nucleus; `lite::` runs untrusted in userspace; Verus + Kani; DMA-reach proof over nucleus-owned AMD-Vi tables becomes load-bearing only at M3/M4).
+> Scope of this doc: the on-disk layout, the Cargo workspace, toolchain pinning for reproducible Verus proofs, the bare-metal build targets, the KVM/libvirt boot path on `gpu-host`, how the untrusted C++ `lite::` driver is vendored and hosted, and exactly what compiles at scaffold time vs. what is a stub. It does **not** re-litigate the decided architecture (new ~6–8K-SLOC Rust+Verus nucleus; `lite::` runs untrusted in userspace; Verus + Kani; DMA-reach proof over nucleus-owned AMD-Vi tables becomes load-bearing only at M3/M4).
 
 ---
 
@@ -122,7 +122,7 @@ rustproof/
 │   │   └── CMakeLists.txt        #   builds a static libamd_lite.a against driver-shim
 │   └── limine/                  # git submodule: pinned Limine bootloader binaries (§3)
 │
-├── tools/                       # host-side build/verify/run helpers (std, run on shark-a)
+├── tools/                       # host-side build/verify/run helpers (std, run on gpu-host)
 │   ├── xtask/                   # bin: `cargo xtask build|image|run|verify` orchestrator
 │   │   └── src/main.rs
 │   ├── mkimage/                 # builds the Limine boot ISO (nucleus + init + driver-host)
@@ -131,7 +131,7 @@ rustproof/
 │
 ├── libvirt/
 │   ├── rustproof-gpu.xml         # domain template: direct-boot ISO + gfx1201 <hostdev>
-│   └── start-rustproof-vm.sh     # thin fork of gist-tri-os/start-gpu-vm.sh (VM=rustproof-gpu)
+│   └── start-rustproof-vm.sh     # thin fork of start-gpu-vm.sh (VM=rustproof-gpu)
 │
 ├── ci/
 │   ├── verify.yml                # proof job: pinned toolchain, `cargo xtask verify`
@@ -272,11 +272,11 @@ runner = "cargo run -p run-vm --"
 
 **Why Limine over writing our own trampoline:** M1/M2 want the smallest possible amount of unverifiable early-boot assembly. Limine gets us into long mode with paging and a clean memory map before our first Rust instruction, so `arch-x86_64/boot.rs` is a handful of request structs rather than a mode-switch + paging bring-up we'd have to hand-audit.
 
-**Boot path for the M0 shark-a libvirt flow: PVH direct-boot.** Emit a **PVH ELF note** (or multiboot2 header) in `nucleus` so QEMU/libvirt can direct-boot it via `<kernel>` / `-kernel nucleus.elf` with **no ISO** — the simplest fit for the passthrough domain, and the M0 plan builds this early memory-map/paging glue as task T0.1. **Limine-on-ISO is retained as the standalone/dev alternative** (behind `--features limine-iso`) for booting outside libvirt; the two paths share everything above the handoff. *(Reconciled 2026-07-21: this section previously made Limine the default; PVH is the default for the shark-a M0 flow, matching implementation-plan.md §5.)*
+**Boot path for the M0 gpu-host libvirt flow: PVH direct-boot.** Emit a **PVH ELF note** (or multiboot2 header) in `nucleus` so QEMU/libvirt can direct-boot it via `<kernel>` / `-kernel nucleus.elf` with **no ISO** — the simplest fit for the passthrough domain, and the M0 plan builds this early memory-map/paging glue as task T0.1. **Limine-on-ISO is retained as the standalone/dev alternative** (behind `--features limine-iso`) for booting outside libvirt; the two paths share everything above the handoff. *(Reconciled 2026-07-21: this section previously made Limine the default; PVH is the default for the gpu-host M0 flow, matching implementation-plan.md §5.)*
 
-### 3.3 How it slots into the existing shark-a libvirt/QEMU flow
+### 3.3 How it slots into the existing gpu-host libvirt/QEMU flow
 
-The existing `gist-tri-os/start-gpu-vm.sh` already does the hard, gfx1201-specific part: it (1) binds the card (`1002:7551`, BDF `0000:c3:00.0` + audio `.1`) to `vfio-pci`, (2) **clears `reset_method`** so the VBIOS POST state survives into the guest (the FLR would wipe PSP-SOS/SMU state the bring-up needs), then (3) `virsh start $VM` and waits for guest readiness.
+The existing `start-gpu-vm.sh` already does the hard, gfx1201-specific part: it (1) binds the card (`1002:7551`, BDF `0000:03:00.0` + audio `.1`) to `vfio-pci`, (2) **clears `reset_method`** so the VBIOS POST state survives into the guest (the FLR would wipe PSP-SOS/SMU state the bring-up needs), then (3) `virsh start $VM` and waits for guest readiness.
 
 We do **not** touch that logic. We add a Rustproof domain and a thin wrapper:
 
@@ -284,7 +284,7 @@ We do **not** touch that logic. We add a Rustproof domain and a thin wrapper:
   - the OS section boots our image. Primary path: attach `rustproof-boot.iso` (Limine + `nucleus` + `init` + `driver-host` as boot modules) as a CD-ROM/disk and set boot order to it. Fallback path: `<os><kernel>/var/lib/rustproof/nucleus.elf</kernel><cmdline>…</cmdline></os>` (PVH/multiboot direct boot).
   - the **same** `<hostdev>` PCI passthrough block for the gfx1201 (and its audio function) — byte-identical to the Windows/Linux domains so the card is presented the same way.
 - `libvirt/start-rustproof-vm.sh` — a fork of `start-gpu-vm.sh` that only overrides `VM=rustproof-gpu` and, since the guest has no SSH, replaces the "wait for SSH" loop with "tail the guest serial console for the `M0: WAVE OK` banner." Everything upstream (VFIO bind + `reset_method` clear + `virsh start`) is reused unchanged.
-- `tools/run-vm` (the cargo `runner`) calls `mkimage` to (re)build `rustproof-boot.iso` from the freshly built ELFs, drops it where the domain expects it, then execs `start-rustproof-vm.sh`. So `cargo xtask run` on shark-a is: build → image → VFIO-bind + boot the guest with the real GPU passed through.
+- `tools/run-vm` (the cargo `runner`) calls `mkimage` to (re)build `rustproof-boot.iso` from the freshly built ELFs, drops it where the domain expects it, then execs `start-rustproof-vm.sh`. So `cargo xtask run` on gpu-host is: build → image → VFIO-bind + boot the guest with the real GPU passed through.
 
 The guest's serial port is wired to a host file/pty in the domain XML; that serial is the only channel the M0 smoke test needs (`nucleus` prints, `init` prints, `driver-host` prints `M0: WAVE OK`).
 
@@ -296,7 +296,7 @@ The guest's serial port is wired to a host file/pty in the domain XML; that seri
 
 **Today** the driver is C++ (the ROCr `lite::` direct-queue path, e.g. `amd_lite_direct_queue.cpp`, living in `rocm-systems`) plus **Python probe/harness scripts**. Decision:
 
-- **In-guest runs C++ only.** The Python probes are a *host-side* test harness and stay on shark-a; no Python interpreter runs inside the nucleus. The in-guest artifact is the compiled C++ dispatch core.
+- **In-guest runs C++ only.** The Python probes are a *host-side* test harness and stay on gpu-host; no Python interpreter runs inside the nucleus. The in-guest artifact is the compiled C++ dispatch core.
 - **The driver is an untrusted userland ELF the nucleus loads.** `vendor/rocr-lite/` is a git submodule pinned to a subset of the ROCr lite path. Its `CMakeLists.txt` builds a **static** `libamd_lite.a`. `crates/driver-host/build.rs` drives that CMake build and links the archive into the `driver-host` binary (target `x86_64-rustproof-user.json`). `driver-host` runs in its own address space with **only** the capabilities `init` grants it: the GPU **BAR/doorbell MMIO window**, one **DMA-capable buffer region**, and an **IRQ endpoint**. It has no capability that reaches any other AS.
 - **libc/POSIX shim (`driver-shim`).** The C++ driver expects a libc. We do **not** port a full libc. Instead `driver-shim` provides the *subset the driver actually calls*, each mapped to a nucleus IPC/capability op:
 
@@ -317,7 +317,7 @@ The guest's serial port is wired to a host file/pty in the domain XML; that seri
 
 ## 5. What actually `cargo`-builds at scaffold time vs. what is a stub
 
-Goal at scaffold: `cargo xtask build` produces a bootable image, `cargo xtask run` boots it as the `rustproof-gpu` guest on shark-a and prints `M0: WAVE OK` over serial, and `cargo xtask verify` runs Verus green over the (initially trivial) TCB proofs.
+Goal at scaffold: `cargo xtask build` produces a bootable image, `cargo xtask run` boots it as the `rustproof-gpu` guest on gpu-host and prints `M0: WAVE OK` over serial, and `cargo xtask verify` runs Verus green over the (initially trivial) TCB proofs.
 
 | Component | Scaffold state | Detail |
 |---|---|---|
@@ -335,7 +335,7 @@ Goal at scaffold: `cargo xtask build` produces a bootable image, `cargo xtask ru
 | `tools/*` (`xtask`, `mkimage`, `run-vm`, `verify`) | **Builds + runs on host** | real ISO build + libvirt boot + Verus invocation |
 | `libvirt/*` | **Present** | `rustproof-gpu.xml` + `start-rustproof-vm.sh` (fork of the working script) |
 
-**One-line litmus for "scaffold done":** on shark-a, `cargo xtask run` boots the nucleus as a KVM guest with the real gfx1201 passed through and the untrusted C++ `lite::` driver dispatches one wave (`M0: WAVE OK` on serial), **while** `cargo xtask verify` is green on the TCB crates whose only obligations so far are well-formedness — with `iommu-amdvi`'s DMA-reach proof present but explicitly admitted and non-load-bearing until M3.
+**One-line litmus for "scaffold done":** on gpu-host, `cargo xtask run` boots the nucleus as a KVM guest with the real gfx1201 passed through and the untrusted C++ `lite::` driver dispatches one wave (`M0: WAVE OK` on serial), **while** `cargo xtask verify` is green on the TCB crates whose only obligations so far are well-formedness — with `iommu-amdvi`'s DMA-reach proof present but explicitly admitted and non-load-bearing until M3.
 
 ---
 
@@ -344,4 +344,4 @@ Goal at scaffold: `cargo xtask build` produces a bootable image, `cargo xtask ru
 - **Pin discipline:** never bump `rust-toolchain.toml`, `verus.lock`, or `Cargo.lock` independently — they move as one unit, re-run `cargo xtask verify` on any change, and expect proof churn when Z3 changes.
 - **Reset-method trick is load-bearing for boot:** the `reset_method` clear in `start-gpu-vm.sh` is what keeps the gfx1201 POST state alive into the guest; `start-rustproof-vm.sh` must preserve it verbatim or the driver's bring-up assumptions break.
 
-*(File paths referencing the existing flow are absolute on shark-a's workspace peer; the canonical source of the passthrough script is `/Users/anush/github/claude-rocm-workspace/gist-tri-os/start-gpu-vm.sh`, which `libvirt/start-rustproof-vm.sh` forks.)*
+*(The passthrough script `libvirt/start-rustproof-vm.sh` is a fork of the internal, HW-proven `start-gpu-vm.sh`; see [`dev-infra.md`](dev-infra.md) §1.3.)*

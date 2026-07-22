@@ -1,6 +1,6 @@
 # Rustproof
 
-A small, formally-verifiable **Rust + Verus isolation nucleus** that safely hosts an *untrusted* GPU compute driver. The existing C++ `lite::` gfx1201 (AMD RDNA4) driver runs as an ordinary user process and drives the GPU directly; the nucleus owns the address-space page tables and (later) the AMD-Vi IOMMU tables, and confines the driver so that — buggy or malicious — it cannot touch memory it was not granted. First target: a KVM guest on the x86_64 box `shark-a`, dispatching one real gfx1201 wave through the untrusted driver.
+A small, formally-verifiable **Rust + Verus isolation nucleus** that safely hosts an *untrusted* GPU compute driver. The existing C++ `lite::` gfx1201 (AMD RDNA4) driver runs as an ordinary user process and drives the GPU directly; the nucleus owns the address-space page tables and (later) the AMD-Vi IOMMU tables, and confines the driver so that — buggy or malicious — it cannot touch memory it was not granted. First target: a KVM guest on the x86_64 box `gpu-host`, dispatching one real gfx1201 wave through the untrusted driver.
 
 > **Honest scope:** Rustproof aims to *verifiably isolate an untrusted GPU driver — it does **not** verify GPU computation.* Two guarantees, split permanently: **isolation / DMA-containment is in scope and verifiable; GPU compute correctness is permanently out of scope.** The nucleus never reasons about what a wave computes, only about what memory the device can reach.
 
@@ -36,7 +36,7 @@ rustproof/
 │   ├── init/  userland-rt/                             # untrusted root task + userland runtime
 │   └── driver-host/  driver-shim/                      # hosts the untrusted C++ lite:: driver
 ├── vendor/rocr-lite/   vendor/limine/                  # untrusted driver source; pinned bootloader
-├── libvirt/                                            # shark-a domain + boot script (forks start-gpu-vm.sh)
+├── libvirt/                                            # gpu-host domain + boot script (forks start-gpu-vm.sh)
 ├── tools/                                              # xtask, mkimage, run-vm, verify
 └── docs/                                               # design docs (below)
 ```
@@ -47,6 +47,8 @@ The C++ `lite::` driver is **never linked into the nucleus** — it is a separat
 
 Nothing here works yet; this is the intended loop.
 
+> `gpu-host` throughout these docs is a placeholder for your x86-64 GPU-passthrough machine; the GPU BDF (`0000:03:00.0`) and the libvirt domain/paths are examples — replace with your own.
+
 ```bash
 # fast inner loop — no GPU, any Linux; memory-safety/isolation work
 cargo build -p nucleus --release          # custom bare-metal target, -Zbuild-std
@@ -55,7 +57,7 @@ cargo test  -p nucleus                     # boots under headless QEMU, exits vi
 # proof gate (once the verification track is staffed)
 cargo xtask verify                         # pinned Verus + pinned Z3 over the TCB crates
 
-# real loop — shark-a, gfx1201 passed through, dispatch a wave
+# real loop — gpu-host, gfx1201 passed through, dispatch a wave
 cargo xtask run                            # build → image → VFIO-bind (no-FLR) → boot guest
                                            # success = "M0: WAVE OK" on the guest serial console
 ```
@@ -68,7 +70,7 @@ cargo xtask run                            # build → image → VFIO-bind (no-F
 - [`docs/host-contract.md`](docs/host-contract.md) — nucleus ↔ untrusted-driver ABI (9 ops, capabilities, IPC, the crux argument).
 - [`docs/nucleus-design.md`](docs/nucleus-design.md) — verified nucleus internals (caps, address spaces, IPC, scheduling, AMD-Vi manager, trusted stub).
 - [`docs/verification.md`](docs/verification.md) — Verus invariant ladder V1–V7, honest proof TCB, toolchain pin, staffing gate.
-- [`docs/dev-infra.md`](docs/dev-infra.md) — dev loop, CI, red-team DMA harness, shark-a integration.
+- [`docs/dev-infra.md`](docs/dev-infra.md) — dev loop, CI, red-team DMA harness, gpu-host integration.
 
 ## License
 

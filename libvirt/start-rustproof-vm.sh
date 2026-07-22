@@ -1,6 +1,6 @@
 #!/bin/bash
-# Boot the Rustproof nucleus as a KVM guest on shark-a with the gfx1201 passed
-# through. This is a thin fork of gist-tri-os/start-gpu-vm.sh: the VFIO bind +
+# Boot the Rustproof nucleus as a KVM guest on gpu-host with the gfx1201 passed
+# through. This is a thin fork of start-gpu-vm.sh: the VFIO bind +
 # the no-FLR reset_method trick are reused VERBATIM (they preserve the VBIOS POST
 # state the gfx1201 PSP/SMU/GC bring-up depends on). The only differences from the
 # tri-OS script are: (1) VM defaults to the rustproof-gpu domain, and (2) the guest
@@ -17,8 +17,8 @@
 
 set -e
 
-GPU="${GPU:-0000:c3:00.0}"
-GPU_AUDIO="${GPU_AUDIO:-0000:c3:00.1}"
+GPU="${GPU:-0000:03:00.0}"
+GPU_AUDIO="${GPU_AUDIO:-0000:03:00.1}"
 VM="${VM:-rustproof-gpu}"
 SERIAL_LOG="${SERIAL_LOG:-/var/log/libvirt/qemu/${VM}-serial.log}"
 BANNER="${BANNER:-M0: WAVE OK}"

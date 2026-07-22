@@ -1,5 +1,5 @@
 <!--
-  TEMPLATE domain for the Rustproof KVM guest on shark-a. This is a SKELETON:
+  TEMPLATE domain for the Rustproof KVM guest on gpu-host. This is a SKELETON:
   derive the real domain by cloning your working gfx1201 GPU-passthrough domain
   (the one the Windows/Linux tri-OS guests use) and changing only two things:
     1. Boot our image instead of a disk OS (the <os> block below).
@@ -37,10 +37,10 @@
     <!-- gfx1201 passthrough: COPY THIS BLOCK VERBATIM from the working GPU domain
          (both the GPU function and its .1 audio function). -->
     <hostdev mode='subsystem' type='pci' managed='no'>
-      <source><address domain='0x0000' bus='0xc3' slot='0x00' function='0x0'/></source>
+      <source><address domain='0x0000' bus='0x03' slot='0x00' function='0x0'/></source>
     </hostdev>
     <hostdev mode='subsystem' type='pci' managed='no'>
-      <source><address domain='0x0000' bus='0xc3' slot='0x00' function='0x1'/></source>
+      <source><address domain='0x0000' bus='0x03' slot='0x00' function='0x1'/></source>
     </hostdev>
 
     <!-- Serial console -> host file; the M0 smoke test greps this for "M0: WAVE OK". -->

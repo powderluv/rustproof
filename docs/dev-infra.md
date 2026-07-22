@@ -1,14 +1,14 @@
-# Rustproof — Dev loop, CI, red-team harness, shark-a integration
+# Rustproof — Dev loop, CI, red-team harness, gpu-host integration
 
-> **Scope.** This is the engineering-infrastructure doc for Rustproof, the Rust+Verus isolation nucleus from [`plans/verified-gpu-host-os.md`](../plans/verified-gpu-host-os.md). It covers how a systems engineer actually *builds, boots, tests, and adversarially probes* the nucleus across the M0–M5 milestones. It does not re-litigate any of the decided facts in the decision doc (fresh ~6–8K-SLOC nucleus, `lite::` as an untrusted user process, Verus + Kani, the DMA-reach invariant over nucleus-owned AMD-Vi tables, the M0–M2-host-enforced / M3-emulated / M4-bare-metal staging). Where this doc makes a claim about isolation strength it uses the decision doc's V/A/U labels (V1–V7 verified, A1–A8 assumed, U1–U3 untrusted).
+> **Scope.** This is the engineering-infrastructure doc for Rustproof, the Rust+Verus isolation nucleus described in [`implementation-plan.md`](implementation-plan.md). It covers how a systems engineer actually *builds, boots, tests, and adversarially probes* the nucleus across the M0–M5 milestones. It does not re-litigate any of the decided facts in the decision doc (fresh ~6–8K-SLOC nucleus, `lite::` as an untrusted user process, Verus + Kani, the DMA-reach invariant over nucleus-owned AMD-Vi tables, the M0–M2-host-enforced / M3-emulated / M4-bare-metal staging). Where this doc makes a claim about isolation strength it uses the decision doc's V/A/U labels (V1–V7 verified, A1–A8 assumed, U1–U3 untrusted).
 >
-> **The load-bearing honesty rule for all of §1–§3:** under plain VFIO (M0–M2) the *host* Linux programs the physical AMD-Vi and pins **all** guest RAM to the device (axiom **A7**). Every "isolation" behaviour you observe on the fast loop and on plain-VFIO shark-a is host-enforced, not nucleus-enforced. The nucleus IOMMU proof only becomes load-bearing at **M3** (emulated vIOMMU, axiom **A8**) and hardware-enforced at **M4** (bare-metal AMD-Vi). The red-team harness (§3) is therefore *meaningless before M3* and is explicitly gated to M3/M4.
+> **The load-bearing honesty rule for all of §1–§3:** under plain VFIO (M0–M2) the *host* Linux programs the physical AMD-Vi and pins **all** guest RAM to the device (axiom **A7**). Every "isolation" behaviour you observe on the fast loop and on plain-VFIO gpu-host is host-enforced, not nucleus-enforced. The nucleus IOMMU proof only becomes load-bearing at **M3** (emulated vIOMMU, axiom **A8**) and hardware-enforced at **M4** (bare-metal AMD-Vi). The red-team harness (§3) is therefore *meaningless before M3* and is explicitly gated to M3/M4.
 
 ---
 
 ## 0. Repo layout & pinning manifest
 
-The nucleus lives in a new Cargo workspace, `rustproof/` (proposed `github.com/powderluv/rustproof`), separate from this meta-workspace. The shark-a passthrough assets it reuses stay where they are today under `gist-tri-os/`.
+The nucleus lives in a new Cargo workspace, `rustproof/` (proposed `github.com/powderluv/rustproof`), separate from this meta-workspace. The gpu-host passthrough assets it reuses stay where they are today under ``.
 
 ```
 rustproof/
@@ -47,14 +47,14 @@ rustproof/
 | Verus + bundled Z3 | `verus-toolchain.toml` → a vendored `verus-<ver>-<os>.zip` (contains `verus`, `z3`, `rust_verify`) | Verus has no LTS; proof stability is version-locked (decision doc R5) |
 | Kani | `cargo kani --version` pinned in CI matrix | bounded model checker for the `hal/` stub |
 | QEMU | recorded in `tools/qemu-inner.sh` + the nightly-HW runner image; `qemu-system-x86_64 --version` asserted in CI | vIOMMU behaviour (§4) is version-sensitive |
-| libvirt domain XML | `gist-tri-os/rustproof-guest.xml` (checked in, secrets via env) | reproducible passthrough topology |
+| libvirt domain XML | `rustproof-guest.xml` (checked in, secrets via env) | reproducible passthrough topology |
 | firmware blobs (PSP SOS / SMU / MES / RLC) | SHA-256 manifest in `boot/firmware.sha256` | the untrusted driver loads these; hash-pin so a HW run is reproducible |
 
 ---
 
 ## 1. The local dev loop
 
-Two loops, deliberately different in cost. Use the fast one for 99% of nucleus/proof work; touch shark-a only when you need a real gfx1201 dispatch.
+Two loops, deliberately different in cost. Use the fast one for 99% of nucleus/proof work; touch gpu-host only when you need a real gfx1201 dispatch.
 
 ### 1.1 Building the nucleus image
 
@@ -103,7 +103,7 @@ Package a bootable image. Use **Limine** (higher-half load, memory map, no BIOS-
 tools/mkimage.sh    # xorriso the nucleus ELF + boot/limine.cfg into target/rustproof.iso
 ```
 
-`bootloader` (rust-osdev 0.11) is the lower-friction alternative for the very first M0 spike; switch to Limine before M1 because we need explicit control of the memory map for the later IOMMU/MMIO work. Either way the output is a single `rustproof.iso` (or `.img`) that boots identically under fast QEMU and under the shark-a libvirt domain.
+`bootloader` (rust-osdev 0.11) is the lower-friction alternative for the very first M0 spike; switch to Limine before M1 because we need explicit control of the memory map for the later IOMMU/MMIO work. Either way the output is a single `rustproof.iso` (or `.img`) that boots identically under fast QEMU and under the gpu-host libvirt domain.
 
 **Crates in the nucleus** (all `no_std`, all either verified or in the audited stub): `x86_64` (page tables, `Cr3`, port IO), `uart_16550` (serial), `linked_list_allocator` or `talc` (kernel heap for `alloc`), `spin` **only inside the audited stub** (the verified core uses the nucleus big-lock, not an unverified spinlock). Verus's `vstd`/`builtin`/`builtin_macros` are proof-only. No `bindgen`/no C++ in the nucleus — `lite::` is a *separate process* reached over IPC, never linked in.
 
@@ -111,7 +111,7 @@ tools/mkimage.sh    # xorriso the nucleus ELF + boot/limine.cfg into target/rust
 
 ### 1.2 Fast inner loop — plain QEMU, no GPU
 
-This is where memory-safety (M1) and isolation (M2) work happens. No GPU, no VFIO, no shark-a — runs on any laptop/CI Linux. `tools/qemu-inner.sh`:
+This is where memory-safety (M1) and isolation (M2) work happens. No GPU, no VFIO, no gpu-host — runs on any laptop/CI Linux. `tools/qemu-inner.sh`:
 
 ```bash
 #!/usr/bin/env bash
@@ -127,11 +127,11 @@ exec qemu-system-x86_64 \
 
 The nucleus exits QEMU by writing a success/failure code to the `isa-debug-exit` port; the cargo test runner maps `33` → test pass. This is the standard rust-osdev pattern and gives you `cargo test` for kernel integration tests (`nucleus/tests/*.rs`): each test binary boots, runs its assertions against real page tables / real capability ops, and exits with a code. Sub-second per test under KVM.
 
-What runs here: everything CPU-side. AS map/unmap/grant/revoke, capability derivation/revocation, IPC round-trips, scheduler context switches, and — from M3 — the AMD-Vi domain manager driven against an **emulated** IOMMU (§4). What does *not* run here: any real gfx1201 dispatch. For that you need shark-a.
+What runs here: everything CPU-side. AS map/unmap/grant/revoke, capability derivation/revocation, IPC round-trips, scheduler context switches, and — from M3 — the AMD-Vi domain manager driven against an **emulated** IOMMU (§4). What does *not* run here: any real gfx1201 dispatch. For that you need gpu-host.
 
-### 1.3 Real loop — shark-a libvirt/QEMU + VFIO passthrough
+### 1.3 Real loop — gpu-host libvirt/QEMU + VFIO passthrough
 
-Only when you need `lite::` to dispatch a real wave on the physical gfx1201 (RX 9070 XT / AI PRO R9700, `1002:7551`). Reuse the existing, HW-proven host helper verbatim: [`gist-tri-os/start-gpu-vm.sh`](../gist-tri-os/start-gpu-vm.sh).
+Only when you need `lite::` to dispatch a real wave on the physical gfx1201 (RX 9070 XT / AI PRO R9700, `1002:7551`). Reuse the in-repo fork [`libvirt/start-rustproof-vm.sh`](../libvirt/start-rustproof-vm.sh) of the internal, HW-proven `start-gpu-vm.sh` passthrough helper — verbatim.
 
 The three non-obvious disciplines that helper encodes — **do not paper over them**:
 
@@ -139,9 +139,9 @@ The three non-obvious disciplines that helper encodes — **do not paper over th
 2. **Cold-power-cycle-then-bind.** The correct flow is: BMC cold power-cycle the whole box → fresh VBIOS POST → run `start-gpu-vm.sh` (VFIO bind + reset_method clear) → guest sees a freshly-POSTed card. The nucleus boots into that pre-conditioned state.
 3. **PSP wedges after ~1 bring-up.** Empirically the PSP tolerates roughly one bring-up per cold POST; a second bring-up in the same power cycle wedges. So the real loop is *not* re-runnable in place — every HW attempt is `power-cycle → boot → one dispatch attempt → power-cycle`. This is why the HW loop is slow and must be serialized (§2.5), and why the fast loop (§1.2) carries the iteration burden.
 
-**BMC out-of-band control.** shark-a's power is driven out-of-band; from the operator Mac the recipe is `ipmitool -I lanplus -H <bmc> -U <user> -P <pass-from-gitignored-env> chassis power cycle` (credentials live in a gitignored env file, never in a script or this doc — same discipline as `start-gpu-vm.sh`'s `VM_SSH_PASS`). Wrap it as `tools/sharka-powercycle.sh` and have it block until the box answers SSH again before the run proceeds.
+**BMC out-of-band control.** gpu-host's power is driven out-of-band; from the operator workstation the recipe is `ipmitool -I lanplus -H <bmc> -U <user> -P <pass-from-gitignored-env> chassis power cycle` (credentials live in a gitignored env file, never in a script or this doc — same discipline as `start-gpu-vm.sh`'s `VM_SSH_PASS`). Wrap it as `tools/gpuhost-powercycle.sh` and have it block until the box answers SSH again before the run proceeds.
 
-**libvirt domain.** Check in `gist-tri-os/rustproof-guest.xml` — a q35 machine, OVMF firmware, the gfx1201 + its HDMI-audio function (`.1`) as `<hostdev>` VFIO passthrough, and a serial console wired to a host pty/log so the nucleus's boot log is captured. For M3 this XML gains a `<iommu>` device (§4); for M0–M2 it is plain passthrough.
+**libvirt domain.** Check in `rustproof-guest.xml` — a q35 machine, OVMF firmware, the gfx1201 + its HDMI-audio function (`.1`) as `<hostdev>` VFIO passthrough, and a serial console wired to a host pty/log so the nucleus's boot log is captured. For M3 this XML gains a `<iommu>` device (§4); for M0–M2 it is plain passthrough.
 
 The nucleus image from §1.1 is the *same artifact* booted here — the only delta versus the fast loop is that here a real gfx1201 is passed through and `lite::` (the untrusted user process) can actually reach it.
 
@@ -149,7 +149,7 @@ The nucleus image from §1.1 is the *same artifact* booted here — the only del
 
 ## 2. CI
 
-Five jobs. Four run on ordinary GitHub-hosted (or self-hosted x86) Linux; one runs on the shark-a self-hosted runner nightly. Fail-fast, no job silently degrades.
+Five jobs. Four run on ordinary GitHub-hosted (or self-hosted x86) Linux; one runs on the gpu-host self-hosted runner nightly. Fail-fast, no job silently degrades.
 
 ### 2.1 The rustc/Verus toolchain coupling (read this first)
 
@@ -192,17 +192,17 @@ Two flavours, both on GitHub-hosted Linux, no GPU:
 - **`test-kani` (`cargo kani`).** Bounded model checking of the `hal/` stub: for each `#[verifier::external_body]` function, a `#[kani::proof]` harness feeds `kani::any()` inputs under `kani::assume(precondition)` and asserts the `ensures` the rest of the proof trusts (e.g. the MMIO accessor writes exactly the requested width to exactly the requested offset; the IOMMU-invalidate stub's index arithmetic never wraps). Kani *finds bugs* in the stub; it does not prove absence (decision doc §4). A Kani counterexample is a CI failure.
 - **`test-qemu` (`cargo test` via the §1.2 runner).** The kernel integration tests boot under headless QEMU (TCG on hosted CI, KVM on the self-hosted x86 runner) and exercise real map/unmap/grant/revoke and IPC against real page tables, exiting via `isa-debug-exit`. This is the dynamic counterpart to the static M2 proof — the proof says the invariant holds; this says the code that's *supposed* to establish it actually links and runs.
 
-### 2.5 Nightly HW job — shark-a
+### 2.5 Nightly HW job — gpu-host
 
 ```yaml
 nightly-hw:
-  runs-on: [self-hosted, linux, x86_64, sharka, gpu-gfx1201]
-  concurrency: { group: sharka-gpu, cancel-in-progress: false }   # GPU is a singleton; never two at once
+  runs-on: [self-hosted, linux, x86_64, gpuhost, gpu-gfx1201]
+  concurrency: { group: gpuhost-gpu, cancel-in-progress: false }   # GPU is a singleton; never two at once
   if: github.event_name == 'schedule'
   timeout-minutes: 60
   steps:
-    - run: tools/sharka-powercycle.sh          # BMC cold cycle -> fresh VBIOS POST (PSP-wedge discipline)
-    - run: gist-tri-os/start-gpu-vm.sh         # VFIO bind + reset_method clear + virsh start (no-FLR)
+    - run: tools/gpuhost-powercycle.sh          # BMC cold cycle -> fresh VBIOS POST (PSP-wedge discipline)
+    - run: start-gpu-vm.sh         # VFIO bind + reset_method clear + virsh start (no-FLR)
     - run: tools/deploy-nucleus.sh             # push target/rustproof.iso into the guest boot path
     - run: tools/run-m0-workload.sh            # in-guest: lite:: bring-up + multi_dispatch_test (§5)
     - run: tools/run-tri-os-smoke.sh           # regression workload (§5)
@@ -210,7 +210,7 @@ nightly-hw:
       run: tools/collect-logs.sh               # serial console, dispatch log, IOMMU event log
 ```
 
-Non-negotiables: **serialized** (`concurrency.group: sharka-gpu`, `cancel-in-progress: false`) because the physical GPU is a singleton and because the PSP wedges after ~1 bring-up per POST; **power-cycle before every run** for the same reason; **`if: always()` log collection** so a wedge produces a diagnosable artifact instead of a bare timeout. This job is a *canary*, not a gate — a red nightly-HW run files an issue and pages the operator; it does not block merges (a shark-a wedge is an environment fault, not a code regression). The blocking gates are `proof`, `build`, `test-host`, `test-kani`, `test-qemu`.
+Non-negotiables: **serialized** (`concurrency.group: gpuhost-gpu`, `cancel-in-progress: false`) because the physical GPU is a singleton and because the PSP wedges after ~1 bring-up per POST; **power-cycle before every run** for the same reason; **`if: always()` log collection** so a wedge produces a diagnosable artifact instead of a bare timeout. This job is a *canary*, not a gate — a red nightly-HW run files an issue and pages the operator; it does not block merges (a gpu-host wedge is an environment fault, not a code regression). The blocking gates are `proof`, `build`, `test-host`, `test-kani`, `test-qemu`.
 
 ---
 
@@ -249,16 +249,16 @@ M3 is the first milestone where the nucleus's IOMMU code is load-bearing, agains
 
 | QEMU device | VFIO passthrough (shadow to host) supported? | Table format the nucleus programs | Fit for our proof |
 |---|---|---|---|
-| `-device amd-iommu,intremap=on,device-iotlb=on` | **Historically weak/partial for *assigned* devices** — assigned-device DMA translation needs the AMD-Vi equivalent of intel-iommu's `caching-mode=on` (trap guest IOTLB invalidations, replay into VFIO MAP/UNMAP). **Must be confirmed on shark-a's QEMU (§6).** | **Real AMD-Vi DTE + I/O page tables** — exactly the format V3/V4 verify and M4 will program on bare metal. | Ideal *if* it works with VFIO; otherwise unusable end-to-end. |
+| `-device amd-iommu,intremap=on,device-iotlb=on` | **Historically weak/partial for *assigned* devices** — assigned-device DMA translation needs the AMD-Vi equivalent of intel-iommu's `caching-mode=on` (trap guest IOTLB invalidations, replay into VFIO MAP/UNMAP). **Must be confirmed on gpu-host's QEMU (§6).** | **Real AMD-Vi DTE + I/O page tables** — exactly the format V3/V4 verify and M4 will program on bare metal. | Ideal *if* it works with VFIO; otherwise unusable end-to-end. |
 | `-device intel-iommu,caching-mode=on,intremap=on` | **Mature** — the first vIOMMU to support VFIO assigned-device shadowing. | VT-d format — **wrong ISA**; the nucleus would program tables we don't verify. | Rejected for the load-bearing path (defeats the point of an AMD-Vi proof). |
 | `-device virtio-iommu-pci` | **Supported** with VFIO passthrough; guest MAP/UNMAP shadowed to host VFIO via the kernel. Portable, version-robust. | Paravirtual virtio-iommu descriptors — **not AMD-Vi tables**. | Exercises reach *semantics* end-to-end but not the AMD-Vi table-builder. |
 
 **The honest resolution (a judgment call the team must confirm, decision doc R3).** Split the M3 claim into two provably-separable halves:
 
 1. **AMD-Vi table-builder correctness (V3/V4, fully verified + golden-tested).** The nucleus builds DTE + I/O page tables in *real AMD-Vi format*; `model/`'s reference walker walks them and the Verus theorem proves `reach ⊆ authorized` over that format. This half needs **no** emulator — it's proven statically and golden-vector tested on the host (§2.4). It transfers *unchanged* to M4 bare metal.
-2. **End-to-end fault plumbing (empirical, the §3 harness).** "Does an out-of-bounds DMA actually fault?" is tested against whichever emulated IOMMU shark-a's QEMU *actually supports for VFIO* — **preferably `amd-iommu` if it works**, falling back to `virtio-iommu` if it doesn't. If we fall back, we accept that the emulated device's table *format* differs from AMD-Vi; the load-bearing proof (half 1) is still over AMD-Vi tables, and the emulator only corroborates the *reach semantics* (a weaker but honest M3 claim). The AMD-Vi-format end-to-end fault demonstration then waits for M4 real hardware.
+2. **End-to-end fault plumbing (empirical, the §3 harness).** "Does an out-of-bounds DMA actually fault?" is tested against whichever emulated IOMMU gpu-host's QEMU *actually supports for VFIO* — **preferably `amd-iommu` if it works**, falling back to `virtio-iommu` if it doesn't. If we fall back, we accept that the emulated device's table *format* differs from AMD-Vi; the load-bearing proof (half 1) is still over AMD-Vi tables, and the emulator only corroborates the *reach semantics* (a weaker but honest M3 claim). The AMD-Vi-format end-to-end fault demonstration then waits for M4 real hardware.
 
-This keeps V3/V4 meaningful even in the pessimistic case where amd-iommu+VFIO doesn't work on shark-a, and it names the fallback explicitly instead of pretending M3 is a full hardware demonstration. **Open question owed a concrete answer before M3 starts (§6): can shark-a's QEMU present an `amd-iommu` that translates for the passthrough gfx1201?** If yes, M3 is clean. If no, M3 runs half-1-verified + half-2-corroborated-via-virtio-iommu, and the first *AMD-Vi-format* end-to-end fault is an M4 deliverable.
+This keeps V3/V4 meaningful even in the pessimistic case where amd-iommu+VFIO doesn't work on gpu-host, and it names the fallback explicitly instead of pretending M3 is a full hardware demonstration. **Open question owed a concrete answer before M3 starts (§6): can gpu-host's QEMU present an `amd-iommu` that translates for the passthrough gfx1201?** If yes, M3 is clean. If no, M3 runs half-1-verified + half-2-corroborated-via-virtio-iommu, and the first *AMD-Vi-format* end-to-end fault is an M4 deliverable.
 
 **libvirt wiring for M3.** The `<hostdev>` gfx1201 passthrough stays; add the vIOMMU. For raw QEMU (easier to iterate than libvirt XML for this): `-machine q35,accel=kvm -device amd-iommu,intremap=on,device-iotlb=on -device vfio-pci,host=$GPU,iommu_platform=on ...`. For libvirt, an `<iommu model='...'/>` element plus `<driver iommu='on'/>` on the hostdev. Iterate on raw QEMU first; freeze the working invocation into `rustproof-guest-m3.xml`.
 
@@ -266,12 +266,12 @@ This keeps V3/V4 meaningful even in the pessimistic case where amd-iommu+VFIO do
 
 ## 5. Reproducibility — one-command M0 + tri_os_smoke regression
 
-**One-command M0.** `tools/repro-m0.sh` on the operator Mac (which has BMC + SSH reach to shark-a) does the whole known-good baseline, so a fresh engineer can confirm the rig before touching nucleus code:
+**One-command M0.** `tools/repro-m0.sh` on the operator workstation (which has BMC + SSH reach to gpu-host) does the whole known-good baseline, so a fresh engineer can confirm the rig before touching nucleus code:
 
 ```bash
 tools/repro-m0.sh
-#  1. tools/sharka-powercycle.sh          # BMC cold cycle -> fresh VBIOS POST
-#  2. ssh shark-a gist-tri-os/start-gpu-vm.sh   # VFIO bind + no-FLR reset_method + virsh start
+#  1. tools/gpuhost-powercycle.sh          # BMC cold cycle -> fresh VBIOS POST
+#  2. ssh gpu-host start-gpu-vm.sh   # VFIO bind + no-FLR reset_method + virsh start
 #  3. tools/deploy-nucleus.sh             # rustproof.iso -> guest boot; boot the nucleus
 #  4. in-guest: lite:: bring-up (phase-9 PSP/SOS->GFX->MEC->MES->scheduler) then
 #     multi_dispatch_test <N>             # the M0 workload (below)
@@ -279,11 +279,11 @@ tools/repro-m0.sh
 #  6. always: collect serial + dispatch logs to artifacts/
 ```
 
-**The M0 workload is the existing multi-dispatch test**, reused unchanged: [`multi_dispatch_test.cpp`](../multi_dispatch_test.cpp) launches a trivial `inc` kernel N times through the ROCr/`lite::` MES path, synchronizing each iteration (like torch's `.item()`), copies back, and prints `SURVIVED N dispatches; verify=PASS`. It is the smallest thing that proves the untrusted-driver-over-nucleus architecture physically dispatches a real wave — exactly the M0 exit criterion. The driver bring-up retry logic (KIQ activation is flaky across cold boots) is already encoded in [`run-multi-dispatch-test.sh`](../run-multi-dispatch-test.sh); port its retry loop into `tools/run-m0-workload.sh` but drive the reset via the BMC power-cycle (the shark-a analog of the Mac `egpu_drain.py`), respecting the one-bring-up-per-POST reality.
+**The M0 workload is the existing multi-dispatch test**, reused unchanged: the internal `multi_dispatch_test.cpp` launches a trivial `inc` kernel N times through the ROCr/`lite::` MES path, synchronizing each iteration (like torch's `.item()`), copies back, and prints `SURVIVED N dispatches; verify=PASS`. It is the smallest thing that proves the untrusted-driver-over-nucleus architecture physically dispatches a real wave — exactly the M0 exit criterion. The driver bring-up retry logic (KIQ activation is flaky across cold boots) is already encoded in the internal `run-multi-dispatch-test.sh`; port its retry loop into `tools/run-m0-workload.sh` but drive the reset via the BMC power-cycle, respecting the one-bring-up-per-POST reality.
 
 **Everything a repro depends on is pinned (§0):** rustc nightly, Verus+Z3, QEMU version, the libvirt XML, and the firmware-blob SHA-256 manifest. A repro that can't match `boot/firmware.sha256` refuses to run rather than silently using a different PSP/SMU/MES blob.
 
-**tri_os_smoke.py as the regression workload.** [`tri_os_smoke.py`](../tri_os_smoke.py) is the portable PyTorch smoke runner already used across the tri-OS effort; on the verified host it is the higher-level regression that a real ROCm workload still runs. `tools/run-tri-os-smoke.sh` invokes it in-guest against the SDK dist, e.g.:
+**A portable smoke runner as the regression workload.** The internal `tri_os_smoke.py` is a portable PyTorch smoke runner used across the tri-OS effort; on the verified host it is the higher-level regression that a real ROCm workload still runs. `tools/run-tri-os-smoke.sh` invokes it in-guest against the SDK dist, e.g.:
 
 ```bash
 SMOKE_FILE=$SDK/smoke-tests/pytorch_smoke_test.py \
@@ -294,11 +294,11 @@ python3 tri_os_smoke.py
 
 Parse its machine-readable `[tri_os_smoke] RESULT passed=… failed=… total=…` line into the CI summary. Two integration points:
 - **M4 exit criterion** (decision doc): the smoke workload runs on the verified bare-metal host — so `run-tri-os-smoke.sh` is the M4 acceptance workload, not just a smoke test.
-- **`SMOKE_ISOLATE=1` per-test-subprocess mode** matters here specifically: a GPU fault in one op becomes a clean FAIL for that op (and a fresh process resets clr's per-process error latch) instead of aborting the run. On a from-scratch nucleus where a single hostile/buggy dispatch could wedge the driver process, isolate mode is what keeps the regression run diagnosable — use it as the default on the HW job. Note the driver process restart still costs a bring-up; on shark-a with the PSP-wedge reality, isolate mode across many tests may exhaust the one-bring-up-per-POST budget, so either keep the isolated slice small or power-cycle between chunks. Confirm the actual per-POST bring-up budget on shark-a (§6) before choosing the slice size.
+- **`SMOKE_ISOLATE=1` per-test-subprocess mode** matters here specifically: a GPU fault in one op becomes a clean FAIL for that op (and a fresh process resets clr's per-process error latch) instead of aborting the run. On a from-scratch nucleus where a single hostile/buggy dispatch could wedge the driver process, isolate mode is what keeps the regression run diagnosable — use it as the default on the HW job. Note the driver process restart still costs a bring-up; on gpu-host with the PSP-wedge reality, isolate mode across many tests may exhaust the one-bring-up-per-POST budget, so either keep the isolated slice small or power-cycle between chunks. Confirm the actual per-POST bring-up budget on gpu-host (§6) before choosing the slice size.
 
 ---
 
-## 6. shark-a facts to confirm *first* (before M3/M4 planning is real)
+## 6. gpu-host facts to confirm *first* (before M3/M4 planning is real)
 
 These are the decision doc's next-action #2 (R2/R3/R4) turned into commands you run on the box **today**. Until they're answered, M3/M4 scheduling is speculative.
 
@@ -316,7 +316,7 @@ Confirm the gfx1201 is alone in its IOMMU group *without* any `pcie_acs_override
 lspci -vv -s <BDF> | grep -iA1 'Region 0'          # BAR0 size (VRAM aperture)
 lspci -vv -s <BDF> | grep -iA3 'Resizable BAR'     # ReBAR capability + current size
 ```
-Confirm whether x86 passthrough on shark-a uses a full VRAM-size BAR (contrast the Mac eGPU path's 256 MB / ReBAR-off constraint in the team's memory). This sizes the `IOC_MAP_BAR` aperture in the frozen host contract and decides whether `lite::`'s VRAM bump-allocator assumptions hold unchanged.
+Confirm whether x86 passthrough on gpu-host uses a full VRAM-size BAR (contrast a known constrained 256 MB / ReBAR-off BAR path). This sizes the `IOC_MAP_BAR` aperture in the frozen host contract and decides whether `lite::`'s VRAM bump-allocator assumptions hold unchanged.
 
 **(c) Can QEMU present a nested/emulated AMD-Vi for the passthrough device? (gates the whole M3 shape — §4).**
 ```bash
@@ -330,10 +330,10 @@ ls /sys/class/iommu/                                          # host IOMMU prese
 The decisive test is empirical: boot a throwaway guest with `-device amd-iommu,intremap=on,device-iotlb=on` **and** the gfx1201 as `vfio-pci`, and check whether guest-side map/unmap actually translates for the assigned device (i.e. an unmapped guest IOVA faults on real DMA). If yes → M3 is clean AMD-Vi end-to-end. If no → M3 falls back to virtio-iommu for the fault-plumbing half while V3/V4 stay AMD-Vi-format-verified statically (§4), and the AMD-Vi-format end-to-end demonstration moves to M4.
 
 **(d) Operational facts to confirm (gates the HW loop's cadence).**
-- The BMC out-of-band power-cycle path from the operator Mac works and returns the box to a POSTed, SSH-reachable state (`tools/sharka-powercycle.sh`).
+- The BMC out-of-band power-cycle path from the operator workstation works and returns the box to a POSTed, SSH-reachable state (`tools/gpuhost-powercycle.sh`).
 - The empirical **per-POST bring-up budget**: is it really ~1 before the PSP wedges, or can a warm re-bring-up sometimes succeed? This sets how many isolated `tri_os_smoke` tests fit per power cycle (§5) and how the nightly-HW job chunks its work.
 
-Record all answers in `docs/sharka-facts.md` (a living file) and gate the M3/M4 milestone entries on them — a red answer to (a) or (c) changes the plan, not just the schedule.
+Record all answers in `docs/gpuhost-facts.md` (a living file) and gate the M3/M4 milestone entries on them — a red answer to (a) or (c) changes the plan, not just the schedule.
 
 ---
 
@@ -348,8 +348,5 @@ Record all answers in `docs/sharka-facts.md` (a living file) and gate the M3/M4 
 | **M4** | + proof (V5) | redteam vs **real** AMD-Vi, tri_os_smoke | reclaim/stale-IOTLB safety (V5) | **bare-metal AMD-Vi (verified)** |
 | **M5** | + proof (V6, opt V7) | full tri_os_smoke regression | no-authority-amplification (V6), submission well-formedness (V7) | composed assurance case |
 
-*Assets referenced (all real paths in this workspace): [`gist-tri-os/start-gpu-vm.sh`](../gist-tri-os/start-gpu-vm.sh), [`multi_dispatch_test.cpp`](../multi_dispatch_test.cpp), [`run-multi-dispatch-test.sh`](../run-multi-dispatch-test.sh), [`tri_os_smoke.py`](../tri_os_smoke.py), [`plans/verified-gpu-host-os.md`](../plans/verified-gpu-host-os.md), [`plans/verified-gpu-host-os-research-brief.md`](../plans/verified-gpu-host-os-research-brief.md).*
+*Internal assets referenced (the `lite::` driver's HW-validation harness — not in this repo): `start-gpu-vm.sh`, `multi_dispatch_test.cpp`, `run-multi-dispatch-test.sh`, `tri_os_smoke.py`. In-repo companions: [`implementation-plan.md`](implementation-plan.md), [`research-brief.md`](research-brief.md).*
 
----
-
-*Written to `/Users/anush/github/claude-rocm-workspace/docs/dev-infra.md`.*

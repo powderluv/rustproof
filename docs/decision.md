@@ -2,7 +2,7 @@
 
 - **Status:** accepted (2026-07-21).
 - **Context:** we need a formally-verifiable, multi-process host OS that dispatches
-  GPU compute on AMD gfx1201, first as a KVM guest on `shark-a`.
+  GPU compute on AMD gfx1201, first as a KVM guest on `gpu-host`.
 
 ## Decision
 
@@ -28,5 +28,5 @@ of scope.
   as a reference instead.
 
 Full analysis: the decision doc and research brief live in the
-`claude-rocm-workspace` repo (`plans/verified-gpu-host-os.md`) and a copy of the
+`the internal workspace` repo (`plans/verified-gpu-host-os.md`) and a copy of the
 brief is at [`docs/research-brief.md`](research-brief.md).

@@ -5,7 +5,7 @@ name: verify
 on: [push, pull_request]
 jobs:
   verus:
-    runs-on: [self-hosted, shark-a]   # needs the pinned toolchain
+    runs-on: [self-hosted, gpu-host]   # needs the pinned toolchain
     steps:
       - uses: actions/checkout@v4
       - run: ./toolchain/fetch-verus.sh          # pinned Verus + z3

@@ -8,14 +8,14 @@ Cross-links (read these for detail; this doc is the map, not the territory):
 - [`docs/host-contract.md`](host-contract.md) — the nucleus ↔ untrusted-driver ABI (the 9 operations, the capability model, the message-passing layer, the DMA-reach crux argument).
 - [`docs/verification.md`](verification.md) — the Verus invariant ladder V1–V7, the honest proof TCB, the toolchain pin, the staffing gate, the Atmosphere seeding plan.
 - [`docs/nucleus-design.md`](nucleus-design.md) — the internal architecture of the verified nucleus (capabilities, address spaces, IPC, scheduling, the AMD-Vi domain manager, the trusted unsafe stub).
-- [`docs/dev-infra.md`](dev-infra.md) — dev loop, CI jobs, the red-team DMA harness, shark-a integration, the shark-a facts to confirm first.
+- [`docs/dev-infra.md`](dev-infra.md) — dev loop, CI jobs, the red-team DMA harness, gpu-host integration, the gpu-host facts to confirm first.
 - [`docs/ai-proof-writer.md`](ai-proof-writer.md) — the AI-agent proof-writer harness that restructures Gate G1 (§4): what the agent writes vs. what a human must own, the reward-hacking guardrails, and the per-invariant-rung verdict.
 
 ---
 
 ## 1. Orientation
 
-**What Rustproof is.** A new, small (~6–8K SLOC) Rust + Verus **isolation nucleus** — not a full OS, not Redox's kernel, not seL4. It runs first as a KVM guest on the x86_64 box `shark-a`, and its one job is to safely host an **untrusted** GPU compute stack: the existing C++ `lite::` gfx1201 (RDNA4) driver runs as an ordinary user process, drives the GPU directly, and is confined so that whatever it does — buggy or malicious — it cannot reach memory it was not granted.
+**What Rustproof is.** A new, small (~6–8K SLOC) Rust + Verus **isolation nucleus** — not a full OS, not Redox's kernel, not seL4. It runs first as a KVM guest on the x86_64 box `gpu-host`, and its one job is to safely host an **untrusted** GPU compute stack: the existing C++ `lite::` gfx1201 (RDNA4) driver runs as an ordinary user process, drives the GPU directly, and is confined so that whatever it does — buggy or malicious — it cannot reach memory it was not granted.
 
 **Why it exists.** The `lite::` driver plus GPUVM is a large, fast-moving body of untrusted C++. Rather than trust it, we put it behind a boundary we can *prove* things about. The nucleus owns the address-space page tables and (from M3) the AMD-Vi IOMMU tables; the driver owns everything about *making the GPU compute*, and produces only IOVAs. The nucleus never reasons about what a wave computes — only about what physical memory the device can touch.
 
@@ -42,7 +42,7 @@ Isolation column is the load-bearing point: *who actually stops a bad DMA at tha
 | **M4** | Bare-metal real AMD-Vi on hardware | **V5** — reclaim / stale-IOTLB safety; V3/V4 now over real silicon | + hardware axioms A1–A6 against real AMD-Vi | **Nucleus** IOMMU proof (bare-metal) |
 | **M5** | — | **Composed confinement assurance case**: V1 ∧ V2 ∧ V3 ∧ V4 ∧ V5 ∧ V6 ⇒ storage + DMA confinement of the untrusted GPU stack; + prose argument citing A1–A6 | all of the above, stated explicitly | Nucleus (composed) |
 
-Two caveats carried in every milestone write-up: **(1)** M0 proves nothing — isolation there is the host IOMMU, not the nucleus. **(2)** "Confinement" at M5 means *storage/DMA* confinement, **not** timing confinement — Verus proves functional/safety properties and does not cover timing side channels (cache, scheduler, TLB/IOTLB contention remain covert channels), exactly the boundary seL4 draws. **(3)** The first *load-bearing* proof (M3) assumes QEMU can present an emulated AMD-Vi that translates for the **passthrough** gfx1201 — historically weak/absent for VFIO-assigned devices (§7c). If shark-a's QEMU can't, M3 degrades to *statically* verifying the AMD-Vi table-builder + corroborating fault-plumbing via `virtio-iommu`, and the first **hardware-enforced** end-to-end DMA-reach demonstration slides to **M4** (bare-metal). Plan for the first genuinely load-bearing result to be bare-metal, not emulated.
+Two caveats carried in every milestone write-up: **(1)** M0 proves nothing — isolation there is the host IOMMU, not the nucleus. **(2)** "Confinement" at M5 means *storage/DMA* confinement, **not** timing confinement — Verus proves functional/safety properties and does not cover timing side channels (cache, scheduler, TLB/IOTLB contention remain covert channels), exactly the boundary seL4 draws. **(3)** The first *load-bearing* proof (M3) assumes QEMU can present an emulated AMD-Vi that translates for the **passthrough** gfx1201 — historically weak/absent for VFIO-assigned devices (§7c). If gpu-host's QEMU can't, M3 degrades to *statically* verifying the AMD-Vi table-builder + corroborating fault-plumbing via `virtio-iommu`, and the first **hardware-enforced** end-to-end DMA-reach demonstration slides to **M4** (bare-metal). Plan for the first genuinely load-bearing result to be bare-metal, not emulated.
 
 ---
 
@@ -63,7 +63,7 @@ Nodes are the M0 tasks from [`docs/milestone-M0.md`](milestone-M0.md). Edges are
 
 ```
 T0.0 baseline on host (0.5–1w) ───────────────────────────────┐
-   (reproduce known-good lite:: dispatch on shark-a; capture   │ (feeds T0.8 host-side FW load
+   (reproduce known-good lite:: dispatch on gpu-host; capture   │ (feeds T0.8 host-side FW load
     the strace syscall set for T0.5; get BOOTLOAD signature)    │  and is the M0 reference log)
                                                                 ▼
 T0.1 bootable nucleus ──► T0.2 AS/threads/caps ──► T0.3 userland loader
@@ -146,7 +146,7 @@ M3: V3 DMA-reach  +  V4 DTE-config   ── FIRST LOAD-BEARING PROOF
    - emulated vIOMMU brought up (see §7 open question — amd-iommu vs virtio-iommu fallback)
 ```
 
-M2's page-table machinery is deliberately built so M3 reuses it verbatim over the IO tables — that reuse is why M2→M3 is an extension, not a restart. **Prerequisite before M3 scheduling is real:** the shark-a facts in §7 must be answered.
+M2's page-table machinery is deliberately built so M3 reuses it verbatim over the IO tables — that reuse is why M2→M3 is an extension, not a restart. **Prerequisite before M3 scheduling is real:** the gpu-host facts in §7 must be answered.
 
 ### 3.4 An architecture fork to record before T0.5: how the untrusted driver is hosted
 
@@ -168,7 +168,7 @@ T0.5 (hosting the C++ `lite::` stack with no POSIX) is the single largest cost a
 
 **Gate condition:** begin M1 proof work only when the agent harness, a signed-off spec-author/reviewer, and the accept-gate ([`ai-proof-writer.md`](ai-proof-writer.md) §4) are in place. **Calibration precondition (Stage 0):** before budgeting any agent yield past M1, run the harness against the repo's *existing* proved corpus as a proof-hole regression (strip proof bodies, ask the agent to reconstruct) — if it can't reproduce proofs it already has the specs for, it won't write new ones; that result is the go/no-go, not a public benchmark. Also use the **Atmosphere-reproduction exercise** ([`verification.md`](verification.md) §7) to de-risk the flat-map/ghost-subtree technique on our pinned toolchain. **Soundness is never delegated to the agent:** a green Verus run is necessary, never sufficient — accept only on green-run AND human-approved spec AND unchanged-TCB (no new `assume`/`admit`/`assume_specification`/`external_body`/`external` without a human-whitelisted rationale) AND spec-mutation-suite-fails-as-expected AND non-vacuous AND seed-stable.
 
-**Gate G2 — the shark-a facts gate (blocks M3/M4 planning).** Answer §7's questions on the box before M3/M4 scheduling is anything but speculative. A red answer to ACS-without-override (a) or emulated-AMD-Vi-for-passthrough (c) changes the plan, not just the schedule.
+**Gate G2 — the gpu-host facts gate (blocks M3/M4 planning).** Answer §7's questions on the box before M3/M4 scheduling is anything but speculative. A red answer to ACS-without-override (a) or emulated-AMD-Vi-for-passthrough (c) changes the plan, not just the schedule.
 
 **Gate G3 — M0 exit / spec freeze (blocks M1 starting on the right target).** M0 is declared only when a fresh-checkout engineer reproduces, from one command, `BOOTLOAD_COMPLETE → MES/direct-MEC → completed wave → expected VRAM value`, **and** the host-contract ioctl→capability mapping is frozen with each op tagged VERIFIED / TRUSTED-STUB / UNTRUSTED. That frozen surface is what M1–M3 verify against.
 
@@ -180,16 +180,16 @@ T0.5 (hosting the C++ `lite::` stack with no POSIX) is the single largest cost a
 
 Concrete, self-serve, all on Track B (no proof engineer needed). Ordered.
 
-1. **Reproduce the known-good baseline on shark-a (T0.0).** Cold BMC power-cycle → `insmod amdgpu_lite.ko` → firmware staged → `LITE_MES_RECIPE=1` bring-up to `RLC_RLCS_BOOTLOAD_STATUS == 0x8000003f` → run the multi-dispatch test → `SURVIVED N dispatches; verify=PASS`. Capture that log; it is the M0 target signature.
+1. **Reproduce the known-good baseline on gpu-host (T0.0).** Cold BMC power-cycle → `insmod amdgpu_lite.ko` → firmware staged → `LITE_MES_RECIPE=1` bring-up to `RLC_RLCS_BOOTLOAD_STATUS == 0x8000003f` → run the multi-dispatch test → `SURVIVED N dispatches; verify=PASS`. Capture that log; it is the M0 target signature.
 2. **`strace` the real stack during step 1** and commit the syscall set as `docs/lite-syscall-surface.txt`. This is the authoritative input to T0.5 (the no-POSIX personality) and the single most schedule-relevant fact you can gather early.
-3. **Answer the shark-a facts (§7 / [`dev-infra.md`](dev-infra.md) §6)** and write `docs/sharka-facts.md`: ACS + IOMMU-group singleton *without* `pcie_acs_override` (a); ReBAR/BAR-size posture (b); whether QEMU can present `amd-iommu`/`virtio-iommu` that translates for the passthrough gfx1201 (c); the empirical per-POST bring-up budget (d).
+3. **Answer the gpu-host facts (§7 / [`dev-infra.md`](dev-infra.md) §6)** and write `docs/gpuhost-facts.md`: ACS + IOMMU-group singleton *without* `pcie_acs_override` (a); ReBAR/BAR-size posture (b); whether QEMU can present `amd-iommu`/`virtio-iommu` that translates for the passthrough gfx1201 (c); the empirical per-POST bring-up budget (d).
 4. **Stand up the repo skeleton** per [`repo-structure.md`](repo-structure.md): virtual Cargo workspace, both custom target JSONs, `-Zbuild-std` wired, `rust-toolchain.toml` copied verbatim from the chosen Verus release, `toolchain/verus.lock`, `cargo-deny`. Get the scaffold to the litmus state — everything compiles, TCB proofs are trivially green (crux proof present but `admit()`-guarded and non-load-bearing), even before there is a bootable image.
-5. **Spike the bootable nucleus (T0.1 start).** *(Boot default for the shark-a libvirt flow is PVH direct-boot — no ISO; Limine-on-ISO in `repo-structure.md` §3.2 is the standalone/dev alternative.)* PVH ELF note → long-mode trampoline → serial (`uart_16550` on `0x3F8`) → GDT/IDT with a double-fault IST → paging from the PVH memory map → LAPIC/TSC timer → bitmap frame allocator with a separate DMA-capable pool. Acceptance: `qemu-system-x86_64 -enable-kvm -kernel nucleus.elf -serial mon:stdio` prints boot progress and a forced page-fault dumps cleanly.
-6. **Fork the shark-a boot assets.** `libvirt/rustproof-gpu.xml` (clone of the working GPU-passthrough domain: same `<hostdev>` gfx1201 + `.1` audio, `managed='no'`, direct-boot the nucleus ELF, serial→host pty) and `libvirt/start-rustproof-vm.sh` (fork of `gist-tri-os/start-gpu-vm.sh` with `VM=rustproof-gpu`, preserving the `reset_method=""` no-FLR trick verbatim and swapping the SSH-wait for a serial-banner wait).
+5. **Spike the bootable nucleus (T0.1 start).** *(Boot default for the gpu-host libvirt flow is PVH direct-boot — no ISO; Limine-on-ISO in `repo-structure.md` §3.2 is the standalone/dev alternative.)* PVH ELF note → long-mode trampoline → serial (`uart_16550` on `0x3F8`) → GDT/IDT with a double-fault IST → paging from the PVH memory map → LAPIC/TSC timer → bitmap frame allocator with a separate DMA-capable pool. Acceptance: `qemu-system-x86_64 -enable-kvm -kernel nucleus.elf -serial mon:stdio` prints boot progress and a forced page-fault dumps cleanly.
+6. **Fork the gpu-host boot assets.** `libvirt/rustproof-gpu.xml` (clone of the working GPU-passthrough domain: same `<hostdev>` gfx1201 + `.1` audio, `managed='no'`, direct-boot the nucleus ELF, serial→host pty) and `libvirt/start-rustproof-vm.sh` (fork of `start-gpu-vm.sh` with `VM=rustproof-gpu`, preserving the `reset_method=""` no-FLR trick verbatim and swapping the SSH-wait for a serial-banner wait).
 7. **Decide the T0.8 bring-up-port question now.** C++/Rust port of `bringup.py` (recommended) vs. CPython personality — write the one-paragraph decision into `docs/milestone-M0.md`, because it changes T0.5's surface and you are about to build T0.5.
 8. **Set up the fast CI loop (build + test-qemu).** `cargo build` on the custom target, headless QEMU boot via `isa-debug-exit` (`0x10`→exit 33 pass), `cargo fmt --check`, `clippy -D warnings`. The `proof`/`test-kani` jobs are wired but inert until Track V starts.
 
-Deliverables at end of week 2: the M0 reference log, the syscall surface, `docs/sharka-facts.md`, a compiling workspace, a nucleus that boots to serial under fast QEMU, and the forked libvirt assets. None of this is blocked on the hire.
+Deliverables at end of week 2: the M0 reference log, the syscall surface, `docs/gpuhost-facts.md`, a compiling workspace, a nucleus that boots to serial under fast QEMU, and the forked libvirt assets. None of this is blocked on the hire.
 
 ---
 
@@ -202,22 +202,22 @@ Deliverables at end of week 2: the M0 reference log, the syscall surface, `docs/
 | Proof-engineer hire is slow / never lands | Gate G1 | Tiny talent pool | pursue Mars Research collaboration in parallel; Atmosphere reproduction as hiring test |
 | The **trusted spec** is wrong (AMD-Vi DTE/IO-PTE model doesn't match silicon) | V3/V4 | A wrong spec makes the proof *vacuously* green — the likeliest and hardest-to-catch failure | dedicated review pass against the AMD IOMV spec by someone who has driven AMD-Vi bare-metal; golden-vector the `model/` walker |
 | Atmosphere proofs don't build on our pinned Verus | V2/V3 seed | Open research proofs bit-rot against toolchain drift | check it in a week (it's the first ramp task); Asterinas OSTD structural fallback (no proofs) |
-| `amd-iommu` + VFIO passthrough unsupported on shark-a QEMU | M3 (§7) | Emulated AMD-Vi translation for *assigned* devices historically weak | split M3: verify AMD-Vi table-builder statically (needs no emulator) + corroborate fault-plumbing via virtio-iommu fallback; AMD-Vi-format end-to-end fault moves to M4 |
+| `amd-iommu` + VFIO passthrough unsupported on gpu-host QEMU | M3 (§7) | Emulated AMD-Vi translation for *assigned* devices historically weak | split M3: verify AMD-Vi table-builder statically (needs no emulator) + corroborate fault-plumbing via virtio-iommu fallback; AMD-Vi-format end-to-end fault moves to M4 |
 | ACS faked via `pcie_acs_override` | A2 / M4 | P2P containment axiom empirically unfounded → proof boundary leaks | confirm singleton IOMMU group with no override (§7a); go/no-go input for M4 |
 | Z3/Verus version drift flips proofs red or masks a regression | all of Track V | SMT is nondeterministic under time pressure | hard-pin all three; fixed seed + per-fn rlimit; timeout = red, never skip; upgrades are deliberate re-verify events |
 | Big-lock concurrency serializes multi-tenant GPU dispatch | design (all milestones) | chosen to keep proofs tractable (Atmosphere-style); serializes concurrent submission + leaks a timing channel — tension with the multi-tenant serving direction (spur-k8s/sglang) | conscious, recorded tradeoff for M0–M5; revisit only with a CertiKOS-scale fine-grained-concurrency proof if multi-tenant throughput demands it |
 
 ---
 
-## 7. shark-a facts to confirm first (Gate G2 detail)
+## 7. gpu-host facts to confirm first (Gate G2 detail)
 
 Commands and the go/no-go framing are in [`dev-infra.md`](dev-infra.md) §6. In brief, answer on the box before M3/M4 planning:
 - **(a) ACS / IOMMU-group singleton, no `pcie_acs_override`** — gates the P2P-containment axiom A2. A faked ACS override is a no-go input for M4.
-- **(b) ReBAR / BAR-size posture** — sizes the `MAP_BAR` aperture in the frozen host contract and decides whether `lite::`'s VRAM bump-allocator assumptions hold (contrast the Mac eGPU 256 MB / ReBAR-off path).
+- **(b) ReBAR / BAR-size posture** — sizes the `MAP_BAR` aperture in the frozen host contract and decides whether `lite::`'s VRAM bump-allocator assumptions hold (contrast a constrained 256 MB / ReBAR-off BAR path).
 - **(c) Can QEMU present an emulated AMD-Vi that translates for the passthrough gfx1201?** — decides the whole M3 shape. If yes, M3 is clean AMD-Vi end-to-end. If no, M3 = V3/V4 statically verified over AMD-Vi format + fault-plumbing corroborated via `virtio-iommu`, and the first AMD-Vi-format end-to-end fault demonstration becomes an M4 deliverable.
 - **(d) Empirical per-POST bring-up budget** — is it really ~1 before the PSP wedges? Sets the HW-loop cadence and how the nightly job chunks isolated tests.
 
-Record answers in a living `docs/sharka-facts.md` and gate the M3/M4 milestone entries on them.
+Record answers in a living `docs/gpuhost-facts.md` and gate the M3/M4 milestone entries on them.
 
 ---
 
@@ -233,6 +233,6 @@ Even at M5 with every proof green, the guarantee rests on: the **trusted unsafe 
 1. **T0.8 downgraded** (§3.2) — in-guest MES/IH re-establishment already works on Linux (`lite_mes_ih_reference.py` runs `full_gpu_bringup` post-handover); the residual risk is *re-hosting* under the no-POSIX nucleus (T0.5), not new bring-up. Budget line reweighted to "C++ hosting of already-working bring-up."
 2. **New §3.4** — made the driver-hosting choice explicit: driver-as-process (plan of record, smallest TCB, pays the T0.5 cost) vs. driver-in-a-thin-Linux-guest with the nucleus as a tiny confining hypervisor (retires the T0.5 risk, larger confined blob). Decide before starting T0.5.
 3. **M3→M4 caveat** (§2, §7c) — an emulated AMD-Vi that translates for a *passthrough* device is historically weak; the first *load-bearing* DMA-reach proof likely slides to bare-metal M4.
-4. **Boot default reconciled** — PVH direct-boot is the shark-a M0 default; `repo-structure.md` §3.2 updated to match (Limine-on-ISO demoted to standalone/dev).
+4. **Boot default reconciled** — PVH direct-boot is the gpu-host M0 default; `repo-structure.md` §3.2 updated to match (Limine-on-ISO demoted to standalone/dev).
 5. **Big-lock tradeoff** added to the risk register (§6) — serializes multi-tenant GPU dispatch; conscious M0–M5 tradeoff.
 6. **Gate G1 rewritten** (§4) to the **AI-agent proof-writer** approach (agent harness + spec-author/reviewer replaces the scarce full-time proof-engineer hire; hire / Mars-collab become the M3-crux fallback). New companion doc [`ai-proof-writer.md`](ai-proof-writer.md).

@@ -1,10 +1,9 @@
 # Rustproof Host Contract — Nucleus ⇄ untrusted `lite::` driver IPC
 
-> **Status:** spec surface (2026-07-21). Companion to the decision doc
-> [`plans/verified-gpu-host-os.md`](../plans/verified-gpu-host-os.md) and research brief
-> [`plans/verified-gpu-host-os-research-brief.md`](../plans/verified-gpu-host-os-research-brief.md).
-> Re-expresses the `amdgpu_lite` ioctl surface (from
-> [`plans/cpp-windows-hip-port.md` §1L.1/§1L.7](../plans/cpp-windows-hip-port.md)) as a
+> **Status:** spec surface (2026-07-21). Companion to
+> [`implementation-plan.md`](implementation-plan.md) and [`research-brief.md`](research-brief.md).
+> Re-expresses the internal `amdgpu_lite` ioctl surface (the `lite::` driver's kernel-shim
+> ioctls, §1L.1/§1L.7 of the internal port notes) as a
 > capability-gated IPC contract between the **verified Rust+Verus nucleus** and the
 > **untrusted `lite::` gfx1201 driver process**.
 >
@@ -65,8 +64,8 @@ milestones — only which agent enforces it. That is deliberate: freeze it once,
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-gfx1201 concrete facts this contract is written against (from the tri-OS bring-up, `gist-tri-os/`):
-PCI `1002:7551` (RX 9070 XT / AI PRO R9700, RDNA4) at BDF e.g. `0000:c3:00.0` + HDMI-audio `.1`;
+gfx1201 concrete facts this contract is written against (from the tri-OS bring-up, ``):
+PCI `1002:7551` (RX 9070 XT / AI PRO R9700, RDNA4) at BDF e.g. `0000:03:00.0` + HDMI-audio `.1`;
 three BARs — an **MMIO register BAR** (GC/GMC/NBIO registers), a **doorbell aperture BAR** (middle
 BAR by size, uncached), and a **VRAM aperture BAR** (resizable; 256 MiB with ReBAR off, full size
 with ReBAR on); the **doorbell is dead under passthrough**, so submission is an MMIO poke of
@@ -593,7 +592,7 @@ Named here so the contract doesn't over-claim (decision doc §6 A2/A3, §3 resid
 - **MSI/MSI-X injection** — an interrupt-remapping fidelity axiom (A3), an out-of-scope channel; the
   doorbell/IRQ path (§5.5) is trusted-stub, not verified.
 - **PCIe peer-to-peer** — depends on ACS being present on the path; assumed, not proven (A2). Confirm
-  shark-a topology provides ACS (decision doc §8 R2).
+  gpu-host topology provides ACS (decision doc §8 R2).
 - **ATS/PRI translated requests** — disabled at the DTE (V4). If a future SVM/unified-memory workload
   forced ATS on, the device would become partially trusted and this clean argument weakens — hence the
   **default decision: no SVM, static pinned DMA buffers only** (decision doc §8 open question).
@@ -763,7 +762,7 @@ there is one post-state to reason about per op, success or failure).
   host-pinned guest-physical); M3 the nucleus enforces them against an emulated AMD-Vi (`dma_addr` =
   nucleus-assigned IOVA); M4 against real AMD-Vi. Same types, same preconditions, different enforcer —
   see the §5.3 note and decision doc §3 staging table.
-- **Owed decisions that touch this contract (decision doc §8):** confirm shark-a provides **ACS** (§6.5
+- **Owed decisions that touch this contract (decision doc §8):** confirm gpu-host provides **ACS** (§6.5
   P2P residual); confirm QEMU can present an **emulated/nested AMD-Vi with shadowing** (else M3's
   `ALLOC_GTT` load-bearing path jumps straight to bare metal); confirm the x86 **ReBAR/BAR-size**
   posture (affects the VRAM-aperture `MAP_BAR` window and the top-of-VRAM IP-discovery read).

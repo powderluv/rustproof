@@ -1,6 +1,6 @@
 # Rustproof — Verified Nucleus Internal Architecture
 
-`docs/nucleus-design.md` · status: **design, pre-M1 (staffing-gated)** · target: KVM guest on `shark-a` (x86_64) dispatching gfx1201 compute via the untrusted C++ `lite::` driver
+`docs/nucleus-design.md` · status: **design, pre-M1 (staffing-gated)** · target: KVM guest on `gpu-host` (x86_64) dispatching gfx1201 compute via the untrusted C++ `lite::` driver
 
 ---
 

@@ -14,7 +14,7 @@
 
 3. **The single biggest formal-methods gap in this project is not the kernel — it is verified IOMMU/DMA confinement.** No shipping verified kernel has a machine-checked proof that covers an untrusted DMA device behind an IOMMU. seL4's proof *assumes DMA is off or trusted*; its VT-d/SMMU support is explicitly outside every verified configuration. ([verified-configurations](https://docs.sel4.systems/projects/sel4/verified-configurations.html)) Closing this requires *new* proof work: a device-DMA model plus verified IOMMU-management code. Scope it as first-class, not as a config flag.
 
-4. **On x86-64 — the shark-a target — seL4 is at its weakest.** It has only C-level functional correctness: **no** binary/translation-validation proof (so the compiler is trusted) and **no** integrity, availability, or confidentiality proofs. All of seL4's strong security guarantees exist on AArch64/RISC-V. Worse, seL4's x86 hypervisor path is tested on Intel VT-x; AMD-V is documented as "wasn't tested." ([verified-configurations](https://docs.sel4.systems/projects/sel4/verified-configurations.html); [libsel4vm](https://docs.sel4.systems/projects/virtualization/docs/libsel4vm.html))
+4. **On x86-64 — the gpu-host target — seL4 is at its weakest.** It has only C-level functional correctness: **no** binary/translation-validation proof (so the compiler is trusted) and **no** integrity, availability, or confidentiality proofs. All of seL4's strong security guarantees exist on AArch64/RISC-V. Worse, seL4's x86 hypervisor path is tested on Intel VT-x; AMD-V is documented as "wasn't tested." ([verified-configurations](https://docs.sel4.systems/projects/sel4/verified-configurations.html); [libsel4vm](https://docs.sel4.systems/projects/virtualization/docs/libsel4vm.html))
 
 5. **Atmosphere (Rust + Verus, x86-64, SOSP'25) is the closest ready-made match to this project's exact threat model.** It already verifies multi-process isolation and confines untrusted devices behind an IOMMU whose *page tables* are managed by verified code, at a **3.32:1 proof-to-code ratio and ~2–2.5 person-years** — roughly an order of magnitude cheaper than seL4. ([2025-sosp-atmo.pdf](https://mars-research.github.io/doc/2025-sosp-atmo.pdf)) *(Note: a 7.5:1 figure appearing in some summaries is an error corrected against the SOSP'25 paper.)*
 
@@ -22,7 +22,7 @@
 
 7. **fe2o3 is a philosophically-aligned experiment, not an adoptable component.** It is a ~5-day-old, single-author proof-of-concept that compiles only f32/f64 elementwise 1-D kernels, has no atomics/LDS/barriers/reductions, an unimplemented general-lowering path, and — critically — depends on the *HIP runtime*, the exact stack lite:: bypasses. Its Kani/Verus "verifiability" is hypothetical and not wired in. ([github.com/powderluv/fe2o3](https://github.com/powderluv/fe2o3))
 
-8. **Because shark-a uses VFIO passthrough, the untrusted host hypervisor programs the physical IOMMU and sits silently inside the verified guest's TCB.** Removing it requires either (a) trusting/verifying the host, (b) a guest vIOMMU (achievable via a software shadow page table even without hardware nested translation), or (c) confidential computing (SEV-SNP + SEV-TIO/TDISP) — which a *consumer RDNA4 gfx1201 card almost certainly does not support*. This is a first-milestone scoping decision. ([vfio-internals](https://kernel-internals.org/iommu/vfio-internals/))
+8. **Because gpu-host uses VFIO passthrough, the untrusted host hypervisor programs the physical IOMMU and sits silently inside the verified guest's TCB.** Removing it requires either (a) trusting/verifying the host, (b) a guest vIOMMU (achievable via a software shadow page table even without hardware nested translation), or (c) confidential computing (SEV-SNP + SEV-TIO/TDISP) — which a *consumer RDNA4 gfx1201 card almost certainly does not support*. This is a first-milestone scoping decision. ([vfio-internals](https://kernel-internals.org/iommu/vfio-internals/))
 
 ---
 
@@ -36,7 +36,7 @@ Everything on the device side of the PCIe link — DMA engines, and the PSP/SOS/
 
 ### 2.2 The honest TCB
 
-For a verified guest OS on shark-a, the trusted computing base includes, at minimum:
+For a verified guest OS on gpu-host, the trusted computing base includes, at minimum:
 
 - **The verifier stack itself:** the theorem prover / SMT solver (Isabelle, Coq, or Z3), and — for any Rust approach — the Rust compiler and the verifier's frontend and axioms. Atmosphere's TCB explicitly lists Verus frontend, Z3, rustc, ~700 lines of assumed axioms, and 300+1,900 lines for tracked-permission setters. ([2025-sosp-atmo.pdf](https://mars-research.github.io/doc/2025-sosp-atmo.pdf))
 - **Unverified boot code and in-kernel assembly** (true of every verified kernel).
@@ -67,7 +67,7 @@ seL4 is the gold standard: a capability microkernel (canonically 8.7 KLOC C / ~6
 
 But the guarantees are sharply architecture-dependent, and **the deployment target lands on the weakest configuration**:
 
-| Property | AArch32 | AArch64 | RISC-V RV64 | **x86-64 (shark-a)** |
+| Property | AArch32 | AArch64 | RISC-V RV64 | **x86-64 (gpu-host)** |
 |---|---|---|---|---|
 | Functional correctness (to C) | ✅ (+fast path) | ✅ (+fast path) | ✅ | ✅ (no fast path) |
 | Binary/translation validation | ✅ | ❌ | ✅ | **❌ (compiler trusted)** |
@@ -78,7 +78,7 @@ But the guarantees are sharply architecture-dependent, and **the deployment targ
 
 Additional seL4 constraints for this project:
 - **DMA assumed off/trusted; IOMMU/VT-d unverified.** The one mechanism you'd use to cage the GPU is outside every proof. ([FAQ](https://sel4.systems/About/FAQ.html))
-- **AMD-V hypervisor path "wasn't tested"** (Intel VT-x is the tested path). shark-a is AMD. ([libsel4vm](https://docs.sel4.systems/projects/virtualization/docs/libsel4vm.html))
+- **AMD-V hypervisor path "wasn't tested"** (Intel VT-x is the tested path). gpu-host is AMD. ([libsel4vm](https://docs.sel4.systems/projects/virtualization/docs/libsel4vm.html))
 - **Microkit** (the natural way to lay out a static multi-process userland: ≤63 protection domains, memory regions, channels) is itself unverified and rides the MCS config, which has **no x86 verification roadmap** (RISC-V 2026, AArch64 2027 only). ([microkit manual](https://docs.sel4.systems/projects/microkit/manual/latest/))
 - WCET/timing analysis has lapsed (old ARM cores only; the *first* such analysis was Blackham et al. RTSS 2011, not Sewell 2017).
 
@@ -214,12 +214,12 @@ The mainline amdgpu driver is ~5.9M lines, but **~4.4M are auto-generated regist
 
 ---
 
-## 8. shark-a VM bring-up: first-milestone shape
+## 8. gpu-host VM bring-up: first-milestone shape
 
 ### 8.1 Baseline topology
 
 ```
-shark-a (x86_64, AMD)
+gpu-host (x86_64, AMD)
  ├─ Host: KVM/QEMU + VFIO  ── programs the PHYSICAL AMD-Vi IOMMU (GPA→HPA)
  │                             ⚠ in the guest's isolation TCB (milestone-1 decision)
  ├─ BMC (out-of-band power cycle for GPU/firmware resets)
@@ -240,7 +240,7 @@ lite:: already does exactly the compute-only bring-up subset needed (PSP/SOS loa
 1. **VFIO trust posture.** Plain passthrough maps *all* guest RAM into the GPU's IOMMU domain — the GPU is confined to the guest but can DMA anywhere *within* it unless the guest runs its own vIOMMU. ([DMA survey](https://dl.gi.de/bitstreams/1a7e69c5-eb7b-4ccb-b270-a119557a62e1/download)) Choose one:
    - **(a) Trust the host** for milestone 1 (fastest; honestly documents the host in the TCB).
    - **(b) Guest vIOMMU** so the verified guest owns stage-1 confinement — **achievable via a software shadow page table synced through VFIO MAP/UNMAP even without hardware nested translation** (at a performance cost); hardware 2-stage nesting is the performant path, not a hard prerequisite. ([KVM-Forum vIOMMU](https://www.linux-kvm.org/images/a/a6/KVM_Forum_2018_viommu_vfio.pdf))
-   - **(c) Confidential computing** (SEV-SNP + SEV-TIO/TDISP) to evict the host — **almost certainly unavailable on a consumer RDNA4 gfx1201 card**; treat as out of scope for shark-a. ([GPU-CC analysis, arXiv 2507.02770](https://arxiv.org/pdf/2507.02770))
+   - **(c) Confidential computing** (SEV-SNP + SEV-TIO/TDISP) to evict the host — **almost certainly unavailable on a consumer RDNA4 gfx1201 card**; treat as out of scope for gpu-host. ([GPU-CC analysis, arXiv 2507.02770](https://arxiv.org/pdf/2507.02770))
 2. **Static compute arena vs dynamic mapping** — commit to a fixed, small set of GPU-reachable guest-physical pages to keep the DMA-reach proof simple.
 3. **Minimal page set** — enumerate precisely which pages lite:: must map (AQL ring, MES/HQD/MQD, doorbells, IH ring, kernargs, I/O buffers) and confirm each can be a dedicated page with strict invalidation without breaking gfx1201 bring-up.
 4. **Confirm** the gfx1201 is in a singleton IOMMU group and ATS/peer-to-peer is disable-able in both host and guest.
@@ -248,7 +248,7 @@ lite:: already does exactly the compute-only bring-up subset needed (PSP/SOS loa
 
 ### 8.4 Suggested milestone sequencing (for the design phase to refine)
 
-- **M0:** boot the chosen base OS as a KVM guest on shark-a with gfx1201 passed through; lite:: (C++, unverified) dispatches one compute kernel end-to-end. Proves the plumbing; nothing verified yet.
+- **M0:** boot the chosen base OS as a KVM guest on gpu-host with gfx1201 passed through; lite:: (C++, unverified) dispatches one compute kernel end-to-end. Proves the plumbing; nothing verified yet.
 - **M1:** Rust port of lite:: with the isolation-critical MMIO/DMA logic isolated in one `unsafe` module; audited, not yet proven. Document the honest TCB including the host.
 - **M2:** verify the DMA-reach confinement invariant on that module with Verus; add the AMD-Vi IOMMU-table proof (the crux — new proof work).
 - **M3:** guest vIOMMU (shadow-page-table) to remove the host from the guest's isolation TCB, if that posture is chosen.
@@ -262,7 +262,7 @@ lite:: already does exactly the compute-only bring-up subset needed (PSP/SOS loa
 
 **R2 — The GPU/firmware is permanently unverifiable; guarantees stop at confinement.** PSP/SOS/SMU/MES/CP are closed blobs with an exploit history. "Verified host OS" can never mean "verified GPU." Messaging and threat model must state this plainly. *Open:* can firmware at least be measured/pinned at bring-up?
 
-**R3 — Under VFIO the untrusted host is in the guest's TCB.** Confidential-computing eviction is likely physically unavailable on consumer gfx1201, forcing "trust the host" or a software-shadow vIOMMU. *Open:* which posture for milestone 1, and does shark-a's platform support a guest vIOMMU for a passthrough device?
+**R3 — Under VFIO the untrusted host is in the guest's TCB.** Confidential-computing eviction is likely physically unavailable on consumer gfx1201, forcing "trust the host" or a software-shadow vIOMMU. *Open:* which posture for milestone 1, and does gpu-host's platform support a guest vIOMMU for a passthrough device?
 
 **R4 — x86-64 is the weakest arch for the strongest existing kernel.** If Option A (seL4) is chosen, you get only C-level functional correctness on x86, no binary/security proofs, untested AMD-V hypervisor, no MCS-on-x86 roadmap. This pushes toward a Rust base (Atmosphere) but that too has an Intel-centric trusted IOMMU layer needing an AMD rewrite. *Open:* Rust-native vs Isabelle/Coq base; trust-host vs verify-host.
 

@@ -1,10 +1,10 @@
 # docs/milestone-M0.md — Rustproof M0: boot the nucleus as a KVM guest and dispatch one gfx1201 wave through untrusted `lite::`
 
-> **Status:** engineering task breakdown, 2026-07-21. Derives directly from the decision doc `plans/verified-gpu-host-os.md` §5-M0 and research brief `plans/verified-gpu-host-os-research-brief.md` §8. Concrete file/flag anchors are from `plans/cpp-windows-hip-port.md`, `gist-tri-os/start-gpu-vm.sh`, `gist-tri-os/README.md`, `multi_dispatch_test.cpp`, `run-multi-dispatch-test.sh`.
+> **Status:** engineering task breakdown, 2026-07-21. Derives directly from the decision doc `plans/verified-gpu-host-os.md` §5-M0 and research brief `plans/verified-gpu-host-os-research-brief.md` §8. Concrete file/flag anchors are from `plans/cpp-windows-hip-port.md`, `start-gpu-vm.sh`, `README.md`, `multi_dispatch_test.cpp`, `run-multi-dispatch-test.sh`.
 
 ## 0. What M0 is, and what it is *not*
 
-**M0 goal.** A minimal Rustproof nucleus boots as a **KVM guest on shark-a** (handed the gfx1201 via `gist-tri-os/start-gpu-vm.sh`, no-FLR), hosts the existing C++ `lite::` gfx1201 stack as an **untrusted user process**, and that process dispatches **one real compute wave** — reusing `multi_dispatch_test.cpp` / `run-multi-dispatch-test.sh` (`inc` kernel; the result value is verified in VRAM, `x[i] == N`).
+**M0 goal.** A minimal Rustproof nucleus boots as a **KVM guest on gpu-host** (handed the gfx1201 via `start-gpu-vm.sh`, no-FLR), hosts the existing C++ `lite::` gfx1201 stack as an **untrusted user process**, and that process dispatches **one real compute wave** — reusing `multi_dispatch_test.cpp` / `run-multi-dispatch-test.sh` (`inc` kernel; the result value is verified in VRAM, `x[i] == N`).
 
 **M0 verifies nothing.** There is **no machine-checked property at M0**. It is a physical-feasibility gate for the untrusted-driver architecture. Per the decision doc's staging table (§3) and rows A7/A8 of the V/A/U table (§6), device isolation at M0 is enforced entirely by the **host Linux / KVM / VFIO** stack — the host programs the physical AMD-Vi and pins guest RAM to the device. Any address-space or capability machinery the nucleus grows here is exercised, not proven. The first Verus property is M1; the first *load-bearing* DMA-reach proof is M3. Say this in every M0 status report.
 
@@ -20,7 +20,7 @@
 | ROCr (`libhsa-runtime64`), HIP/clr (`libamdhip64`), comgr **loader** path | **Reuse as prebuilt Linux binaries** under the personality shim (T0.5), or statically relink. Runtime *compilation* (HIPRTC/comgr/LLVM) is **not** needed — the kernel is AOT-compiled by `hipcc --offload-arch=gfx1201`. |
 | Python bring-up `userspace_driver/python/amd_gpu_driver/backends/amdgpu_lite/bringup.py` (+ `windows/psp_init.py`, `windows/ring_init.py`) — `LITE_MES_RECIPE` | **Reuse on the host** for the fragile firmware-load stages; the RAM-ring stages must run in-guest (T0.8) — **port to C++/Rust or run under a CPython personality (a real fork, see T0.8)**. |
 | `multi_dispatch_test.cpp` / `run-multi-dispatch-test.sh` | **Reuse as the M0 workload** (adapt the runner for the guest; the `.cpp` is unchanged). |
-| `gist-tri-os/start-gpu-vm.sh` (VFIO bind, `reset_method` cleared, no-FLR) | **Reuse as-is** for host-side handover. |
+| `start-gpu-vm.sh` (VFIO bind, `reset_method` cleared, no-FLR) | **Reuse as-is** for host-side handover. |
 | `amdgpu_lite.ko` (`userspace_driver/amdgpu_lite/{main,pci_setup,memory,irq}.c`) | **Not run in the guest.** Its *services* (BAR mmap, VRAM/GTT alloc, GPU-PT program, MSI-X→eventfd) are **absorbed into the nucleus + host-contract server** (T0.4). Read it as the spec for what those services must do. |
 | **The nucleus, the POSIX/Linux personality, the host-contract server, firmware provisioning, in-guest MES/IH bring-up** | **All new work.** |
 
@@ -31,7 +31,7 @@
 Under VFIO passthrough the guest sees gfx1201 (`1002:7551`) as an ordinary PCIe device on the guest's PCIe bus. So inside the guest the nucleus does **not** touch AMD-Vi (that is M3); it does PCIe enumeration + BAR mapping + guest-physical DMA + (optionally) MSI-X. Guest-physical→host-physical is the host VFIO/IOMMU's job.
 
 ```
- shark-a host (Linux, TRUSTED at M0):
+ gpu-host host (Linux, TRUSTED at M0):
    start-gpu-vm.sh  ->  vfio-pci bind, reset_method="" (no FLR), virsh start
    (optionally) LITE_MES_RECIPE bring-up to BOOTLOAD_COMPLETE on the raw card first
         │  no-FLR handover: freshly-POSTed card enters the guest
@@ -69,12 +69,12 @@ Ordering is the build order. Hard dependencies are noted; several tasks parallel
 
 ---
 
-### T0.0 — Reproduce the known-good baseline on shark-a (host, no nucleus)
+### T0.0 — Reproduce the known-good baseline on gpu-host (host, no nucleus)
 - **Goal.** Establish the reference the M0 port is measured against: the exact same `lite::` dispatch works on host Linux today. (Decision-doc action #5.)
 - **Steps.**
-  1. Cold power-cycle shark-a (BMC) for a fresh POST.
+  1. Cold power-cycle gpu-host (BMC) for a fresh POST.
   2. `insmod amdgpu_lite.ko`; decompress firmware (`psp_14_0_3_*`, `gc_12_0_1_*`, `sdma_7_0_*` `.bin.zst` → `/lib/firmware/amdgpu/`).
-  3. Run `LITE_MES_RECIPE=1` bring-up to `BOOTLOAD_COMPLETE` (`RLC_RLCS_BOOTLOAD_STATUS == 0x8000003f`) + MES start; then `run-multi-dispatch-test.sh` (or its shark-a analog) → one wave + VRAM verify.
+  3. Run `LITE_MES_RECIPE=1` bring-up to `BOOTLOAD_COMPLETE` (`RLC_RLCS_BOOTLOAD_STATUS == 0x8000003f`) + MES start; then `run-multi-dispatch-test.sh` (or its gpu-host analog) → one wave + VRAM verify.
 - **Files/tools.** `userspace_driver/amdgpu_lite/`, `.../backends/amdgpu_lite/bringup.py`, `.../backends/windows/{psp_init,ring_init}.py`, `multi_dispatch_test.cpp`.
 - **Acceptance.** Captured log: `BOOTLOAD_STATUS=0x8000003f` → MES/direct-MEC → `SURVIVED N dispatches; verify=PASS`. This log is the M0 target signature.
 - **Effort.** 0.5–1 wk. **Risk.** Low (already works per README), except PSP-wedge flakiness → the retry loop in `run-multi-dispatch-test.sh` + BMC cycle. **Deps.** none.
@@ -134,7 +134,7 @@ Ordering is the build order. Hard dependencies are noted; several tasks parallel
   8. **ABI shim.** Present a synthetic `/dev/amdgpu_lite0` fd whose `ioctl()`/`mmap()` (via T0.5) route to this server, so `amd_lite_linux_transport.cpp` is reused verbatim.
 - **Files/tools.** New `hostcontract/` server; spec = `plans/cpp-windows-hip-port.md §1L.1` + `amdgpu_lite/{pci_setup,memory,irq}.c`; consumer = `amd_lite_linux_transport.cpp`, `amdgpu_lite_uapi.h`.
 - **Acceptance.** From a user process: open `/dev/amdgpu_lite0`, `GET_INFO` returns `1002:7551` + BAR sizes; `mmap` the MMIO BAR and read a known GC register; `ALLOC_GTT` a page, write via CPU, read back.
-- **Effort.** 4–8 wk. **Risk.** **High** — BAR/DMA/ECAM correctness in a from-scratch guest; confirm shark-a's **ReBAR/BAR-size** posture for x86 passthrough (decision-doc R4 open item — differs from the Mac 256 MB path). M0 workload is tiny, so even a small VRAM window suffices. **Deps.** T0.2 (caps), T0.3 (user process). **Freeze the ioctl→capability mapping here** as the M1–M3 spec surface.
+- **Effort.** 4–8 wk. **Risk.** **High** — BAR/DMA/ECAM correctness in a from-scratch guest; confirm gpu-host's **ReBAR/BAR-size** posture for x86 passthrough (decision-doc R4 open item — differs from a constrained 256 MB / ReBAR-off path). M0 workload is tiny, so even a small VRAM window suffices. **Deps.** T0.2 (caps), T0.3 (user process). **Freeze the ioctl→capability mapping here** as the M1–M3 spec surface.
 
 ---
 
@@ -142,9 +142,9 @@ Ordering is the build order. Hard dependencies are noted; several tasks parallel
 - **Goal.** Run the large, multithreaded C++ ROCr/HIP/`lite::` stack (and the test) with no Linux kernel under it. This is the single biggest M0 item and the one most often under-budgeted (R6).
 - **Decision (recommended): a Linux-syscall *personality*, not a fresh libc.** Three options:
   - **(a) relibc-derived shim (Redox libc).** Rust-native, Redox synergy — but **relibc's C++/libstdc++ support is one of Redox's weakest areas**, and ROCr/HIP is heavy C++ (std::thread, exceptions, RTTI, iostreams). High porting risk.
-  - **(b) musl-static + Linux-syscall emulation (recommended).** Link the stack against static **musl + libstdc++/libc++** (the well-trodden Alpine path), and implement the *bounded subset of the x86_64 Linux syscall ABI* those binaries actually issue, backed by nucleus services. The driver ELF is then **the same binary that runs on shark-a today**. Trap `syscall` in the guest; the nucleus reflects unknown numbers to a userland **"Linux personality" server** (keeps the nucleus small and out of the future TCB).
+  - **(b) musl-static + Linux-syscall emulation (recommended).** Link the stack against static **musl + libstdc++/libc++** (the well-trodden Alpine path), and implement the *bounded subset of the x86_64 Linux syscall ABI* those binaries actually issue, backed by nucleus services. The driver ELF is then **the same binary that runs on gpu-host today**. Trap `syscall` in the guest; the nucleus reflects unknown numbers to a userland **"Linux personality" server** (keeps the nucleus small and out of the future TCB).
   - **(c) bespoke libc.** Most control, most work — rejected for M0.
-- **Concrete syscall/service surface the stack needs** (enumerate empirically with `strace` on shark-a during T0.0, then implement exactly this set):
+- **Concrete syscall/service surface the stack needs** (enumerate empirically with `strace` on gpu-host during T0.0, then implement exactly this set):
   - **Memory:** `mmap`/`munmap`/`mprotect`/`brk` (heap + BAR/DMA mappings) → nucleus map-cap.
   - **Device:** `openat`/`close`/`ioctl` on `/dev/amdgpu_lite0` → T0.4 host contract.
   - **Firmware file reads:** `openat`/`read`/`pread`/`fstat`/`close` on `/lib/firmware/amdgpu/*.bin` → T0.6 RO file service.
@@ -165,7 +165,7 @@ Ordering is the build order. Hard dependencies are noted; several tasks parallel
 - **Steps.**
   1. Build a small read-only RAM image (cpio/tar) containing exactly the gfx1201 blobs the recipe reads: **`psp_14_0_3_*`, `gc_12_0_1_*` (incl. `gc_*_uni_mes.bin`), `sdma_7_0_*`** — decompressed from `.bin.zst`.
   2. Load it via QEMU `-initrd` (or embed in the nucleus image); a tiny nucleus RO file service answers T0.5's `openat`/`read` at `/lib/firmware/amdgpu`.
-- **Files/tools.** cpio; the blob list from `gist-tri-os/README.md` §"Firmware staging"; recipe reads with `--fw-dir /lib/firmware/amdgpu`.
+- **Files/tools.** cpio; the blob list from `README.md` §"Firmware staging"; recipe reads with `--fw-dir /lib/firmware/amdgpu`.
 - **Acceptance.** In-guest, the driver `open`/`read`s each required blob and byte-length matches the host copy.
 - **Effort.** 1–2 wk. **Risk.** Low. **Deps.** T0.5 (file syscalls).
 
@@ -228,7 +228,7 @@ Ordering is the build order. Hard dependencies are noted; several tasks parallel
 
 ---
 
-## 3. libvirt/QEMU specifics (shark-a)
+## 3. libvirt/QEMU specifics (gpu-host)
 
 Extend the `start-gpu-vm.sh` domain to **direct-boot the nucleus** and pass through the GPU (+ its `.1` HDMI-audio function, per the script's `GPU_AUDIO`):
 
@@ -243,10 +243,10 @@ Extend the `start-gpu-vm.sh` domain to **direct-boot the nucleus** and pass thro
 <devices>
   <serial type='pty'/><console type='pty'/>                <!-- ttyS0 to the host -->
   <hostdev mode='subsystem' type='pci' managed='no'>       <!-- managed='no': start-gpu-vm.sh already bound vfio-pci, no FLR -->
-    <source><address domain='0x0000' bus='0xc3' slot='0x00' function='0x0'/></source>
+    <source><address domain='0x0000' bus='0x03' slot='0x00' function='0x0'/></source>
   </hostdev>
   <hostdev mode='subsystem' type='pci' managed='no'>
-    <source><address domain='0x0000' bus='0xc3' slot='0x00' function='0x1'/></source>
+    <source><address domain='0x0000' bus='0x03' slot='0x00' function='0x1'/></source>
   </hostdev>
 </devices>
 ```
@@ -278,4 +278,4 @@ Sum of the mandatory path ≈ **33–63 engineer-weeks ≈ 8–15 months solo**;
 1. **T0.5 (no-POSIX C++ hosting).** A large, multithreaded C++ runtime with `std::thread`/futex/exceptions and static libstdc++, on a from-scratch kernel. De-risk with an early `strace` capture in T0.0 to fix the exact syscall set, and prototype the personality against a stock ROCr "hello agent" before the real stack.
 2. **T0.8 (in-guest MES/IH bring-up).** The RAM-ring stages don't survive the no-FLR handover, so the guest must re-establish MES/KIQ/IH — today Python. Choose the C++/Rust port (recommended) vs. CPython personality **before** T0.7, because it changes T0.5's surface.
 
-**Carry-forward reminders:** confirm shark-a's **ReBAR/BAR-size** and **ACS** posture (decision doc R2/R4 — shapes T0.4 and later M3/M4); keep the fragile PSP load on known-good Linux (T0.8 host side); and repeat in every M0 write-up that **M0 proves nothing — isolation here is the host IOMMU, not the nucleus** (§0, decision doc A7/A8).
+**Carry-forward reminders:** confirm gpu-host's **ReBAR/BAR-size** and **ACS** posture (decision doc R2/R4 — shapes T0.4 and later M3/M4); keep the fragile PSP load on known-good Linux (T0.8 host side); and repeat in every M0 write-up that **M0 proves nothing — isolation here is the host IOMMU, not the nucleus** (§0, decision doc A7/A8).
