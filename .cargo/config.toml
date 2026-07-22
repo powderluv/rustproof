@@ -1,11 +1,19 @@
-# Default target is the bare-metal kernel target; host tools build with an
-# explicit --target (the xtask orchestrates per-crate targets). See repo-structure.md.
-[build]
-target = "targets/x86_64-rustproof-kernel.json"
+# Rustproof build configuration.
+#
+# The exec/boot build uses STABLE Rust + the built-in freestanding target
+# `x86_64-unknown-none` (no build-std, no custom target JSON) for a fast,
+# dependency-light inner loop. Build + boot the kernel image with:
+#
+#     tools/run-qemu.sh                                     # build + boot + check banner
+#     cargo build -p nucleus --target x86_64-unknown-none --release
+#
+# Host tools (tools/*) build for the host target as usual (no --target).
+#
+# NOTE: the pinned-nightly + custom-target(JSON) + build-std path in
+# docs/repo-structure.md §2-3 is for the FUTURE Verus proof track; it is
+# intentionally NOT the default so the boot spike builds on stable today.
 
-[unstable]
-build-std = ["core", "compiler_builtins", "alloc"]
-build-std-features = ["compiler-builtins-mem"]
-
-[target.'cfg(target_os = "none")']
-runner = "cargo run -p run-vm --"
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=static",
+]

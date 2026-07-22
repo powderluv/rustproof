@@ -1,0 +1,19 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  boot-smoke:
+    name: build nucleus + boot under QEMU
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+      - name: Add bare-metal target
+        run: rustup target add x86_64-unknown-none   # toolchain is pinned by rust-toolchain.toml
+      - name: rustfmt
+        run: cargo fmt --check -p nucleus -p arch-x86_64
+      - name: Boot smoke (PVH -> long mode -> serial -> clean exit)
+        run: tools/run-qemu.sh

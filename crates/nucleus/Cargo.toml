@@ -6,3 +6,4 @@ license.workspace = true
 publish = false
 
 [dependencies]
+arch-x86_64 = { path = "../arch-x86_64" }

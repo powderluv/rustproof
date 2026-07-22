@@ -4,7 +4,7 @@ A small, formally-verifiable **Rust + Verus isolation nucleus** that safely host
 
 > **Honest scope:** Rustproof aims to *verifiably isolate an untrusted GPU driver — it does **not** verify GPU computation.* Two guarantees, split permanently: **isolation / DMA-containment is in scope and verifiable; GPU compute correctness is permanently out of scope.** The nucleus never reasons about what a wave computes, only about what memory the device can reach.
 
-**Status:** design + scaffold stage, **pre-M0**. Nothing verifies yet; nothing boots yet. No in-house proof engineer, so the verification track (M1+) is unstaffed and unscheduled until that gate is cleared — see the plan. The near-term work is ordinary (hard) systems work: boot the nucleus as a KVM guest and get the untrusted driver to dispatch one wave.
+**Status:** early M0. The nucleus **boots** — a minimal image comes up under QEMU via the PVH protocol, switches to 64-bit long mode, brings up COM1 serial, and exits cleanly (the first slice of task T0.1). Not yet: interrupt handling (IDT/exceptions), a frame allocator, address spaces, the GPU driver, or any verification. No in-house proof engineer, so the verification track (M1+) is unstaffed until that gate is restructured — see [`docs/ai-proof-writer.md`](docs/ai-proof-writer.md). The near-term work is ordinary (hard) systems work: grow the nucleus, then get the untrusted driver to dispatch one wave on real hardware.
 
 ## What "verified" will mean here
 
@@ -43,24 +43,30 @@ rustproof/
 
 The C++ `lite::` driver is **never linked into the nucleus** — it is a separate, untrusted process reached only over the capability/IPC ABI.
 
-## Build & run (planned)
+## Build & run
 
-Nothing here works yet; this is the intended loop.
-
-> `gpu-host` throughout these docs is a placeholder for your x86-64 GPU-passthrough machine; the GPU BDF (`0000:03:00.0`) and the libvirt domain/paths are examples — replace with your own.
+The fast inner loop **works today** — stable Rust, the built-in `x86_64-unknown-none`
+target, and QEMU (cross-builds from any host; no GPU needed):
 
 ```bash
-# fast inner loop — no GPU, any Linux; memory-safety/isolation work
-cargo build -p nucleus --release          # custom bare-metal target, -Zbuild-std
-cargo test  -p nucleus                     # boots under headless QEMU, exits via isa-debug-exit
+# build the nucleus image + boot it under QEMU + check the serial banner
+tools/run-qemu.sh                          # => "rustproof: BOOT OK", exit 33 (PASS)
 
-# proof gate (once the verification track is staffed)
-cargo xtask verify                         # pinned Verus + pinned Z3 over the TCB crates
-
-# real loop — gpu-host, gfx1201 passed through, dispatch a wave
-cargo xtask run                            # build → image → VFIO-bind (no-FLR) → boot guest
-                                           # success = "M0: WAVE OK" on the guest serial console
+# or just build the image
+cargo build -p nucleus --target x86_64-unknown-none --release
 ```
+
+Requires a stable Rust toolchain with the `x86_64-unknown-none` target
+(`rustup target add x86_64-unknown-none`) and `qemu-system-x86_64`.
+
+Planned (not wired yet):
+
+```bash
+cargo xtask verify   # proof gate: pinned Verus + Z3 over the TCB crates (verification track)
+cargo xtask run      # real loop on gpu-host: build → image → VFIO-bind (no-FLR) → boot guest
+```
+
+> `gpu-host` throughout these docs is a placeholder for your x86-64 GPU-passthrough machine; the GPU BDF (`0000:03:00.0`) and the libvirt domain/paths are examples — replace with your own.
 
 ## Docs
 

@@ -27,3 +27,10 @@ exclude = ["vendor"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/powderluv/rustproof"
+
+# no_std kernel/userland: no unwinding.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
