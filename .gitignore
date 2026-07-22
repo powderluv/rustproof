@@ -1,0 +1,32 @@
+# Rust build output
+/target
+**/target
+
+# Verus / proof artifacts
+*.smt2
+*.z3-trace
+.verus-log/
+verus-out/
+
+# Kernel / boot images
+*.img
+*.iso
+*.bin
+*.elf
+!**/tests/fixtures/**/*.bin
+
+# GPU firmware blobs (provisioned locally, never committed — see docs/milestone-M0.md)
+firmware/
+*.sbin
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Local env (shark-a creds live in gitignored env files, never in scripts)
+*.env
+!example.env
+vm.env

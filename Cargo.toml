@@ -1,0 +1,29 @@
+# Rustproof — virtual workspace. See docs/repo-structure.md.
+# NOTE: pre-M0 scaffold. Crates are stubs; a full build needs the pinned Verus
+# toolchain + custom bare-metal target (see docs/repo-structure.md sections 2-3).
+[workspace]
+resolver = "2"
+members = [
+    "crates/nucleus-core",
+    "crates/capabilities",
+    "crates/vspace",
+    "crates/ipc",
+    "crates/iommu-amdvi",
+    "crates/arch-x86_64",
+    "crates/abi",
+    "crates/nucleus",
+    "crates/userland-rt",
+    "crates/init",
+    "crates/driver-host",
+    "crates/driver-shim",
+    "tools/xtask",
+    "tools/mkimage",
+    "tools/run-vm",
+    "tools/verify",
+]
+exclude = ["vendor"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/powderluv/rustproof"

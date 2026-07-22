@@ -1,0 +1,7 @@
+# Pin Verus + its bundled Z3 by exact identity. All three move as ONE unit
+# with rust-toolchain.toml and Cargo.lock. See docs/verification.md.
+# PLACEHOLDER values -- fill in when a Verus release is chosen.
+verus_release = "release/0.2025.xx.xx"
+verus_git_sha = "0000000000000000000000000000000000000000"
+z3_version    = "4.12.5"
+z3_sha256     = "REPLACE_ME"

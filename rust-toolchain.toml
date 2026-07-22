@@ -1,0 +1,8 @@
+# PIN THIS to the exact nightly shipped by the pinned Verus release's own
+# rust-toolchain.toml -- do NOT pick a nightly yourself (see docs/verification.md).
+# The channel below is a PLACEHOLDER to be replaced when Verus is pinned.
+[toolchain]
+channel = "nightly-2025-03-01"  # PLACEHOLDER -- sync to toolchain/verus.lock
+components = ["rust-src", "rustc-dev", "llvm-tools-preview"]
+targets = ["x86_64-unknown-none"]
+profile = "minimal"

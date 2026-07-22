@@ -1,0 +1,59 @@
+<!--
+  TEMPLATE domain for the Rustproof KVM guest on shark-a. This is a SKELETON:
+  derive the real domain by cloning your working gfx1201 GPU-passthrough domain
+  (the one the Windows/Linux tri-OS guests use) and changing only two things:
+    1. Boot our image instead of a disk OS (the <os> block below).
+    2. Keep the SAME <hostdev> gfx1201 passthrough block, byte-identical, so the
+       card is presented exactly as the working guests see it.
+  Replace every REPLACE_ME. See docs/repo-structure.md sec 3.3 and docs/dev-infra.md.
+-->
+<domain type='kvm'>
+  <name>rustproof-gpu</name>
+  <memory unit='GiB'>REPLACE_ME</memory>
+  <vcpu>REPLACE_ME</vcpu>
+
+  <os>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <!-- Primary path: boot the Limine ISO (nucleus + init + driver-host modules). -->
+    <boot dev='cdrom'/>
+    <!-- Fallback path (uncomment; requires the PVH/multiboot direct-boot feature):
+    <kernel>/var/lib/rustproof/nucleus.elf</kernel>
+    <cmdline>console=serial</cmdline>
+    -->
+  </os>
+
+  <features><acpi/><apic/></features>
+  <cpu mode='host-passthrough' check='none'/>
+
+  <devices>
+    <!-- The boot ISO built by `cargo xtask image`. -->
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='/var/lib/rustproof/rustproof-boot.iso'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+
+    <!-- gfx1201 passthrough: COPY THIS BLOCK VERBATIM from the working GPU domain
+         (both the GPU function and its .1 audio function). -->
+    <hostdev mode='subsystem' type='pci' managed='no'>
+      <source><address domain='0x0000' bus='0xc3' slot='0x00' function='0x0'/></source>
+    </hostdev>
+    <hostdev mode='subsystem' type='pci' managed='no'>
+      <source><address domain='0x0000' bus='0xc3' slot='0x00' function='0x1'/></source>
+    </hostdev>
+
+    <!-- Serial console -> host file; the M0 smoke test greps this for "M0: WAVE OK". -->
+    <serial type='file'>
+      <source path='/var/log/libvirt/qemu/rustproof-gpu-serial.log'/>
+      <target port='0'/>
+    </serial>
+    <console type='file'>
+      <source path='/var/log/libvirt/qemu/rustproof-gpu-serial.log'/>
+      <target type='serial' port='0'/>
+    </console>
+
+    <!-- M3+: to make the nucleus IOMMU proof load-bearing inside the guest, add an
+         emulated AMD-Vi / virtio-iommu here (see docs/dev-infra.md). Absent at M0-M2. -->
+  </devices>
+</domain>

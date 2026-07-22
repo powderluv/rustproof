@@ -1,0 +1,11 @@
+# Default target is the bare-metal kernel target; host tools build with an
+# explicit --target (the xtask orchestrates per-crate targets). See repo-structure.md.
+[build]
+target = "targets/x86_64-rustproof-kernel.json"
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.'cfg(target_os = "none")']
+runner = "cargo run -p run-vm --"

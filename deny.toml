@@ -1,0 +1,6 @@
+# cargo-deny: lock the dependency graph of the verified TCB crates.
+# TODO(M1): tighten once the Verus support crates (vstd/builtin) are vendored.
+[bans]
+multiple-versions = "warn"
+[advisories]
+yanked = "deny"

@@ -1,0 +1,12 @@
+# Build + boot-smoke gate: build the image and boot it in nested KVM (no GPU).
+# The GPU dispatch smoke (M0 "WAVE OK") runs on the shark-a nightly job, not here.
+# TODO(M0): fill in once tools/{mkimage,run-vm,xtask} are implemented.
+name: build
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show                          # honors rust-toolchain.toml
+      - run: cargo xtask build                    # custom target + build-std
