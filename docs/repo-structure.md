@@ -272,7 +272,7 @@ runner = "cargo run -p run-vm --"
 
 **Why Limine over writing our own trampoline:** M1/M2 want the smallest possible amount of unverifiable early-boot assembly. Limine gets us into long mode with paging and a clean memory map before our first Rust instruction, so `arch-x86_64/boot.rs` is a handful of request structs rather than a mode-switch + paging bring-up we'd have to hand-audit.
 
-**Fallback for zero-extra-disk libvirt boot:** emit a **PVH ELF note** (or multiboot2 header) in `nucleus` so QEMU can direct-boot it via `<kernel>` / `-kernel nucleus.elf` with no ISO. We keep this behind `--features direct-boot` because it means writing the early memory-map/paging glue ourselves; Limine-on-ISO is the default.
+**Boot path for the M0 shark-a libvirt flow: PVH direct-boot.** Emit a **PVH ELF note** (or multiboot2 header) in `nucleus` so QEMU/libvirt can direct-boot it via `<kernel>` / `-kernel nucleus.elf` with **no ISO** — the simplest fit for the passthrough domain, and the M0 plan builds this early memory-map/paging glue as task T0.1. **Limine-on-ISO is retained as the standalone/dev alternative** (behind `--features limine-iso`) for booting outside libvirt; the two paths share everything above the handoff. *(Reconciled 2026-07-21: this section previously made Limine the default; PVH is the default for the shark-a M0 flow, matching implementation-plan.md §5.)*
 
 ### 3.3 How it slots into the existing shark-a libvirt/QEMU flow
 
