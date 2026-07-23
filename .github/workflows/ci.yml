@@ -17,3 +17,5 @@ jobs:
         run: cargo fmt --check -p nucleus -p arch-x86_64
       - name: Boot smoke (PVH -> long mode -> serial -> clean exit)
         run: tools/run-qemu.sh
+      - name: Fault-dump smoke (forced #PF -> exception handler dumps cleanly)
+        run: PROVOKE_FAULT=1 tools/run-qemu.sh

@@ -7,6 +7,7 @@
 #![no_std]
 #![allow(clippy::missing_safety_doc)]
 
+pub mod interrupts;
 pub mod port;
 pub mod qemu;
 pub mod serial;

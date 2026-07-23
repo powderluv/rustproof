@@ -21,6 +21,18 @@ pub extern "C" fn kmain(start_info: u64) -> ! {
     kprintln!("  long mode reached; COM1 serial up");
     kprintln!("  identity map: low 1 GiB, 2 MiB pages");
     kprintln!("  PVH start_info @ {:#018x}", start_info);
+
+    arch_x86_64::interrupts::init();
+    kprintln!("  IDT loaded (32 CPU exception vectors)");
+
+    #[cfg(feature = "provoke-fault")]
+    {
+        kprintln!("provoke-fault: reading unmapped 0xDEADBEEF to force a #PF");
+        let bad = 0xDEAD_BEEF_usize as *const u32;
+        let _ = unsafe { core::ptr::read_volatile(bad) };
+        kprintln!("ERROR: expected page fault was not taken");
+    }
+
     kprintln!("rustproof: BOOT OK");
     qemu::exit(qemu::EXIT_SUCCESS);
 }

@@ -7,3 +7,7 @@ publish = false
 
 [dependencies]
 arch-x86_64 = { path = "../arch-x86_64" }
+
+[features]
+# Force a page fault after boot to exercise the exception handlers (test only).
+provoke-fault = []
