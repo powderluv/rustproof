@@ -6,7 +6,13 @@ license.workspace = true
 publish = false
 
 [dependencies]
+abi = { path = "../abi" }
 arch-x86_64 = { path = "../arch-x86_64" }
+mm = { path = "../mm" }
+vspace = { path = "../vspace" }
+capabilities = { path = "../capabilities" }
+ipc = { path = "../ipc" }
+sched = { path = "../sched" }
 
 [features]
 # Force a page fault after boot to exercise the exception handlers (test only).

@@ -11,6 +11,8 @@ members = [
     "crates/iommu-amdvi",
     "crates/arch-x86_64",
     "crates/abi",
+    "crates/mm",
+    "crates/sched",
     "crates/nucleus",
     "crates/userland-rt",
     "crates/init",

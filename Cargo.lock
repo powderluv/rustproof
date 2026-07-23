@@ -13,6 +13,9 @@ version = "0.0.0"
 [[package]]
 name = "capabilities"
 version = "0.0.0"
+dependencies = [
+ "abi",
+]
 
 [[package]]
 name = "driver-host"
@@ -33,16 +36,32 @@ version = "0.0.0"
 [[package]]
 name = "ipc"
 version = "0.0.0"
+dependencies = [
+ "abi",
+]
 
 [[package]]
 name = "mkimage"
 version = "0.0.0"
 
 [[package]]
+name = "mm"
+version = "0.0.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
 name = "nucleus"
 version = "0.0.0"
 dependencies = [
+ "abi",
  "arch-x86_64",
+ "capabilities",
+ "ipc",
+ "mm",
+ "sched",
+ "vspace",
 ]
 
 [[package]]
@@ -52,6 +71,13 @@ version = "0.0.0"
 [[package]]
 name = "run-vm"
 version = "0.0.0"
+
+[[package]]
+name = "sched"
+version = "0.0.0"
+dependencies = [
+ "abi",
+]
 
 [[package]]
 name = "userland-rt"
@@ -64,6 +90,9 @@ version = "0.0.0"
 [[package]]
 name = "vspace"
 version = "0.0.0"
+dependencies = [
+ "abi",
+]
 
 [[package]]
 name = "xtask"

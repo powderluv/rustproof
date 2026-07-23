@@ -33,6 +33,7 @@ echo "== booting under QEMU (TCG) =="
 set +e
 OUT=$(timeout 30 qemu-system-x86_64 \
     -kernel "$KERNEL" \
+    -m 512M \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -serial stdio -display none -no-reboot 2>&1)
 RC=$?
