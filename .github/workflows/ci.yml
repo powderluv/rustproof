@@ -4,18 +4,32 @@ on:
   pull_request:
 
 jobs:
-  boot-smoke:
-    name: build nucleus + boot under QEMU
+  x86_64:
+    name: x86-64 — build, boot, ring-3 userland, fault dump
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install QEMU
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
       - name: Add bare-metal target
-        run: rustup target add x86_64-unknown-none   # toolchain is pinned by rust-toolchain.toml
+        run: rustup target add x86_64-unknown-none   # toolchain pinned by rust-toolchain.toml
       - name: rustfmt
-        run: cargo fmt --check -p nucleus -p arch-x86_64 -p abi -p mm -p vspace -p capabilities -p ipc -p sched
-      - name: Boot smoke (PVH -> long mode -> serial -> clean exit)
-        run: tools/run-qemu.sh
+        run: cargo fmt --all --check
+      - name: Host unit tests (portable + paging crates)
+        run: cargo test -p abi -p mm -p vspace -p capabilities -p ipc -p sched -p loader -p hostcontract -p vspace-riscv
+      - name: Boot + ring-3 userland smoke
+        run: tools/run-qemu.sh          # boots, loads init into ring 3, runs the host contract
       - name: Fault-dump smoke (forced #PF -> exception handler dumps cleanly)
         run: PROVOKE_FAULT=1 tools/run-qemu.sh
+
+  riscv64:
+    name: riscv64 — build + boot under QEMU (OpenSBI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU (riscv)
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc
+      - name: Add riscv target
+        run: rustup target add riscv64gc-unknown-none-elf
+      - name: Boot smoke (S-mode -> UART -> portable core -> clean exit)
+        run: tools/run-qemu-riscv.sh

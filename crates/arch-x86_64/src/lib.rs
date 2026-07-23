@@ -7,10 +7,13 @@
 #![no_std]
 #![allow(clippy::missing_safety_doc)]
 
+pub mod cpu;
+pub mod gdt;
 pub mod interrupts;
 pub mod port;
 pub mod qemu;
 pub mod serial;
+pub mod syscall;
 
 /// Write formatted text to COM1. The serial port is a fixed, stateless sink (ZST).
 #[macro_export]

@@ -1,0 +1,8 @@
+# `init` links at the USER virtual base 0x80_0000_0000 (see link.ld). The
+# workspace forces `relocation-model=static`, whose default (small) code model can
+# only encode a 32-bit absolute address -- far short of 512 GiB -- so the default
+# build overflows its relocations. Select the large code model (64-bit absolute
+# relocations) for this crate. This applies only to `init` (a per-crate config),
+# and only when the build is invoked from within the crate directory.
+[target.x86_64-unknown-none]
+rustflags = ["-C", "relocation-model=static", "-C", "code-model=large"]

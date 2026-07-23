@@ -1,0 +1,479 @@
+#![cfg_attr(not(test), no_std)]
+//! hostcontract — the capability-gated host-contract syscall dispatcher.
+//!
+//! [`dispatch`] is a **pure function over the [`abi::HostEnv`] trait**: it reads no
+//! global kernel state, only what the integrator exposes through `env`. That keeps the
+//! whole decision surface host-unit-testable (a mock `HostEnv` in tests; real kernel
+//! state at runtime) and makes it the natural Verus proof target — the load-bearing
+//! guarantee, "no host-contract op grants authority without the required capability",
+//! is expressed entirely in terms of `env.cap_lookup`.
+//!
+//! The syscall calling convention is fixed by [`abi::sysno`]: `rax` = number, args
+//! `a0..a4` in `rdi, rsi, rdx, r10, r8`, result in `rax`. The integrator's trap handler
+//! decodes those registers and calls [`dispatch`]; `EXIT` is handled there (it never
+//! returns) so it only ever reaches us as an invalid selector.
+//!
+//! Maps to `docs/host-contract.md`: `GET_INFO`/`ALLOC_VRAM` are VERIFIED, `MAP_BAR` is
+//! VERIFIED* (the cap check is verified; the actual MMIO mapping is a TRUSTED-STUB here).
+
+use abi::{
+    syserr, sysno, AllocResp, CapId, CapType, GpuInfo, HostEnv, MapBarResp, PhysAddr, PAGE_SIZE,
+};
+
+/// Bytes copied out of user memory per `read_user_bytes` call in `DEBUG_WRITE`.
+const DEBUG_CHUNK: usize = 256;
+/// Upper bound on how many bytes a single `DEBUG_WRITE` will emit — a run-away or
+/// hostile length is clamped here so the copy loop is always bounded.
+const DEBUG_MAX_TOTAL: u64 = 64 * 1024;
+
+/// Stub BAR window size reported by `MAP_BAR`: 256 MiB, the gfx1201 VRAM aperture with
+/// ReBAR off (see `docs/host-contract.md`). The real size comes from the device later.
+const STUB_BAR_SIZE: u64 = 256 * 1024 * 1024;
+
+/// Reinterpret a `#[repr(C)]` plain-old-data value as its raw little-endian bytes.
+///
+/// TCB / SAFETY: `T` must be a `#[repr(C)]`, pointer-free, all-integer POD with no
+/// padding — which holds for the three host-contract response structs used below
+/// ([`GpuInfo`], [`MapBarResp`], [`AllocResp`]). The returned slice borrows `val`, so it
+/// cannot dangle, and we only ever *read* it (to copy into user memory), so no invalid
+/// or uninitialized bit pattern is ever observed.
+unsafe fn as_bytes<T>(val: &T) -> &[u8] {
+    core::slice::from_raw_parts(val as *const T as *const u8, core::mem::size_of::<T>())
+}
+
+/// Capability-gated host-contract syscall dispatch.
+///
+/// Pure over `env`; returns an [`abi::syserr`] code in every arm ([`syserr::OK`] on
+/// success). `a3`/`a4` are reserved by the current contract.
+///
+// PROOF(later): no host-contract op succeeds (returns OK / grants authority) unless the
+// required capability was present with the required type — i.e. every non-`OK` path is
+// reachable only from a failing `env.cap_lookup`, a failing `env.alloc_dma`, or a bad
+// user pointer, and no `OK` path skips the cap check for `MAP_BAR`/`ALLOC_VRAM`.
+pub fn dispatch(
+    env: &mut dyn HostEnv,
+    num: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+) -> u64 {
+    // a3/a4 are unused by every current op; bind them so the signature stays the fixed
+    // 5-arg kernel dispatch shape without an unused-warning.
+    let _ = (a3, a4);
+    match num {
+        sysno::DEBUG_WRITE => sys_debug_write(env, a0, a1),
+        sysno::GET_INFO => sys_get_info(env, a0),
+        sysno::MAP_BAR => sys_map_bar(env, a0, a2),
+        sysno::ALLOC_VRAM => sys_alloc_vram(env, a0, a2),
+        // EXIT is handled by the integrator before dispatch (it never returns); if it
+        // reaches us it is a misuse, so it falls through with every other selector.
+        _ => syserr::BAD_SYSCALL,
+    }
+}
+
+/// `DEBUG_WRITE`: copy `len` bytes from user pointer `uptr` to the debug console, in
+/// bounded `DEBUG_CHUNK`-sized chunks through a stack buffer. Clamps to `DEBUG_MAX_TOTAL`.
+fn sys_debug_write(env: &mut dyn HostEnv, uptr: u64, len: u64) -> u64 {
+    let total = len.min(DEBUG_MAX_TOTAL);
+    let mut buf = [0u8; DEBUG_CHUNK];
+    let mut off: u64 = 0;
+    while off < total {
+        let n = ((total - off) as usize).min(DEBUG_CHUNK);
+        let chunk = &mut buf[..n];
+        // `wrapping_add` keeps arithmetic total even at the top of the address space; a
+        // wrapped-past-the-end pointer is simply rejected by `read_user_bytes`.
+        if !env.read_user_bytes(uptr.wrapping_add(off), chunk) {
+            return syserr::FAULT;
+        }
+        env.debug_write(chunk);
+        off += n as u64;
+    }
+    syserr::OK
+}
+
+/// `GET_INFO`: write the device [`GpuInfo`] (raw `#[repr(C)]` bytes) to user pointer `uptr`.
+fn sys_get_info(env: &mut dyn HostEnv, uptr: u64) -> u64 {
+    let info: GpuInfo = env.gpu_info();
+    // SAFETY: `info` is a live `#[repr(C)]` POD; see `as_bytes`.
+    let bytes = unsafe { as_bytes(&info) };
+    if env.write_user_bytes(uptr, bytes) {
+        syserr::OK
+    } else {
+        syserr::FAULT
+    }
+}
+
+/// `MAP_BAR`: require an [`CapType::Mmio`] capability at `cap_id`, then write a
+/// [`MapBarResp`] to user pointer `resp_ptr`.
+///
+/// VERIFIED* per `docs/host-contract.md`: the capability CHECK below is the verified,
+/// load-bearing part. Building the response is a TRUSTED-STUB — no real MMIO PTE is
+/// installed; `user_va` is derived from the capability's object base as a placeholder
+/// and `size` is the stub BAR window. A real backend replaces the response construction
+/// but keeps this exact cap gate in front of it.
+fn sys_map_bar(env: &mut dyn HostEnv, cap_id: u64, resp_ptr: u64) -> u64 {
+    let cap = CapId(cap_id as usize);
+    let base = match env.cap_lookup(cap) {
+        Some((CapType::Mmio, _rights, base)) => base,
+        // Missing cap or wrong object type: no authority to map a BAR.
+        _ => return syserr::NO_CAP,
+    };
+    // TRUSTED-STUB: placeholder mapping — real code installs a PTE for the device BAR.
+    let resp = MapBarResp {
+        user_va: base,
+        size: STUB_BAR_SIZE,
+    };
+    // SAFETY: `resp` is a live `#[repr(C)]` POD; see `as_bytes`.
+    let bytes = unsafe { as_bytes(&resp) };
+    if env.write_user_bytes(resp_ptr, bytes) {
+        syserr::OK
+    } else {
+        syserr::FAULT
+    }
+}
+
+/// `ALLOC_VRAM`: require an [`CapType::Untyped`] capability at `cap_id`, allocate one
+/// DMA frame, then write an [`AllocResp`] to user pointer `resp_ptr`.
+///
+/// VERIFIED per `docs/host-contract.md`: the cap gate + the frame grant are the verified
+/// decision; the returned frame comes from the integrator's DMA-capable allocator.
+fn sys_alloc_vram(env: &mut dyn HostEnv, cap_id: u64, resp_ptr: u64) -> u64 {
+    let cap = CapId(cap_id as usize);
+    match env.cap_lookup(cap) {
+        Some((CapType::Untyped, _rights, _obj)) => {}
+        // Missing cap or wrong object type: no authority to allocate VRAM.
+        _ => return syserr::NO_CAP,
+    }
+    let frame: PhysAddr = match env.alloc_dma() {
+        Some(f) => f,
+        None => return syserr::NO_MEM,
+    };
+    let resp = AllocResp {
+        phys: frame.as_u64(),
+        size: PAGE_SIZE,
+    };
+    // SAFETY: `resp` is a live `#[repr(C)]` POD; see `as_bytes`.
+    let bytes = unsafe { as_bytes(&resp) };
+    if env.write_user_bytes(resp_ptr, bytes) {
+        syserr::OK
+    } else {
+        syserr::FAULT
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use abi::CapRights;
+
+    /// Base user VA the mock's flat "user memory" is mapped at; pointers below this or
+    /// past the end of `mem` are rejected exactly like a real bad user pointer.
+    const BASE_VA: u64 = 0x1000_0000;
+
+    /// A synthetic [`HostEnv`] backing every host test: a flat user-memory buffer, a
+    /// captured debug stream, a tiny cap table, and a bounded DMA-frame counter.
+    struct MockEnv {
+        mem: Vec<u8>,
+        debug_out: Vec<u8>,
+        caps: Vec<(CapId, (CapType, CapRights, u64))>,
+        next_frame: u64,
+        frames_left: usize,
+        info: GpuInfo,
+    }
+
+    impl MockEnv {
+        fn new(mem_len: usize) -> Self {
+            MockEnv {
+                mem: vec![0u8; mem_len],
+                debug_out: Vec::new(),
+                caps: Vec::new(),
+                next_frame: 0x8000_0000,
+                frames_left: 0,
+                info: GpuInfo::default(),
+            }
+        }
+        /// User VA of offset `off` into the flat user-memory buffer.
+        fn va(&self, off: usize) -> u64 {
+            BASE_VA + off as u64
+        }
+        /// Read `mem[off..off+len]` back out for assertions.
+        fn peek(&self, off: usize, len: usize) -> &[u8] {
+            &self.mem[off..off + len]
+        }
+    }
+
+    impl HostEnv for MockEnv {
+        fn debug_write(&mut self, bytes: &[u8]) {
+            self.debug_out.extend_from_slice(bytes);
+        }
+        fn gpu_info(&self) -> GpuInfo {
+            self.info
+        }
+        fn cap_lookup(&self, cap: CapId) -> Option<(CapType, CapRights, u64)> {
+            self.caps.iter().find(|(c, _)| *c == cap).map(|(_, v)| *v)
+        }
+        fn alloc_dma(&mut self) -> Option<PhysAddr> {
+            if self.frames_left == 0 {
+                return None;
+            }
+            self.frames_left -= 1;
+            let p = self.next_frame;
+            self.next_frame += PAGE_SIZE;
+            Some(PhysAddr(p))
+        }
+        fn write_user_bytes(&mut self, uptr: u64, bytes: &[u8]) -> bool {
+            if uptr < BASE_VA {
+                return false;
+            }
+            let off = (uptr - BASE_VA) as usize;
+            let end = match off.checked_add(bytes.len()) {
+                Some(e) => e,
+                None => return false,
+            };
+            if end > self.mem.len() {
+                return false;
+            }
+            self.mem[off..end].copy_from_slice(bytes);
+            true
+        }
+        fn read_user_bytes(&self, uptr: u64, out: &mut [u8]) -> bool {
+            if uptr < BASE_VA {
+                return false;
+            }
+            let off = (uptr - BASE_VA) as usize;
+            let end = match off.checked_add(out.len()) {
+                Some(e) => e,
+                None => return false,
+            };
+            if end > self.mem.len() {
+                return false;
+            }
+            out.copy_from_slice(&self.mem[off..end]);
+            true
+        }
+    }
+
+    /// Decode a `#[repr(C)]` POD back out of a byte slice for round-trip assertions.
+    fn decode<T: Copy>(bytes: &[u8]) -> T {
+        assert!(bytes.len() >= core::mem::size_of::<T>());
+        // SAFETY: test-only; `bytes` was produced by `as_bytes` over the same POD type.
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const T) }
+    }
+
+    #[test]
+    fn debug_write_copies_exact_bytes() {
+        let mut env = MockEnv::new(4096);
+        let payload = b"hello, host contract";
+        let off = 64;
+        env.mem[off..off + payload.len()].copy_from_slice(payload);
+
+        let ptr = env.va(off);
+        let r = dispatch(
+            &mut env,
+            sysno::DEBUG_WRITE,
+            ptr,
+            payload.len() as u64,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(r, syserr::OK);
+        assert_eq!(env.debug_out.as_slice(), payload);
+    }
+
+    #[test]
+    fn debug_write_chunks_across_buffer() {
+        // Longer than DEBUG_CHUNK so the copy loop runs multiple iterations.
+        let len = DEBUG_CHUNK * 3 + 7;
+        let mut env = MockEnv::new(len + 16);
+        for (i, b) in env.mem.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let expected: Vec<u8> = env.mem[..len].to_vec();
+
+        let ptr = env.va(0);
+        let r = dispatch(&mut env, sysno::DEBUG_WRITE, ptr, len as u64, 0, 0, 0);
+        assert_eq!(r, syserr::OK);
+        assert_eq!(env.debug_out, expected);
+    }
+
+    #[test]
+    fn debug_write_clamps_to_max_total() {
+        let mut env = MockEnv::new(DEBUG_MAX_TOTAL as usize + 4096);
+        // Ask for far more than the clamp; only DEBUG_MAX_TOTAL bytes are emitted.
+        let ptr = env.va(0);
+        let r = dispatch(
+            &mut env,
+            sysno::DEBUG_WRITE,
+            ptr,
+            DEBUG_MAX_TOTAL + 4096,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(r, syserr::OK);
+        assert_eq!(env.debug_out.len() as u64, DEBUG_MAX_TOTAL);
+    }
+
+    #[test]
+    fn debug_write_bad_pointer_faults() {
+        let mut env = MockEnv::new(256);
+        // Pointer well past the end of user memory.
+        let ptr = env.va(0x10_0000);
+        let r = dispatch(&mut env, sysno::DEBUG_WRITE, ptr, 8, 0, 0, 0);
+        assert_eq!(r, syserr::FAULT);
+        assert!(env.debug_out.is_empty());
+    }
+
+    #[test]
+    fn get_info_round_trips() {
+        let mut env = MockEnv::new(4096);
+        env.info = GpuInfo {
+            pci_vendor: 0x1002,
+            pci_device: 0x7551,
+            gfx_version: 1201,
+            vram_bytes: 32u64 * 1024 * 1024 * 1024,
+        };
+        let want = env.info;
+        let off = 128;
+
+        let ptr = env.va(off);
+        let r = dispatch(&mut env, sysno::GET_INFO, ptr, 0, 0, 0, 0);
+        assert_eq!(r, syserr::OK);
+        let got: GpuInfo = decode(env.peek(off, core::mem::size_of::<GpuInfo>()));
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn get_info_bad_pointer_faults() {
+        let mut env = MockEnv::new(8); // too small to hold GpuInfo
+        let ptr = env.va(0);
+        let r = dispatch(&mut env, sysno::GET_INFO, ptr, 0, 0, 0, 0);
+        assert_eq!(r, syserr::FAULT);
+    }
+
+    #[test]
+    fn map_bar_with_mmio_cap_ok() {
+        let mut env = MockEnv::new(4096);
+        let cap = CapId(7);
+        let base = 0xE000_0000u64;
+        env.caps.push((cap, (CapType::Mmio, CapRights::READ, base)));
+        let off = 256;
+
+        let ptr = env.va(off);
+        let r = dispatch(
+            &mut env,
+            sysno::MAP_BAR,
+            cap.0 as u64,
+            0,   // BAR index (stub ignores)
+            ptr, // resp ptr
+            0,
+            0,
+        );
+        assert_eq!(r, syserr::OK);
+        let resp: MapBarResp = decode(env.peek(off, core::mem::size_of::<MapBarResp>()));
+        assert_eq!(resp.user_va, base);
+        assert_eq!(resp.size, STUB_BAR_SIZE);
+    }
+
+    #[test]
+    fn map_bar_wrong_type_is_no_cap() {
+        let mut env = MockEnv::new(4096);
+        let cap = CapId(3);
+        // An Untyped cap must NOT authorize MAP_BAR.
+        env.caps.push((cap, (CapType::Untyped, CapRights::ALL, 0)));
+        let ptr = env.va(0);
+        let r = dispatch(&mut env, sysno::MAP_BAR, cap.0 as u64, 0, ptr, 0, 0);
+        assert_eq!(r, syserr::NO_CAP);
+    }
+
+    #[test]
+    fn map_bar_missing_cap_is_no_cap() {
+        let mut env = MockEnv::new(4096);
+        let ptr = env.va(0);
+        let r = dispatch(&mut env, sysno::MAP_BAR, 99, 0, ptr, 0, 0);
+        assert_eq!(r, syserr::NO_CAP);
+    }
+
+    #[test]
+    fn map_bar_bad_resp_pointer_faults() {
+        let mut env = MockEnv::new(4096);
+        let cap = CapId(1);
+        env.caps
+            .push((cap, (CapType::Mmio, CapRights::READ, 0xABCD)));
+        // Valid cap, but the response pointer is out of range.
+        let ptr = env.va(0x10_0000);
+        let r = dispatch(&mut env, sysno::MAP_BAR, cap.0 as u64, 0, ptr, 0, 0);
+        assert_eq!(r, syserr::FAULT);
+    }
+
+    #[test]
+    fn alloc_vram_with_untyped_cap_advances_phys() {
+        let mut env = MockEnv::new(4096);
+        let cap = CapId(2);
+        env.caps.push((cap, (CapType::Untyped, CapRights::ALL, 0)));
+        env.frames_left = 4;
+        let first_frame = env.next_frame;
+
+        let ptr1 = env.va(0);
+        let r1 = dispatch(&mut env, sysno::ALLOC_VRAM, cap.0 as u64, 0, ptr1, 0, 0);
+        assert_eq!(r1, syserr::OK);
+        let a1: AllocResp = decode(env.peek(0, core::mem::size_of::<AllocResp>()));
+        assert_eq!(a1.phys, first_frame);
+        assert_eq!(a1.size, PAGE_SIZE);
+
+        let off2 = 64;
+        let ptr2 = env.va(off2);
+        let r2 = dispatch(&mut env, sysno::ALLOC_VRAM, cap.0 as u64, 0, ptr2, 0, 0);
+        assert_eq!(r2, syserr::OK);
+        let a2: AllocResp = decode(env.peek(off2, core::mem::size_of::<AllocResp>()));
+        // Second grant must be a distinct, advanced physical frame.
+        assert_eq!(a2.phys, first_frame + PAGE_SIZE);
+    }
+
+    #[test]
+    fn alloc_vram_without_cap_is_no_cap() {
+        let mut env = MockEnv::new(4096);
+        env.frames_left = 4; // frames available, but no capability
+        let ptr = env.va(0);
+        let r = dispatch(&mut env, sysno::ALLOC_VRAM, 42, 0, ptr, 0, 0);
+        assert_eq!(r, syserr::NO_CAP);
+    }
+
+    #[test]
+    fn alloc_vram_wrong_type_is_no_cap() {
+        let mut env = MockEnv::new(4096);
+        let cap = CapId(5);
+        env.caps.push((cap, (CapType::Mmio, CapRights::ALL, 0)));
+        env.frames_left = 4;
+        let ptr = env.va(0);
+        let r = dispatch(&mut env, sysno::ALLOC_VRAM, cap.0 as u64, 0, ptr, 0, 0);
+        assert_eq!(r, syserr::NO_CAP);
+    }
+
+    #[test]
+    fn alloc_vram_out_of_frames_is_no_mem() {
+        let mut env = MockEnv::new(4096);
+        let cap = CapId(6);
+        env.caps.push((cap, (CapType::Untyped, CapRights::ALL, 0)));
+        env.frames_left = 0; // valid cap, but the DMA pool is empty
+        let ptr = env.va(0);
+        let r = dispatch(&mut env, sysno::ALLOC_VRAM, cap.0 as u64, 0, ptr, 0, 0);
+        assert_eq!(r, syserr::NO_MEM);
+    }
+
+    #[test]
+    fn exit_and_unknown_are_bad_syscall() {
+        let mut env = MockEnv::new(16);
+        assert_eq!(
+            dispatch(&mut env, sysno::EXIT, 0, 0, 0, 0, 0),
+            syserr::BAD_SYSCALL
+        );
+        assert_eq!(
+            dispatch(&mut env, 0xDEAD_BEEF, 0, 0, 0, 0, 0),
+            syserr::BAD_SYSCALL
+        );
+    }
+}

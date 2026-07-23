@@ -175,3 +175,75 @@ impl MessageInfo {
         MessageInfo { label, length }
     }
 }
+
+// ---------------------------------------------------------------- syscall ABI
+
+/// User→kernel calling convention for the `syscall` instruction:
+/// `rax` = number (one of [`sysno`]); args `a0..a4` in `rdi, rsi, rdx, r10, r8`;
+/// result returned in `rax` (`rcx` and `r11` are clobbered by `syscall`).
+pub mod sysno {
+    /// Write `a1` bytes from user pointer `a0` to the debug console.
+    pub const DEBUG_WRITE: u64 = 0;
+    /// Terminate the calling process with exit code `a0`.
+    pub const EXIT: u64 = 1;
+    /// Host contract: write device info to `*mut GpuInfo` at `a0`.
+    pub const GET_INFO: u64 = 2;
+    /// Host contract: `a0` = MMIO capability id, `a1` = BAR index, `a2` = `*mut MapBarResp`.
+    pub const MAP_BAR: u64 = 3;
+    /// Host contract: `a0` = Untyped capability id, `a1` = byte size, `a2` = `*mut AllocResp`.
+    pub const ALLOC_VRAM: u64 = 4;
+}
+
+/// Syscall result codes returned in `rax`. `OK` is 0; errors are large sentinels so
+/// they never collide with a valid small return value.
+pub mod syserr {
+    pub const OK: u64 = 0;
+    pub const BAD_SYSCALL: u64 = u64::MAX;
+    pub const NO_CAP: u64 = u64::MAX - 1;
+    pub const NO_MEM: u64 = u64::MAX - 2;
+    pub const FAULT: u64 = u64::MAX - 3;
+}
+
+/// GPU device info returned by `GET_INFO` (host contract).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(C)]
+pub struct GpuInfo {
+    pub pci_vendor: u16,
+    pub pci_device: u16,
+    pub gfx_version: u32,
+    pub vram_bytes: u64,
+}
+
+/// Response to `MAP_BAR` (host contract): where a device BAR was mapped in the caller.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(C)]
+pub struct MapBarResp {
+    pub user_va: u64,
+    pub size: u64,
+}
+
+/// Response to `ALLOC_VRAM` (host contract): the physical frame + size granted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(C)]
+pub struct AllocResp {
+    pub phys: u64,
+    pub size: u64,
+}
+
+/// Kernel services the host-contract dispatcher needs, supplied by the integrator so the
+/// dispatch logic stays a pure, testable unit (mock in tests, real kernel state at runtime).
+pub trait HostEnv {
+    /// Emit debug bytes (already copied out of user memory) to the console.
+    fn debug_write(&mut self, bytes: &[u8]);
+    /// The device info to report for `GET_INFO`.
+    fn gpu_info(&self) -> GpuInfo;
+    /// Look up a capability in the calling process's space: `(type, rights, object)`.
+    fn cap_lookup(&self, cap: CapId) -> Option<(CapType, CapRights, u64)>;
+    /// Allocate one DMA-capable physical frame for `ALLOC_VRAM`.
+    fn alloc_dma(&mut self) -> Option<PhysAddr>;
+    /// Copy `bytes` into the caller's memory at user virtual address `uptr`.
+    /// Returns false if the pointer is not a valid, writable user address.
+    fn write_user_bytes(&mut self, uptr: u64, bytes: &[u8]) -> bool;
+    /// Copy from the caller's memory at `uptr` into `out`. Returns false on a bad pointer.
+    fn read_user_bytes(&self, uptr: u64, out: &mut [u8]) -> bool;
+}

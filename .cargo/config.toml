@@ -17,3 +17,9 @@
 rustflags = [
     "-C", "relocation-model=static",
 ]
+
+# RISC-V (rv64gc) — S-mode kernel loaded by OpenSBI at 0x8020_0000. See docs/riscv-port.md.
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+    "-C", "relocation-model=static",
+]

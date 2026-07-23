@@ -7,6 +7,13 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
+name = "arch-riscv64"
+version = "0.0.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
 name = "arch-x86_64"
 version = "0.0.0"
 
@@ -26,8 +33,18 @@ name = "driver-shim"
 version = "0.0.0"
 
 [[package]]
+name = "hostcontract"
+version = "0.0.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
 name = "init"
 version = "0.0.0"
+dependencies = [
+ "abi",
+]
 
 [[package]]
 name = "iommu-amdvi"
@@ -38,6 +55,14 @@ name = "ipc"
 version = "0.0.0"
 dependencies = [
  "abi",
+]
+
+[[package]]
+name = "loader"
+version = "0.0.0"
+dependencies = [
+ "abi",
+ "vspace",
 ]
 
 [[package]]
@@ -58,7 +83,9 @@ dependencies = [
  "abi",
  "arch-x86_64",
  "capabilities",
+ "hostcontract",
  "ipc",
+ "loader",
  "mm",
  "sched",
  "vspace",
@@ -67,6 +94,17 @@ dependencies = [
 [[package]]
 name = "nucleus-core"
 version = "0.0.0"
+
+[[package]]
+name = "nucleus-riscv"
+version = "0.0.0"
+dependencies = [
+ "abi",
+ "arch-riscv64",
+ "capabilities",
+ "ipc",
+ "mm",
+]
 
 [[package]]
 name = "run-vm"
@@ -89,6 +127,13 @@ version = "0.0.0"
 
 [[package]]
 name = "vspace"
+version = "0.0.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
+name = "vspace-riscv"
 version = "0.0.0"
 dependencies = [
  "abi",

@@ -23,6 +23,13 @@ if [ "${PROVOKE_FAULT:-0}" = "1" ]; then
     MODE="fault-dump"
 fi
 
+echo "== building the init user program (ring 3) =="
+# init is linked at 512 GiB (user VA window), which needs the large code model; a
+# repo-root build does not read init's crate-local .cargo/config, so pass it here.
+RUSTFLAGS="-C relocation-model=static -C code-model=large" \
+    cargo build -p init --target "$TARGET" "${BUILD_FLAG[@]}"
+cp "target/$TARGET/$PROFILE/init" crates/nucleus/user.elf
+
 echo "== building nucleus ($PROFILE, mode=$MODE) for $TARGET =="
 cargo build -p nucleus --target "$TARGET" "${BUILD_FLAG[@]}" "${FEATURES[@]}"
 

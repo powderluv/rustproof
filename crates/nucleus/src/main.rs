@@ -12,6 +12,11 @@
 #![no_main]
 
 mod pvh;
+mod userland;
+
+/// The `init` user program, staged next to this crate by `tools/run-qemu.sh` (empty
+/// until then — `build.rs` guarantees the file exists so `include_bytes!` compiles).
+static USER_ELF: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/user.elf"));
 
 use abi::{
     CapRights, CapType, FrameAllocator, MemoryKind, MemoryRegion, MessageInfo, ThreadId, VirtAddr,
@@ -216,8 +221,20 @@ pub extern "C" fn kmain(start_info: u64) -> ! {
     }
     kprintln!("  [main] resumed after thread B returned via context switch");
 
+    // ---------------- userland: load init and run it in ring 3 ----------------
+    if USER_ELF.len() >= 64 {
+        kprintln!();
+        kprintln!(
+            "[user] loading init ({} bytes) into a fresh address space",
+            USER_ELF.len()
+        );
+        // Never returns: init runs in ring 3 and its EXIT syscall prints the final
+        // banner and shuts the guest down.
+        unsafe { userland::setup_and_enter(USER_ELF, fa) }
+    }
+
     kprintln!();
-    kprintln!("rustproof: BOOT OK");
+    kprintln!("rustproof: BOOT OK (no user image embedded)");
     qemu::exit(qemu::EXIT_SUCCESS);
 }
 
