@@ -194,6 +194,12 @@ pub mod sysno {
     pub const ALLOC_VRAM: u64 = 4;
     /// Cooperatively yield the CPU to the next ready process. No args, no result.
     pub const YIELD: u64 = 5;
+    /// Send one word to an endpoint (rendezvous): `a0` = endpoint id, `a1` = word.
+    /// Returns `syserr::OK`; blocks until a receiver takes the word.
+    pub const SEND: u64 = 6;
+    /// Receive one word from an endpoint (rendezvous): `a0` = endpoint id. Returns the
+    /// word; blocks until a sender delivers one.
+    pub const RECV: u64 = 7;
 }
 
 /// Syscall result codes returned in `rax`. `OK` is 0; errors are large sentinels so

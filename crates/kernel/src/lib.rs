@@ -38,6 +38,20 @@ const MAX_PROCS: usize = 4;
 /// How many independent copies of the user image to launch.
 const NUM_PROCS: usize = 3;
 
+/// Scheduling state of a process slot. `Ready` processes are exactly those in the run
+/// queue (`SCHED`); a blocked process is removed from it until its IPC rendezvous completes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProcState {
+    /// Slot unused (available to load a process into).
+    Free,
+    /// Runnable — in the run queue.
+    Ready,
+    /// Blocked in `SEND` on `ep`, holding the `word` until a receiver takes it.
+    BlockedSend { ep: u64, word: u64 },
+    /// Blocked in `RECV` on `ep`, waiting for a sender.
+    BlockedRecv { ep: u64 },
+}
+
 /// One scheduled user process: its own address space (`token`), its last-saved user
 /// register state (`frame`), and its own capability space — the isolation boundary.
 struct Process {
@@ -47,8 +61,8 @@ struct Process {
     frame: UserFrame,
     /// Per-process authority: what this process may invoke via the host contract.
     caps: capabilities::CapSpace<16>,
-    /// False once the process has exited (slot reusable).
-    active: bool,
+    /// Scheduling / IPC state.
+    state: ProcState,
 }
 
 impl Process {
@@ -56,7 +70,7 @@ impl Process {
         token: 0,
         frame: UserFrame::ZERO,
         caps: capabilities::CapSpace::new(),
-        active: false,
+        state: ProcState::Free,
     };
 }
 
@@ -82,6 +96,50 @@ unsafe fn proc_at<'a>(i: usize) -> &'a mut Process {
 #[inline]
 unsafe fn sched() -> &'static mut sched::Scheduler<MAX_PROCS> {
     &mut *core::ptr::addr_of_mut!(SCHED)
+}
+
+/// The first process blocked receiving on endpoint `ep`, if any.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table.
+unsafe fn find_blocked_recv(ep: u64) -> Option<usize> {
+    (0..MAX_PROCS).find(|&i| proc_at(i).state == ProcState::BlockedRecv { ep })
+}
+
+/// The first process blocked sending on endpoint `ep`, with its pending word, if any.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table.
+unsafe fn find_blocked_send(ep: u64) -> Option<(usize, u64)> {
+    (0..MAX_PROCS).find_map(|i| match proc_at(i).state {
+        ProcState::BlockedSend { ep: e, word } if e == ep => Some((i, word)),
+        _ => None,
+    })
+}
+
+/// Called when the run queue is empty: either every process has exited (a clean finish —
+/// `BOOT OK`) or the survivors are all blocked on IPC with no one to wake them (a
+/// deadlock — a failure). Never returns.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table.
+unsafe fn nothing_runnable<A: Arch>() -> ! {
+    let mut con = Console::<A>::new();
+    let deadlocked = (0..MAX_PROCS).any(|i| {
+        matches!(
+            proc_at(i).state,
+            ProcState::BlockedSend { .. } | ProcState::BlockedRecv { .. }
+        )
+    });
+    if deadlocked {
+        let _ = writeln!(
+            con,
+            "\n[kernel] deadlock: no runnable process (survivors blocked on IPC)"
+        );
+        A::exit(false);
+    }
+    let _ = writeln!(con, "\nrustproof: BOOT OK");
+    A::exit(true)
 }
 
 /// Stubbed gfx1201 identity returned by the host contract's `GET_INFO`.
@@ -279,7 +337,7 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &[u8]) -> ! {
                 .insert(abi::CapType::Untyped, abi::CapRights::ALL, 0);
             slot.token = space.token();
             slot.frame = A::frame_init(entry, A::USER_STACK_TOP, i as u64);
-            slot.active = true;
+            slot.state = ProcState::Ready;
             unsafe { sched().add(abi::ThreadId(i)) };
             let _ = writeln!(con, "  proc {} loaded (entry {:#x})", i, entry);
         }
@@ -330,15 +388,52 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             let code = A::frame_arg(&f, 0);
             let mut con = Console::<A>::new();
             let _ = writeln!(con, "[kernel] proc {} exited with code {}", cur, code);
-            proc_at(cur).active = false;
+            proc_at(cur).state = ProcState::Free;
             sched().remove(abi::ThreadId(cur));
             match sched().current() {
-                None => {
-                    // The last process has exited: the run is done.
-                    let _ = writeln!(con, "\nrustproof: BOOT OK");
-                    A::exit(true);
-                }
                 Some(t) => CURRENT = t.0,
+                None => nothing_runnable::<A>(), // all exited (BOOT OK) or deadlocked
+            }
+        }
+        abi::sysno::SEND => {
+            // Synchronous rendezvous: `a0` = endpoint, `a1` = word.
+            let ep = A::frame_arg(&f, 0);
+            let word = A::frame_arg(&f, 1);
+            if let Some(r) = find_blocked_recv(ep) {
+                // A receiver is waiting: hand it the word, wake it, and return OK to us.
+                A::frame_set_ret(&mut proc_at(r).frame, word);
+                proc_at(r).state = ProcState::Ready;
+                sched().add(abi::ThreadId(r));
+                A::frame_set_ret(&mut f, abi::syserr::OK);
+                // CURRENT unchanged: the sender resumes.
+            } else {
+                // No receiver yet: block until one arrives (the word rides in the state).
+                proc_at(cur).state = ProcState::BlockedSend { ep, word };
+                sched().remove(abi::ThreadId(cur));
+                match sched().current() {
+                    Some(t) => CURRENT = t.0,
+                    None => nothing_runnable::<A>(),
+                }
+            }
+        }
+        abi::sysno::RECV => {
+            // Synchronous rendezvous: `a0` = endpoint; returns the word.
+            let ep = A::frame_arg(&f, 0);
+            if let Some((s, word)) = find_blocked_send(ep) {
+                // A sender is waiting: take its word, return it to us, wake the sender (OK).
+                A::frame_set_ret(&mut f, word);
+                A::frame_set_ret(&mut proc_at(s).frame, abi::syserr::OK);
+                proc_at(s).state = ProcState::Ready;
+                sched().add(abi::ThreadId(s));
+                // CURRENT unchanged: the receiver resumes with the word.
+            } else {
+                // No sender yet: block until one delivers.
+                proc_at(cur).state = ProcState::BlockedRecv { ep };
+                sched().remove(abi::ThreadId(cur));
+                match sched().current() {
+                    Some(t) => CURRENT = t.0,
+                    None => nothing_runnable::<A>(),
+                }
             }
         }
         num => {

@@ -63,8 +63,10 @@ compute loop with `DF=1` as a standing regression test.
 | Milestone | Goal | State |
 |---|---|---|
 | **x86-M1** ✅ | Cooperative multi-process: `YIELD` syscall, N processes each isolated (own AS + caps), round-robin, run to `EXIT`. Generic; x86 + RISC-V. | done |
-| **x86-M2** ✅ | Preemptive: an 8259 PIC + 8254 PIT timer interrupt (IRQ0 → vector 0x20) drives the scheduler; a compute-bound process is time-sliced without cooperating. The timer ISR builds the identical `TrapFrame` and reuses `resume`. x86 only (RISC-V stays cooperative). | done |
-| **x86-M3** | Inter-process IPC over the `ipc` endpoints across address spaces; a real `spawn`. | later |
+| **x86-M2** ✅ | Preemptive on x86: an 8259 PIC + 8254 PIT timer interrupt (IRQ0 → vector 0x20) drives the scheduler; a compute-bound process is time-sliced without cooperating. The timer ISR builds the identical `TrapFrame` and reuses `resume`. | done |
+| **riscv-timer** ✅ | Preemptive on RISC-V too: the Sstc `stimecmp` supervisor timer (`scause` int code 5) routes to the same generic `preempt_trap`. Both arches now time-slice. | done |
+| **x86-M3a** ✅ | Cross-address-space IPC: `SEND`/`RECV` synchronous 1-word rendezvous with process blocking (`ProcState` + run-queue add/remove), deadlock detection. Generic; x86 + RISC-V. | this change |
+| **x86-M3b** | A real `spawn` syscall: load the embedded image into a fresh process at runtime. | next |
 
 ## Alternatives Considered
 

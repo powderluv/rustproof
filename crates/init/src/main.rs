@@ -389,24 +389,76 @@ fn tag(id: u64) {
     dw!(b"] ");
 }
 
-/// The ELF entry point. The kernel loader jumps here in ring 3 with a fresh stack and this
-/// process's id in the first-argument register (`rdi`). It runs a compute loop with **no**
-/// syscalls between prints, so the only thing that can interleave it with its siblings is
-/// the timer preempting it — if the interleaved `[proc N] tick K` lines appear, preemptive
-/// scheduling works. It then exercises the per-process host contract and exits with its id.
-/// Never returns (it exits via the EXIT syscall).
+/// Send one `word` to endpoint `ep` (blocks until a receiver takes it). Returns `syserr::OK`.
+fn send(ep: u64, word: u64) -> u64 {
+    // SAFETY: SEND passes two scalars and returns a status; no user memory is touched.
+    unsafe { syscall2(sysno::SEND, ep, word) }
+}
+
+/// Receive one word from endpoint `ep` (blocks until a sender delivers). Returns the word.
+fn recv(ep: u64) -> u64 {
+    // SAFETY: RECV passes the endpoint and returns the delivered word; no memory is touched.
+    unsafe { syscall1(sysno::RECV, ep) }
+}
+
+/// The ELF entry point (ring 3, fresh stack, id in the first-argument register). The demo
+/// is role-selected by `id`: proc 0 produces + `SEND`s five values, proc 1 `RECV`s + prints
+/// them (cross-address-space IPC rendezvous), and any other proc runs a preemptible compute
+/// loop + the per-process host contract. Together they show IPC blocking and preemption
+/// coexisting. Never returns (each role exits via the EXIT syscall).
 ///
 /// Declared `extern "C"` / `#[no_mangle]` so the linker resolves `_start` (the
 /// `ENTRY` of `link.ld`); the `id` parameter reads the SysV first-arg register.
 #[no_mangle]
 pub extern "C" fn _start(id: u64) -> ! {
+    match id {
+        0 => producer(),
+        1 => consumer(),
+        _ => compute(id),
+    }
+}
+
+/// IPC producer: send five values on endpoint 0, blocking on each until the consumer takes
+/// it. The interleaving with the consumer's `recv` lines shows the synchronous rendezvous.
+fn producer() -> ! {
+    tag(0);
+    dw!(b"producer: sending 5 values on ep 0\n");
+    let mut i = 0u64;
+    while i < 5 {
+        let v = 100u64.wrapping_add(i);
+        send(0, v);
+        tag(0);
+        dw!(b"sent ");
+        dbg_dec(v);
+        dw!(b"\n");
+        i = i.wrapping_add(1);
+    }
+    exit(0);
+}
+
+/// IPC consumer: receive five values on endpoint 0, blocking until each arrives.
+fn consumer() -> ! {
+    tag(1);
+    dw!(b"consumer: receiving 5 values on ep 0\n");
+    let mut i = 0u64;
+    while i < 5 {
+        let v = recv(0);
+        tag(1);
+        dw!(b"recv ");
+        dbg_dec(v);
+        dw!(b"\n");
+        i = i.wrapping_add(1);
+    }
+    exit(1);
+}
+
+/// A preemptible compute process: a busy loop with NO syscalls between prints, so only the
+/// timer can interleave it (its `tick K` lines interleaving proves preemption). Runs the
+/// per-process host contract afterward, then exits. `spin` deliberately sets DF=1 (a
+/// standing regression test for the kernel's interrupt-entry `cld`; see `spin`).
+fn compute(id: u64) -> ! {
     tag(id);
     dw!(b"start (compute loop, no yields -- preemption only)\n");
-
-    // Pure compute: NO syscall between ticks. Without preemption, process `id` would run
-    // this whole loop and exit before any sibling got the CPU; the interleaved output is
-    // the timer preempting mid-`spin`. Each process's register/RIP state is saved and
-    // restored exactly across every preemption (that is what makes the loop resume).
     let mut tick = 0u64;
     while tick < 5 {
         tag(id);
