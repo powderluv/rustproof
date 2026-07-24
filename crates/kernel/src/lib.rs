@@ -153,6 +153,23 @@ unsafe fn sched() -> &'static mut sched::Scheduler<MAX_PROCS> {
     &mut *core::ptr::addr_of_mut!(SCHED)
 }
 
+/// Resolve an IPC capability to the endpoint it names, enforcing authority: process `proc`
+/// must hold `cap` as an [`abi::CapType::Endpoint`] carrying `needed` (WRITE to send, READ
+/// to receive). Returns the capability's *object* — the endpoint id — so two processes
+/// rendezvous only when their caps name the same endpoint, whatever slot each holds it in.
+/// `None` means no authority: the caller gets `NO_CAP` and does not block.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table.
+unsafe fn endpoint_of(proc: usize, cap: u64, needed: abi::CapRights) -> Option<u64> {
+    let slot = proc_at(proc).caps.lookup(abi::CapId(cap as usize))?;
+    if slot.cap_type == abi::CapType::Endpoint && slot.rights.contains(needed) {
+        Some(slot.object)
+    } else {
+        None
+    }
+}
+
 /// The first process blocked receiving on endpoint `ep`, if any.
 ///
 /// # Safety
@@ -250,13 +267,19 @@ unsafe fn load_process<A: Arch>(
         Some((token, entry)) => {
             let s = proc_at(slot);
             s.caps = capabilities::CapSpace::new();
+            // CapId(0): the shared IPC endpoint (object 0), send + receive.
             let _ = s
                 .caps
-                .insert(abi::CapType::Endpoint, abi::CapRights::NONE, 0);
+                .insert(abi::CapType::Endpoint, abi::CapRights::ALL, 0);
             let _ = s
                 .caps
                 .insert(abi::CapType::Mmio, abi::CapRights::ALL, 0xE000_0000);
             let _ = s.caps.insert(abi::CapType::Untyped, abi::CapRights::ALL, 0);
+            // CapId(3): endpoint object 1, RECEIVE-ONLY — holding an endpoint cap is not
+            // permission to send on it, which the demo exercises.
+            let _ = s
+                .caps
+                .insert(abi::CapType::Endpoint, abi::CapRights::READ, 1);
             s.token = token;
             s.frame = A::frame_init(entry, A::USER_STACK_TOP, id_arg);
             s.frames = frames;
@@ -526,44 +549,59 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             }
         }
         abi::sysno::SEND => {
-            // Synchronous rendezvous: `a0` = endpoint, `a1` = word.
-            let ep = A::frame_arg(&f, 0);
+            // Synchronous rendezvous: `a0` = an Endpoint capability, `a1` = word. Sending
+            // requires WRITE on that cap; the endpoint itself is the cap's object, so two
+            // processes rendezvous only if their caps name the same endpoint.
             let word = A::frame_arg(&f, 1);
-            if let Some(r) = find_blocked_recv(ep) {
-                // A receiver is waiting: hand it the word, wake it, and return OK to us.
-                A::frame_set_ret(&mut proc_at(r).frame, word);
-                proc_at(r).state = ProcState::Ready;
-                sched().add(abi::ThreadId(r));
-                A::frame_set_ret(&mut f, abi::syserr::OK);
-                // CURRENT unchanged: the sender resumes.
-            } else {
-                // No receiver yet: block until one arrives (the word rides in the state).
-                proc_at(cur).state = ProcState::BlockedSend { ep, word };
-                sched().remove(abi::ThreadId(cur));
-                match sched().current() {
-                    Some(t) => CURRENT = t.0,
-                    None => nothing_runnable::<A>(),
-                }
+            match endpoint_of(cur, A::frame_arg(&f, 0), abi::CapRights::WRITE) {
+                // No such cap, wrong type, or no WRITE right: refuse without blocking.
+                None => A::frame_set_ret(&mut f, abi::syserr::NO_CAP),
+                Some(ep) => match find_blocked_recv(ep) {
+                    Some(r) => {
+                        // A receiver is waiting: hand it the word, wake it, return OK to us.
+                        A::frame_set_ret(&mut proc_at(r).frame, word);
+                        proc_at(r).state = ProcState::Ready;
+                        sched().add(abi::ThreadId(r));
+                        A::frame_set_ret(&mut f, abi::syserr::OK);
+                        // CURRENT unchanged: the sender resumes.
+                    }
+                    None => {
+                        // No receiver yet: block until one arrives (word rides in the state).
+                        proc_at(cur).state = ProcState::BlockedSend { ep, word };
+                        sched().remove(abi::ThreadId(cur));
+                        match sched().current() {
+                            Some(t) => CURRENT = t.0,
+                            None => nothing_runnable::<A>(),
+                        }
+                    }
+                },
             }
         }
         abi::sysno::RECV => {
-            // Synchronous rendezvous: `a0` = endpoint; returns the word.
-            let ep = A::frame_arg(&f, 0);
-            if let Some((s, word)) = find_blocked_send(ep) {
-                // A sender is waiting: take its word, return it to us, wake the sender (OK).
-                A::frame_set_ret(&mut f, word);
-                A::frame_set_ret(&mut proc_at(s).frame, abi::syserr::OK);
-                proc_at(s).state = ProcState::Ready;
-                sched().add(abi::ThreadId(s));
-                // CURRENT unchanged: the receiver resumes with the word.
-            } else {
-                // No sender yet: block until one delivers.
-                proc_at(cur).state = ProcState::BlockedRecv { ep };
-                sched().remove(abi::ThreadId(cur));
-                match sched().current() {
-                    Some(t) => CURRENT = t.0,
-                    None => nothing_runnable::<A>(),
-                }
+            // Synchronous rendezvous: `a0` = an Endpoint capability; returns the word.
+            // Receiving requires READ on that cap.
+            match endpoint_of(cur, A::frame_arg(&f, 0), abi::CapRights::READ) {
+                // No such cap, wrong type, or no READ right: refuse without blocking.
+                None => A::frame_set_ret(&mut f, abi::syserr::NO_CAP),
+                Some(ep) => match find_blocked_send(ep) {
+                    Some((s, word)) => {
+                        // A sender waits: take its word, return it, wake the sender (OK).
+                        A::frame_set_ret(&mut f, word);
+                        A::frame_set_ret(&mut proc_at(s).frame, abi::syserr::OK);
+                        proc_at(s).state = ProcState::Ready;
+                        sched().add(abi::ThreadId(s));
+                        // CURRENT unchanged: the receiver resumes with the word.
+                    }
+                    None => {
+                        // No sender yet: block until one delivers.
+                        proc_at(cur).state = ProcState::BlockedRecv { ep };
+                        sched().remove(abi::ThreadId(cur));
+                        match sched().current() {
+                            Some(t) => CURRENT = t.0,
+                            None => nothing_runnable::<A>(),
+                        }
+                    }
+                },
             }
         }
         abi::sysno::SPAWN => {

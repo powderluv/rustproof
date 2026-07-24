@@ -48,7 +48,16 @@ concrete lets the process table be a plain non-generic static.
   new context-switch mechanism.
 - **Per-process address + capability space** is the isolation boundary the whole
   project exists to (eventually) verify: a process can only touch what its own
-  page tables map and only invoke authority its own `CapSpace` holds.
+  page tables map and only invoke authority its own `CapSpace` holds — including
+  *who it can talk to*, since IPC endpoints are capabilities (see `ipc-caps`
+  below) rather than integers any process could name.
+
+Honest scope on IPC authority: the *mechanism* is enforced (cap type + rights
+checked on every `SEND`/`RECV`, rendezvous keyed on the cap's object), but the
+*policy* is still uniform — `load_process` grants every process the same starting
+caps, so today they all hold the shared endpoint. Per-role grants (and passing
+endpoint caps to a child at `SPAWN`) are the natural next step; the enforcement
+point they need already exists.
 
 Load-bearing detail: an x86 interrupt/exception gate clears `IF`/`TF` but **not**
 `DF`, and `std` is unprivileged — so a ring-3 process can enter the kernel with
@@ -68,6 +77,7 @@ compute loop with `DF=1` as a standing regression test.
 | **x86-M3a** ✅ | Cross-address-space IPC: `SEND`/`RECV` synchronous 1-word rendezvous with process blocking (`ProcState` + run-queue add/remove), deadlock detection. Generic; x86 + RISC-V. | this change |
 | **x86-M3b** ✅ | A real `SPAWN` syscall (Untyped-cap-gated): load the embedded image into a fresh process at runtime, with full frame reclamation on `EXIT` (a spawn/exit cycle leaks no address space). Generic; x86 + RISC-V. | done |
 | **vram-quota** ✅ | Per-process VRAM quota + `FREE_VRAM`: `ALLOC_VRAM` refuses past the quota (`VRAM_QUOTA_FRAMES`); `FREE_VRAM(phys)` frees an owned frame (ownership-checked — a process can only free its own), returning quota; VRAM tracked separately from AS frames, both reclaimed on exit. Generic; x86 + RISC-V. | done |
+| **ipc-caps** ✅ | IPC endpoints are capabilities, not raw integers: `SEND`/`RECV` take a `CapId`, require `CapType::Endpoint` with `WRITE`/`READ` respectively, and rendezvous on the cap's *object* — so two processes meet only when their caps name the same endpoint, and an unauthorized caller gets `NO_CAP` without blocking. Generic; x86 + RISC-V. | done |
 
 ## Alternatives Considered
 

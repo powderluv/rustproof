@@ -379,6 +379,22 @@ fn compute(id: u64) -> ! {
             debug_write(b"\n");
         }
     }
+    // IPC authority: endpoints are capabilities, not raw integers. CapId(3) is an
+    // Endpoint cap with READ only, and CapId(9) is not held at all — sending on either
+    // must be refused, proving the kernel gates IPC on the cap AND its rights.
+    tag(id);
+    if send(3, 0xBEEF) == syserr::NO_CAP {
+        debug_write(b"ipc: send on read-only ep cap -> NO_CAP (rights enforced)\n");
+    } else {
+        debug_write(b"ipc: send on read-only ep cap ALLOWED (bug)\n");
+    }
+    tag(id);
+    if send(9, 0xBEEF) == syserr::NO_CAP {
+        debug_write(b"ipc: send on unheld cap -> NO_CAP (authority enforced)\n");
+    } else {
+        debug_write(b"ipc: send on unheld cap ALLOWED (bug)\n");
+    }
+
     // VRAM quota + FREE_VRAM: allocate until the per-process quota is hit (the kernel
     // refuses further allocations), then free one and re-allocate to show FREE_VRAM returns
     // quota. Remaining frames are reclaimed by EXIT.
