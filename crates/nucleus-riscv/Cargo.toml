@@ -11,6 +11,7 @@ arch-riscv64 = { path = "../arch-riscv64" }
 mm = { path = "../mm" }
 capabilities = { path = "../capabilities" }
 ipc = { path = "../ipc" }
+sched = { path = "../sched" }
 vspace-riscv = { path = "../vspace-riscv" }
 loader-riscv = { path = "../loader-riscv" }
 hostcontract = { path = "../hostcontract" }

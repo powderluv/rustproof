@@ -21,6 +21,24 @@ use arch_riscv64::{kprintln, qemu};
 /// `build.rs` guarantees the file exists so `include_bytes!` compiles).
 static USER_ELF: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/user.elf"));
 
+// ---- sched demo: a second kernel thread with its own stack + saved context ----
+static mut MAIN_CTX: sched::Context = sched::Context::new();
+static mut B_CTX: sched::Context = sched::Context::new();
+static mut B_STACK: [u8; 16 * 1024] = [0; 16 * 1024];
+
+extern "C" fn thread_b() -> ! {
+    kprintln!("  [thread B] running on its own stack — switching back to main");
+    unsafe {
+        sched::switch(
+            core::ptr::addr_of_mut!(B_CTX),
+            core::ptr::addr_of!(MAIN_CTX),
+        )
+    };
+    loop {
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+    }
+}
+
 // The boot entry (`_start`) + boot stack live in arch-riscv64; it calls `kmain` below.
 
 // ---- frame-allocator bitmap storage (heap-free; the _start bss loop zero-fills it) ----
@@ -136,6 +154,19 @@ pub extern "C" fn kmain(hartid: u64, dtb: u64) -> ! {
         ),
         other => kprintln!("[ipc] unexpected action: {:?}", other),
     }
+
+    // ---------------- sched: real cooperative context switch ----------------
+    kprintln!();
+    kprintln!("[sched] preparing thread B and switching (real context switch)");
+    unsafe {
+        let top = abi::VirtAddr(core::ptr::addr_of!(B_STACK) as u64 + 16 * 1024);
+        B_CTX = sched::Context::prepare(top, thread_b);
+        sched::switch(
+            core::ptr::addr_of_mut!(MAIN_CTX),
+            core::ptr::addr_of!(B_CTX),
+        );
+    }
+    kprintln!("  [main] resumed after thread B returned via context switch");
 
     // ---------------- RV-M1: enable Sv39 paging ----------------
     kprintln!();

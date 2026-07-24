@@ -114,6 +114,7 @@ dependencies = [
  "ipc",
  "loader-riscv",
  "mm",
+ "sched",
  "vspace-riscv",
 ]
 

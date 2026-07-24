@@ -1,159 +1,21 @@
 #![cfg_attr(not(test), no_std)]
-//! sched — cooperative round-robin scheduler + x86-64 context switch for the nucleus.
+//! sched — a cooperative round-robin scheduler with a per-arch context switch.
 //!
-//! Two independent pieces:
-//!
-//! * [`Context`] + [`switch`] — the machine-level thread switch. `Context` holds the
-//!   x86-64 callee-saved registers plus the stack pointer; `switch` is a naked function
-//!   that spills them to the outgoing context and reloads them from the incoming one,
-//!   then `ret`s. Switching *into* a freshly [`Context::prepare`]d context therefore
-//!   "returns" straight into a new thread's entry point. This half is x86-64 only and is
-//!   exercised under QEMU by the integrator — never in host unit tests.
-//!
-//! * [`Scheduler`] — a fixed-capacity, allocation-free round-robin run queue of
-//!   [`abi::ThreadId`]. Pure index logic, fully host-testable.
+//! [`Scheduler`] is a portable, allocation-free round-robin run queue of [`abi::ThreadId`]
+//! — pure index logic, fully host-testable. The machine [`Context`] + [`switch`] (and
+//! [`Context::prepare`]) are arch-specific (x86-64 / riscv64) and exercised under QEMU by
+//! the integrator, never in host tests.
+use abi::ThreadId;
 
-use abi::{ThreadId, VirtAddr};
-
-// ============================================================ machine context
-
-/// The register state saved/restored across a cooperative [`switch`].
-///
-/// Only the x86-64 **callee-saved** registers (System V AMD64 ABI) plus the stack
-/// pointer live here: a cooperative switch happens at a normal function-call boundary,
-/// so the caller-saved registers are already spilled by the compiler and the switch is,
-/// from each thread's point of view, just a very long function call.
-///
-/// `#[repr(C)]` pins the field order so the assembly in [`switch`] can address the
-/// fields by fixed byte offsets. The `const _` block below fails the build if that
-/// layout ever drifts out from under the offsets baked into the asm.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Context {
-    pub rbx: u64, // 0x00
-    pub rbp: u64, // 0x08
-    pub r12: u64, // 0x10
-    pub r13: u64, // 0x18
-    pub r14: u64, // 0x20
-    pub r15: u64, // 0x28
-    pub rsp: u64, // 0x30
-}
-
-// The naked `switch` below hard-codes these byte offsets; keep them honest at build time.
-const _: () = {
-    assert!(core::mem::offset_of!(Context, rbx) == 0x00);
-    assert!(core::mem::offset_of!(Context, rbp) == 0x08);
-    assert!(core::mem::offset_of!(Context, r12) == 0x10);
-    assert!(core::mem::offset_of!(Context, r13) == 0x18);
-    assert!(core::mem::offset_of!(Context, r14) == 0x20);
-    assert!(core::mem::offset_of!(Context, r15) == 0x28);
-    assert!(core::mem::offset_of!(Context, rsp) == 0x30);
-};
-
-impl Context {
-    /// A zeroed context (all registers 0, no stack). Not runnable until an `rsp` is set,
-    /// e.g. via [`Context::prepare`].
-    pub const fn new() -> Self {
-        Context {
-            rbx: 0,
-            rbp: 0,
-            r12: 0,
-            r13: 0,
-            r14: 0,
-            r15: 0,
-            rsp: 0,
-        }
-    }
-
-    /// Lay out a brand-new thread's initial stack so that the *first* [`switch`] into the
-    /// returned context begins executing `entry`.
-    ///
-    /// The trick mirrors what a real `call` leaves behind: [`switch`] ends in `ret`,
-    /// which pops a return address off the incoming `rsp` and jumps to it. So we write
-    /// `entry` at the top of the given stack and point `rsp` at it — the first `switch`
-    /// then "returns" into `entry`.
-    ///
-    /// Stack layout produced (stack grows downward):
-    /// ```text
-    ///   stack_top ->  ┌───────────────┐  (16-byte aligned, exclusive top)
-    ///                 │  padding      │
-    ///        rsp  ->  ├───────────────┤  (16-byte aligned slot)
-    ///                 │  entry addr   │  <- `ret` pops this
-    ///                 └───────────────┘
-    /// ```
-    /// The slot is 16-byte aligned so that after `ret` pops it, `entry` observes
-    /// `rsp % 16 == 8`, exactly the state the System V ABI guarantees on function entry
-    /// (a real `call` from a 16-aligned `rsp`). Getting this wrong crashes SSE spills.
-    ///
-    /// # Safety
-    /// Writes one `u64` (the return address) into the caller-owned stack, just below
-    /// `stack_top`. The caller must guarantee `stack_top` is the exclusive top of a
-    /// writable, thread-private stack region with at least 16 bytes of headroom below it,
-    /// and that no one else aliases that memory.
-    ///
-    /// PROOF(later): the byte written lies strictly within `[stack_base, stack_top)` and
-    /// `rsp` is 16-aligned and in range — so the prepared stack cannot underflow the
-    /// backing region.
-    pub unsafe fn prepare(stack_top: VirtAddr, entry: extern "C" fn() -> !) -> Context {
-        // Deepest 16-aligned address strictly below `stack_top`. `- 8` first guarantees
-        // we land below an already-aligned `stack_top` (never at it), then mask to 16.
-        let slot = (stack_top.as_u64() - 8) & !0xF;
-
-        // SAFETY: `slot` is inside the caller's stack (contract above); a fn pointer is a
-        // 64-bit value on x86-64, so this stores the whole entry address atomically w.r.t.
-        // this (single-threaded) setup.
-        core::ptr::write(slot as *mut u64, entry as u64);
-
-        Context {
-            rsp: slot,
-            ..Context::new()
-        }
-    }
-}
-
-/// Cooperatively switch CPU register state from `*from` to `*to`.
-///
-/// Spills the callee-saved registers and `rsp` of the current thread into `*from`, loads
-/// the same set from `*to`, then `ret`s — resuming `*to` exactly where its own `switch`
-/// left off (or, for a [`Context::prepare`]d context, at its `entry` point).
-///
-/// Naked so the compiler emits *no* prologue/epilogue: the raw `rsp` we load must be the
-/// one `ret` pops from. `extern "C"` pins the argument registers (`from` → `rdi`,
-/// `to` → `rsi`) that the assembly reads.
-///
-/// # Safety
-/// `from` and `to` must be valid, aligned, non-aliasing `Context` pointers. `*to` must
-/// describe a real suspended thread (from a prior `switch`) or a freshly `prepare`d one;
-/// resuming garbage register/stack state is undefined behavior. Control does not return
-/// to the caller until some other thread switches back to `*from`.
-///
-/// PROOF(later): the register set saved into `*from` is exactly the set restored from
-/// `*to` (no lost/aliased slot), so a round-trip switch is the identity on machine state.
 #[cfg(target_arch = "x86_64")]
-#[unsafe(naked)]
-pub unsafe extern "C" fn switch(from: *mut Context, to: *const Context) {
-    // Intel syntax (Rust's default). rdi = from, rsi = to.
-    core::arch::naked_asm!(
-        // --- save current callee-saved regs + rsp into *from ---
-        "mov [rdi + 0x00], rbx",
-        "mov [rdi + 0x08], rbp",
-        "mov [rdi + 0x10], r12",
-        "mov [rdi + 0x18], r13",
-        "mov [rdi + 0x20], r14",
-        "mov [rdi + 0x28], r15",
-        "mov [rdi + 0x30], rsp",
-        // --- load incoming regs + rsp from *to ---
-        "mov rbx, [rsi + 0x00]",
-        "mov rbp, [rsi + 0x08]",
-        "mov r12, [rsi + 0x10]",
-        "mov r13, [rsi + 0x18]",
-        "mov r14, [rsi + 0x20]",
-        "mov r15, [rsi + 0x28]",
-        "mov rsp, [rsi + 0x30]",
-        // Return address now sits on the *incoming* stack: resume that thread.
-        "ret",
-    );
-}
+mod context_x86;
+#[cfg(target_arch = "x86_64")]
+pub use context_x86::{switch, Context};
+
+#[cfg(target_arch = "riscv64")]
+mod context_riscv;
+#[cfg(target_arch = "riscv64")]
+pub use context_riscv::{switch, Context};
 
 // ============================================================ run queue
 
@@ -422,15 +284,21 @@ mod tests {
         assert_eq!(s.current(), Some(tid(1)));
     }
 
-    // ---- Context::prepare (host-safe: pure pointer math + one write, no `switch`) ----
+    // ---- Context::prepare — x86-specific; skipped on hosts where `Context` is not
+    // compiled (only x86_64 / riscv64 kernel targets have a machine context). ----
+    #[cfg(target_arch = "x86_64")]
+    use abi::VirtAddr;
 
+    #[cfg(target_arch = "x86_64")]
     extern "C" fn dummy_entry() -> ! {
         loop {}
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[repr(align(16))]
     struct AlignedStack([u8; 256]);
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn prepare_lays_out_return_address() {
         let mut stack = AlignedStack([0u8; 256]);
@@ -460,6 +328,7 @@ mod tests {
         assert_eq!(ctx.r15, 0);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn prepare_handles_unaligned_top() {
         // Even if the caller hands us a non-16-aligned top, rsp comes out 16-aligned and
@@ -475,6 +344,7 @@ mod tests {
         assert_eq!(written, dummy_entry as *const () as u64);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn context_default_is_zeroed() {
         let c = Context::new();
