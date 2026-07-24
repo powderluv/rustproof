@@ -1,7 +1,7 @@
 //! x86-64 implementation of the `hal` traits.
 use abi::{FrameAllocator, MemoryRegion, PhysAddr, VirtAddr};
 use arch_x86_64::syscall::TrapFrame;
-use arch_x86_64::{cpu, qemu, serial::Serial, syscall};
+use arch_x86_64::{cpu, interrupts, pic, qemu, serial::Serial, syscall};
 use hal::{Arch, Perms, Space, UserFrame};
 
 /// Reinterpret the opaque [`UserFrame`] as the x86 [`TrapFrame`] (its first 20 words).
@@ -144,6 +144,21 @@ impl Arch for X86 {
 
     fn frame_set_ret(f: &mut UserFrame, v: u64) {
         frame_mut(f).rax = v;
+    }
+
+    fn start_preemption() {
+        // Remap the PICs (IRQ0 -> vector 0x20), point that vector at the timer stub, and
+        // start a ~100 Hz PIT tick. Interrupts stay masked in the kernel, so the first
+        // tick only arrives once a process is running in ring 3 (IF set on `iretq`).
+        unsafe {
+            pic::remap_and_mask();
+            interrupts::set_gate(pic::TIMER_VECTOR, interrupts::timer_handler_addr());
+            pic::init_pit(100);
+        }
+    }
+
+    fn end_of_interrupt() {
+        unsafe { pic::eoi_master() }
     }
 
     unsafe fn resume(token: u64, f: &UserFrame) -> ! {

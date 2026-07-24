@@ -291,8 +291,11 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &[u8]) -> ! {
             "[proc] starting scheduler at process {} (round-robin)\n",
             first
         );
+        // Turn on preemption (a periodic timer) where the arch supports it; otherwise
+        // scheduling stays cooperative (YIELD-driven). Ticks only arrive in user mode.
+        A::start_preemption();
         // Hand off to the scheduler: this resumes process `first` in user mode, and the
-        // trap handler drives every switch thereafter. Never returns here.
+        // trap handlers (syscall + timer) drive every switch thereafter. Never returns.
         let p = unsafe { proc_at(first) };
         unsafe { A::resume(p.token, &p.frame) };
     }
@@ -360,6 +363,26 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
 
     // Persist `cur`'s (possibly result-updated) frame, then resume whoever is now current.
     proc_at(cur).frame = f;
+    let next = CURRENT;
+    let token = proc_at(next).token;
+    A::resume(token, &proc_at(next).frame)
+}
+
+/// The timer-IRQ handler — preempts the running process and round-robins to the next ready
+/// one. The arch timer stub calls this (via the `rustproof_timer_trap` symbol) with the
+/// same frame layout `syscall_trap` uses, so preemption reuses the identical save/resume
+/// path — the only difference is the entry point (an interrupt, not a syscall). Never
+/// returns.
+///
+/// # Safety
+/// `frame` must point at `A::FRAME_WORDS` valid `u64`s (the on-stack timer trap frame).
+pub unsafe fn preempt_trap<A: Arch>(frame: *mut u64) -> ! {
+    let cur = CURRENT;
+    // Save the preempted process's full register state (it never cooperated).
+    core::ptr::copy_nonoverlapping(frame, proc_at(cur).frame.0.as_mut_ptr(), A::FRAME_WORDS);
+    A::end_of_interrupt();
+    // Round-robin to the next ready process (the same one if it is alone).
+    CURRENT = sched().next().map(|t| t.0).unwrap_or(cur);
     let next = CURRENT;
     let token = proc_at(next).token;
     A::resume(token, &proc_at(next).frame)

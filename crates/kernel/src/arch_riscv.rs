@@ -163,6 +163,12 @@ impl Arch for Riscv {
         frame_mut(f).regs[10] = v; // a0 = result
     }
 
+    fn start_preemption() {
+        // RISC-V has no timer wired yet; scheduling stays cooperative (YIELD-driven).
+    }
+
+    fn end_of_interrupt() {}
+
     unsafe fn resume(token: u64, f: &UserFrame) -> ! {
         // Switch to the process's address space, then restore its registers and `sret`.
         mmu::enable_paging(token);

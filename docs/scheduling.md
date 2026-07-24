@@ -50,12 +50,20 @@ concrete lets the process table be a plain non-generic static.
   project exists to (eventually) verify: a process can only touch what its own
   page tables map and only invoke authority its own `CapSpace` holds.
 
+Load-bearing detail: an x86 interrupt/exception gate clears `IF`/`TF` but **not**
+`DF`, and `std` is unprivileged — so a ring-3 process can enter the kernel with
+`DF=1`. The Rust handler's `rep movs`-lowered copies (e.g. the trap-frame save)
+assume the SysV `DF=0` invariant, so every interrupt/exception stub `cld`s on
+entry (the `syscall` path gets this from `FMASK` bit `0x400`). Omitting it lets
+untrusted code corrupt kernel memory; the `init` demo deliberately runs its
+compute loop with `DF=1` as a standing regression test.
+
 ## Milestones
 
 | Milestone | Goal | State |
 |---|---|---|
 | **x86-M1** ✅ | Cooperative multi-process: `YIELD` syscall, N processes each isolated (own AS + caps), round-robin, run to `EXIT`. Generic; x86 + RISC-V. | done |
-| **x86-M2** | Preemptive: PIT/APIC timer interrupt drives the scheduler; a compute-bound process is time-sliced without cooperating. x86 only. | next |
+| **x86-M2** ✅ | Preemptive: an 8259 PIC + 8254 PIT timer interrupt (IRQ0 → vector 0x20) drives the scheduler; a compute-bound process is time-sliced without cooperating. The timer ISR builds the identical `TrapFrame` and reuses `resume`. x86 only (RISC-V stays cooperative). | done |
 | **x86-M3** | Inter-process IPC over the `ipc` endpoints across address spaces; a real `spawn`. | later |
 
 ## Alternatives Considered

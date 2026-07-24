@@ -203,13 +203,25 @@ fn exit(code: u64) -> ! {
     }
 }
 
-/// Cooperatively yield the CPU to the next ready process (no args, no result). Returns to
-/// this process — at the instruction after the syscall — once it is scheduled again.
-fn yield_() {
-    // SAFETY: YIELD touches no user memory and returns nothing meaningful.
-    unsafe {
-        syscall0(sysno::YIELD);
+/// Busy-compute for ~`iters` iterations without making any syscall, so only the timer
+/// interrupt can interleave this process with its siblings. `core::hint::black_box` keeps
+/// the loop from being optimized away (and compiles to no `.rodata` reference, so the
+/// 512 GiB-linked image stays link-clean).
+///
+/// Deliberately runs the loop with the direction flag SET (`std`), as hostile ring-3 code
+/// could: `std` is unprivileged, and the timer preempts this loop while DF=1. This is a
+/// regression test for the kernel — its interrupt entry MUST `cld` before any `rep movs`
+/// (the trap-frame save), or entering with DF=1 corrupts kernel memory. DF is restored
+/// (`cld`) before returning so the rest of this program is unaffected.
+fn spin(iters: u64) {
+    // SAFETY: `std`/`cld` only toggle RFLAGS.DF (legal in ring 3); the loop between them
+    // performs no string/`rep` operation, so a set DF cannot affect this program.
+    unsafe { core::arch::asm!("std", options(nomem, nostack)) };
+    let mut i = 0u64;
+    while core::hint::black_box(i) < iters {
+        i = i.wrapping_add(1);
     }
+    unsafe { core::arch::asm!("cld", options(nomem, nostack)) };
 }
 
 // ---------------------------------------------------------- static string output
@@ -378,36 +390,44 @@ fn tag(id: u64) {
 }
 
 /// The ELF entry point. The kernel loader jumps here in ring 3 with a fresh stack and this
-/// process's id in the first-argument register (`rdi`). Runs the host-contract demo,
-/// cooperatively `YIELD`ing between steps so the concurrently-scheduled sibling processes
-/// interleave, then exits with its id. Never returns (it exits via the EXIT syscall).
+/// process's id in the first-argument register (`rdi`). It runs a compute loop with **no**
+/// syscalls between prints, so the only thing that can interleave it with its siblings is
+/// the timer preempting it — if the interleaved `[proc N] tick K` lines appear, preemptive
+/// scheduling works. It then exercises the per-process host contract and exits with its id.
+/// Never returns (it exits via the EXIT syscall).
 ///
 /// Declared `extern "C"` / `#[no_mangle]` so the linker resolves `_start` (the
 /// `ENTRY` of `link.ld`); the `id` parameter reads the SysV first-arg register.
 #[no_mangle]
 pub extern "C" fn _start(id: u64) -> ! {
     tag(id);
-    dw!(b"hello from ring 3\n");
-    yield_();
+    dw!(b"start (compute loop, no yields -- preemption only)\n");
 
-    // GET_INFO: report the device the kernel advertises.
+    // Pure compute: NO syscall between ticks. Without preemption, process `id` would run
+    // this whole loop and exit before any sibling got the CPU; the interleaved output is
+    // the timer preempting mid-`spin`. Each process's register/RIP state is saved and
+    // restored exactly across every preemption (that is what makes the loop resume).
+    let mut tick = 0u64;
+    while tick < 5 {
+        tag(id);
+        dw!(b"tick ");
+        dbg_dec(tick);
+        dw!(b"\n");
+        spin(5_000_000);
+        tick = tick.wrapping_add(1);
+    }
+
+    // Per-process capabilities still gate the host contract under preemption.
     let info = get_info();
     tag(id);
     dw!(b"gpu gfx_version=");
     dbg_hex(info.gfx_version as u64);
-    dw!(b" vram_bytes=");
-    dbg_dec(info.vram_bytes);
     dw!(b"\n");
-    yield_();
-
-    // MAP_BAR: the kernel grants an Mmio cap at CapId(1); map BAR 0.
     match map_bar(CapId(1), 0) {
         Ok(r) => {
             tag(id);
             dw!(b"map_bar user_va=");
             dbg_hex(r.user_va);
-            dw!(b" size=");
-            dbg_hex(r.size);
             dw!(b"\n");
         }
         Err(e) => {
@@ -417,16 +437,11 @@ pub extern "C" fn _start(id: u64) -> ! {
             dw!(b"\n");
         }
     }
-    yield_();
-
-    // ALLOC_VRAM: the kernel grants an Untyped cap at CapId(2); request 4 KiB.
     match alloc_vram(CapId(2), 4096) {
         Ok(r) => {
             tag(id);
             dw!(b"alloc_vram phys=");
             dbg_hex(r.phys);
-            dw!(b" size=");
-            dbg_hex(r.size);
             dw!(b"\n");
         }
         Err(e) => {

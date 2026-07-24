@@ -137,6 +137,17 @@ pub trait Arch {
     /// Set the syscall return value the user will observe on resume.
     fn frame_set_ret(f: &mut UserFrame, v: u64);
 
+    /// Enable preemptive scheduling: start a periodic timer interrupt that drives the
+    /// scheduler (so a non-cooperating process is time-sliced). A no-op on arches where
+    /// preemption is not yet wired (they remain cooperative). Called once, after
+    /// [`init_traps`](Self::init_traps), before the first process runs.
+    fn start_preemption();
+
+    /// Acknowledge the current interrupt at the interrupt controller (end-of-interrupt),
+    /// so the next timer tick can be delivered. Called from the timer handler before it
+    /// resumes a process. A no-op where [`start_preemption`](Self::start_preemption) is.
+    fn end_of_interrupt();
+
     /// Load `token` into the paging base register and resume the user state in `frame`
     /// (`iretq` / `sret`). Never returns.
     ///

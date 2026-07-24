@@ -45,6 +45,9 @@ pub struct ExceptionFrame {
 #[unsafe(naked)]
 extern "C" fn isr_common() {
     core::arch::naked_asm!(
+        // Clear DF before the Rust dispatcher (see `timer_isr`): an exception from ring 3
+        // may carry DF=1, which would corrupt the `rep movs` in the dump's formatting.
+        "cld",
         "push rax",
         "push rcx",
         "push rdx",
@@ -220,6 +223,65 @@ extern "C" fn exception_dispatch(frame: *const ExceptionFrame) -> ! {
         f.r15
     );
     qemu::exit(qemu::EXIT_FAILURE);
+}
+
+// ---- timer IRQ (preemption) ----
+
+extern "C" {
+    /// The scheduler-aware timer handler (provided by the nucleus). Receives the on-stack
+    /// frame and never returns — it resumes some process via `syscall::resume`.
+    fn rustproof_timer_trap(frame: *mut u64) -> !;
+}
+
+/// Timer IRQ entry (vector [`pic::TIMER_VECTOR`]). On an interrupt from ring 3 the CPU has
+/// already pushed `rip/cs/rflags/rsp/ss`; we push the 15 GPRs in the SAME order the syscall
+/// stub uses, so the result is exactly a [`syscall::TrapFrame`]. It is handed to the
+/// scheduler, which never returns (it resumes a process via `syscall::resume`). Because the
+/// timer only fires in ring 3 (the kernel runs with interrupts masked), the CPU always
+/// switches to the TSS.rsp0 stack and pushes the full 5-word frame, so the 16-byte
+/// alignment for the call is exact without a manual fixup.
+#[unsafe(naked)]
+extern "C" fn timer_isr() {
+    core::arch::naked_asm!(
+        // Clear DF: an interrupt gate clears IF/TF but NOT DF, and a ring-3 process may
+        // have set it (`std` is unprivileged). The Rust handler's `rep movs`-lowered
+        // copies assume the SysV DF=0 invariant, so entering with DF=1 would copy backward
+        // and corrupt kernel memory. (The syscall path gets this from FMASK bit 0x400.)
+        "cld",
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15", // 15 GPRs over the CPU frame -> a syscall::TrapFrame
+        "mov rdi, rsp",
+        "call {trap}",
+        "ud2",
+        trap = sym rustproof_timer_trap,
+    );
+}
+
+/// Install a handler at `vector` (used for the timer IRQ after the base exception vectors
+/// are set by [`init`]). Uses the same 64-bit interrupt gate (IF auto-clears on entry).
+pub fn set_gate(vector: usize, handler: u64) {
+    unsafe {
+        let idt = core::ptr::addr_of_mut!(IDT);
+        (*idt)[vector].set_handler(handler);
+    }
+}
+
+/// Address of the timer IRQ stub, for [`set_gate`].
+pub fn timer_handler_addr() -> u64 {
+    timer_isr as *const () as u64
 }
 
 // ---- IDT ----
