@@ -203,6 +203,9 @@ pub mod sysno {
     /// Spawn a new process running the same embedded image. Returns the new process id, or
     /// `u64::MAX` on failure (no free slot / out of memory).
     pub const SPAWN: u64 = 8;
+    /// Free a VRAM frame previously returned by `ALLOC_VRAM`: `a0` = its physical address.
+    /// Returns `OK`, or `FAULT` if the caller does not own that frame.
+    pub const FREE_VRAM: u64 = 9;
 }
 
 /// Syscall result codes returned in `rax`. `OK` is 0; errors are large sentinels so
@@ -250,8 +253,13 @@ pub trait HostEnv {
     fn gpu_info(&self) -> GpuInfo;
     /// Look up a capability in the calling process's space: `(type, rights, object)`.
     fn cap_lookup(&self, cap: CapId) -> Option<(CapType, CapRights, u64)>;
-    /// Allocate one DMA-capable physical frame for `ALLOC_VRAM`.
+    /// Allocate one DMA-capable physical frame for `ALLOC_VRAM`, honoring the caller's
+    /// per-process VRAM quota. `None` if the quota is reached or memory is exhausted.
     fn alloc_dma(&mut self) -> Option<PhysAddr>;
+    /// Free a VRAM frame (at physical address `phys`) previously handed to the caller by
+    /// [`alloc_dma`](Self::alloc_dma). Returns `false` if the caller does not own it (so a
+    /// process can only free its own VRAM, never another's).
+    fn free_dma(&mut self, phys: u64) -> bool;
     /// Copy `bytes` into the caller's memory at user virtual address `uptr`.
     /// Returns false if the pointer is not a valid, writable user address.
     fn write_user_bytes(&mut self, uptr: u64, bytes: &[u8]) -> bool;

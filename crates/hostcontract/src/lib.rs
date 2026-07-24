@@ -48,8 +48,8 @@ unsafe fn as_bytes<T>(val: &T) -> &[u8] {
 ///
 // PROOF(later): no host-contract op succeeds (returns OK / grants authority) unless the
 // required capability was present with the required type — i.e. every non-`OK` path is
-// reachable only from a failing `env.cap_lookup`, a failing `env.alloc_dma`, or a bad
-// user pointer, and no `OK` path skips the cap check for `MAP_BAR`/`ALLOC_VRAM`.
+// reachable only from a failing `env.cap_lookup`, a failing `env.alloc_dma`/`env.free_dma`,
+// or a bad user pointer, and no `OK` path skips the cap check for `MAP_BAR`/`ALLOC_VRAM`.
 pub fn dispatch(
     env: &mut dyn HostEnv,
     num: u64,
@@ -67,6 +67,7 @@ pub fn dispatch(
         sysno::GET_INFO => sys_get_info(env, a0),
         sysno::MAP_BAR => sys_map_bar(env, a0, a2),
         sysno::ALLOC_VRAM => sys_alloc_vram(env, a0, a2),
+        sysno::FREE_VRAM => sys_free_vram(env, a0),
         // EXIT is handled by the integrator before dispatch (it never returns); if it
         // reaches us it is a misuse, so it falls through with every other selector.
         _ => syserr::BAD_SYSCALL,
@@ -163,6 +164,17 @@ fn sys_alloc_vram(env: &mut dyn HostEnv, cap_id: u64, resp_ptr: u64) -> u64 {
     }
 }
 
+/// `FREE_VRAM`: return a VRAM frame (physical address `a0`) to the pool. No capability is
+/// required — freeing is not an authority grant — but the caller may only free a frame it
+/// owns; `env.free_dma` enforces that, so `FAULT` means the frame is not the caller's.
+fn sys_free_vram(env: &mut dyn HostEnv, phys: u64) -> u64 {
+    if env.free_dma(phys) {
+        syserr::OK
+    } else {
+        syserr::FAULT
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +193,8 @@ mod tests {
         next_frame: u64,
         frames_left: usize,
         info: GpuInfo,
+        /// Physical addresses currently handed out and not yet freed (ownership tracking).
+        held: Vec<u64>,
     }
 
     impl MockEnv {
@@ -192,6 +206,7 @@ mod tests {
                 next_frame: 0x8000_0000,
                 frames_left: 0,
                 info: GpuInfo::default(),
+                held: Vec::new(),
             }
         }
         /// User VA of offset `off` into the flat user-memory buffer.
@@ -221,7 +236,18 @@ mod tests {
             self.frames_left -= 1;
             let p = self.next_frame;
             self.next_frame += PAGE_SIZE;
+            self.held.push(p);
             Some(PhysAddr(p))
+        }
+        fn free_dma(&mut self, phys: u64) -> bool {
+            // Only a frame this env handed out (and still holds) can be freed.
+            match self.held.iter().position(|&p| p == phys) {
+                Some(i) => {
+                    self.held.swap_remove(i);
+                    true
+                }
+                None => false,
+            }
         }
         fn write_user_bytes(&mut self, uptr: u64, bytes: &[u8]) -> bool {
             if uptr < BASE_VA {
@@ -451,6 +477,41 @@ mod tests {
         let ptr = env.va(0);
         let r = dispatch(&mut env, sysno::ALLOC_VRAM, cap.0 as u64, 0, ptr, 0, 0);
         assert_eq!(r, syserr::NO_CAP);
+    }
+
+    #[test]
+    fn free_vram_frees_owned_frame_once() {
+        let mut env = MockEnv::new(4096);
+        let cap = CapId(2);
+        env.caps.push((cap, (CapType::Untyped, CapRights::ALL, 0)));
+        env.frames_left = 4;
+        let ptr = env.va(0);
+        assert_eq!(
+            dispatch(&mut env, sysno::ALLOC_VRAM, cap.0 as u64, 0, ptr, 0, 0),
+            syserr::OK
+        );
+        let a: AllocResp = decode(env.peek(0, core::mem::size_of::<AllocResp>()));
+
+        // Freeing the owned frame succeeds...
+        assert_eq!(
+            dispatch(&mut env, sysno::FREE_VRAM, a.phys, 0, 0, 0, 0),
+            syserr::OK
+        );
+        // ...and freeing it again fails: it is no longer owned (no double-free).
+        assert_eq!(
+            dispatch(&mut env, sysno::FREE_VRAM, a.phys, 0, 0, 0, 0),
+            syserr::FAULT
+        );
+    }
+
+    #[test]
+    fn free_vram_unowned_is_fault() {
+        let mut env = MockEnv::new(4096);
+        // A physical address this process never allocated cannot be freed (isolation).
+        assert_eq!(
+            dispatch(&mut env, sysno::FREE_VRAM, 0x1234_0000, 0, 0, 0, 0),
+            syserr::FAULT
+        );
     }
 
     #[test]

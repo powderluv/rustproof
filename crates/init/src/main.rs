@@ -408,6 +408,21 @@ fn spawn() -> u64 {
     unsafe { syscall1(sysno::SPAWN, 2) }
 }
 
+/// Allocate one VRAM frame via the Untyped cap; returns its physical address, or 0 on
+/// failure (per-process quota reached or out of memory).
+fn alloc_vram_phys() -> u64 {
+    match alloc_vram(CapId(2), 4096) {
+        Ok(r) => r.phys,
+        Err(_) => 0,
+    }
+}
+
+/// Free a VRAM frame (by physical address). Returns `syserr::OK` (0) or a nonzero error.
+fn free_vram(phys: u64) -> u64 {
+    // SAFETY: FREE_VRAM takes a phys addr and returns a status; no user memory is touched.
+    unsafe { syscall1(sysno::FREE_VRAM, phys) }
+}
+
 /// The ELF entry point (ring 3, fresh stack, id in the first-argument register). The demo
 /// is role-selected by `id`: proc 0 produces + `SEND`s five values, proc 1 `RECV`s + prints
 /// them (cross-address-space IPC rendezvous), and any other proc runs a preemptible compute
@@ -505,18 +520,31 @@ fn compute(id: u64) -> ! {
             dw!(b"\n");
         }
     }
-    match alloc_vram(CapId(2), 4096) {
-        Ok(r) => {
-            tag(id);
-            dw!(b"alloc_vram phys=");
-            dbg_hex(r.phys);
-            dw!(b"\n");
+    // VRAM quota + FREE_VRAM: allocate until the per-process quota is hit (the kernel
+    // refuses further allocations), then free one and re-allocate to show FREE_VRAM returns
+    // quota. Remaining frames are reclaimed by EXIT.
+    let mut n = 0u64;
+    let mut last = 0u64;
+    loop {
+        let p = alloc_vram_phys();
+        if p == 0 {
+            break;
         }
-        Err(e) => {
-            tag(id);
-            dw!(b"alloc_vram err=");
-            dbg_hex(e);
-            dw!(b"\n");
+        last = p;
+        n = n.wrapping_add(1);
+    }
+    tag(id);
+    dw!(b"vram: hit quota at ");
+    dbg_dec(n);
+    dw!(b" frames\n");
+    if last != 0 {
+        free_vram(last);
+        let p = alloc_vram_phys();
+        tag(id);
+        if p != 0 {
+            dw!(b"vram: freed 1, realloc OK\n");
+        } else {
+            dw!(b"vram: freed 1, realloc FAILED\n");
         }
     }
 

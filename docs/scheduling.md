@@ -67,6 +67,7 @@ compute loop with `DF=1` as a standing regression test.
 | **riscv-timer** ✅ | Preemptive on RISC-V too: the Sstc `stimecmp` supervisor timer (`scause` int code 5) routes to the same generic `preempt_trap`. Both arches now time-slice. | done |
 | **x86-M3a** ✅ | Cross-address-space IPC: `SEND`/`RECV` synchronous 1-word rendezvous with process blocking (`ProcState` + run-queue add/remove), deadlock detection. Generic; x86 + RISC-V. | this change |
 | **x86-M3b** ✅ | A real `SPAWN` syscall (Untyped-cap-gated): load the embedded image into a fresh process at runtime, with full frame reclamation on `EXIT` (a spawn/exit cycle leaks no address space). Generic; x86 + RISC-V. | done |
+| **vram-quota** ✅ | Per-process VRAM quota + `FREE_VRAM`: `ALLOC_VRAM` refuses past the quota (`VRAM_QUOTA_FRAMES`); `FREE_VRAM(phys)` frees an owned frame (ownership-checked — a process can only free its own), returning quota; VRAM tracked separately from AS frames, both reclaimed on exit. Generic; x86 + RISC-V. | done |
 
 ## Alternatives Considered
 

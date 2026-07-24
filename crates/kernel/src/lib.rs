@@ -53,9 +53,13 @@ enum ProcState {
     BlockedRecv { ep: u64 },
 }
 
-/// How many physical frames a process may hold (tracked for reclamation on exit): its
-/// address space (page tables + stack + ELF segments, ~25) plus any DMA frames it allocs.
+/// How many address-space frames a process may hold (tracked for reclamation on exit): its
+/// page tables + stack + ELF segments, ~25. VRAM frames are tracked + quota'd separately.
 const MAX_PROC_FRAMES: usize = 64;
+
+/// Per-process VRAM quota: the most `ALLOC_VRAM` frames a process may hold at once
+/// (`FREE_VRAM` returns quota). Also the capacity of the per-process VRAM tracking list.
+const VRAM_QUOTA_FRAMES: usize = 8;
 
 /// One scheduled user process: its own address space (`token`), its last-saved user
 /// register state (`frame`), and its own capability space — the isolation boundary.
@@ -68,10 +72,15 @@ struct Process {
     caps: capabilities::CapSpace<16>,
     /// Scheduling / IPC state.
     state: ProcState,
-    /// Every physical frame allocated for this process, freed back to the pool on exit so a
-    /// spawn/exit cycle does not leak an address space. `frames[..nframes]` are live.
+    /// Every address-space frame allocated for this process, freed back to the pool on exit
+    /// so a spawn/exit cycle does not leak an address space. `frames[..nframes]` are live.
     frames: [abi::PhysAddr; MAX_PROC_FRAMES],
     nframes: usize,
+    /// VRAM (DMA) frames the process currently holds via `ALLOC_VRAM`. `vram[..nvram]` are
+    /// live; `nvram` is the process's VRAM usage (capped at the quota) and each is
+    /// individually freeable via `FREE_VRAM`. Also reclaimed on exit.
+    vram: [abi::PhysAddr; VRAM_QUOTA_FRAMES],
+    nvram: usize,
 }
 
 impl Process {
@@ -82,6 +91,8 @@ impl Process {
         state: ProcState::Free,
         frames: [abi::PhysAddr(0); MAX_PROC_FRAMES],
         nframes: 0,
+        vram: [abi::PhysAddr(0); VRAM_QUOTA_FRAMES],
+        nvram: 0,
     };
 }
 
@@ -502,6 +513,10 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                     fa.free_frame(p.frames[i]);
                 }
                 p.nframes = 0;
+                for i in 0..p.nvram {
+                    fa.free_frame(p.vram[i]);
+                }
+                p.nvram = 0;
             }
             proc_at(cur).state = ProcState::Free;
             sched().remove(abi::ThreadId(cur));
@@ -656,22 +671,41 @@ impl<A: Arch> abi::HostEnv for KEnv<A> {
         caps.lookup(cap).map(|s| (s.cap_type, s.rights, s.object))
     }
     fn alloc_dma(&mut self) -> Option<abi::PhysAddr> {
-        use abi::FrameAllocator as _;
         // SAFETY: single-CPU, non-reentrant; FA and the process slot are disjoint statics.
         unsafe {
+            // Enforce the per-process VRAM quota BEFORE allocating, so a process at quota
+            // never even takes a frame from the pool.
+            if proc_at(self.proc_idx).nvram >= VRAM_QUOTA_FRAMES {
+                return None;
+            }
             let fa = (*core::ptr::addr_of_mut!(FA)).as_mut()?;
             let p = fa.alloc_dma_frame()?;
             let proc = proc_at(self.proc_idx);
-            if proc.nframes >= MAX_PROC_FRAMES {
-                // At the tracking cap: an untracked frame would never be reclaimed on exit
-                // (a leak), so fail the allocation and return the frame, mirroring
-                // `RecordingAlloc`. The 64-frame list bounds a process's footprint.
-                fa.free_frame(p);
-                return None;
-            }
-            proc.frames[proc.nframes] = p;
-            proc.nframes += 1;
+            proc.vram[proc.nvram] = p;
+            proc.nvram += 1;
             Some(p)
+        }
+    }
+    fn free_dma(&mut self, phys: u64) -> bool {
+        use abi::FrameAllocator as _;
+        // SAFETY: single-CPU, non-reentrant; FA and the process slot are disjoint statics.
+        unsafe {
+            let proc = proc_at(self.proc_idx);
+            // Ownership check: only free a frame this process holds (never another's).
+            let Some(i) = proc.vram[..proc.nvram]
+                .iter()
+                .position(|f| f.as_u64() == phys)
+            else {
+                return false;
+            };
+            let frame = proc.vram[i];
+            // Swap-remove from the VRAM list (order does not matter), then return to pool.
+            proc.nvram -= 1;
+            proc.vram[i] = proc.vram[proc.nvram];
+            if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
+                fa.free_frame(frame);
+            }
+            true
         }
     }
     fn write_user_bytes(&mut self, uptr: u64, bytes: &[u8]) -> bool {
