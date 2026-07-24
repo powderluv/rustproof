@@ -62,11 +62,31 @@ So that the rights half is never vacuously true, `load_process` also mints two
 deliberately under-powered caps (a `WRITE`-less `Untyped`, a `READ`-less `Mmio`)
 that the demo uses to prove each refusal on real hardware.
 
-Honest scope on IPC authority: the *mechanism* is enforced, but the *policy* is
-still uniform — `load_process` grants every process the same starting caps, so
-today they all hold the shared endpoint. Per-role grants (and passing endpoint
-caps to a child at `SPAWN`) are the natural next step; the enforcement point they
-need already exists.
+The grant *policy* is per-role, not a uniform hand-out: `load_process` gives a
+process exactly its role's capability table (`grants_for`), so a **producer**
+holds `WRITE` on the shared endpoint and nothing else — it cannot receive on the
+endpoint it sends to, map a device, allocate, or spawn — a **consumer** holds
+only `READ` there, and a **worker** gets the device/memory authority but a
+no-rights placeholder on the shared endpoint, so possession of a slot is not
+authority. Cap ids stay aligned across roles because `insert` fills a fresh space
+in order. The demo asserts each of those refusals on hardware.
+
+Authority is never derived from a table index. Slots are recycled by `EXIT` /
+`SPAWN`, so `load_process` takes the role as an explicit parameter: the boot
+policy (`boot_role`) applies only to the initial, never-recycled ids, and a
+`SPAWN`ed process is always a `Worker`, chosen at the spawn site. Deriving it
+from the slot instead would let a worker spawn into the exited producer's slot
+and receive `WRITE` on the shared endpoint — authority no worker holds, i.e. a
+principal minting a stronger principal. Identity is likewise separate from the
+slot (a monotonic counter), so a slot's current and former occupants can never be
+conflated. The demo spawns late, into a deliberately recycled slot, and asserts
+the child is still a worker.
+
+Honest scope on what remains: the role table is a static boot policy, and
+capabilities are only ever granted at load time — there is no delegation yet, so
+a parent cannot hand (or attenuate) one of its own caps to a child at `SPAWN`.
+`capabilities::derive` already provides the authority-monotonic primitive that
+needs; wiring it through `SPAWN` is the next step.
 
 Load-bearing detail: an x86 interrupt/exception gate clears `IF`/`TF` but **not**
 `DF`, and `std` is unprivileged — so a ring-3 process can enter the kernel with
@@ -87,6 +107,7 @@ compute loop with `DF=1` as a standing regression test.
 | **x86-M3b** ✅ | A real `SPAWN` syscall (Untyped-cap-gated): load the embedded image into a fresh process at runtime, with full frame reclamation on `EXIT` (a spawn/exit cycle leaks no address space). Generic; x86 + RISC-V. | done |
 | **vram-quota** ✅ | Per-process VRAM quota + `FREE_VRAM`: `ALLOC_VRAM` refuses past the quota (`VRAM_QUOTA_FRAMES`); `FREE_VRAM(phys)` frees an owned frame (ownership-checked — a process can only free its own), returning quota; VRAM tracked separately from AS frames, both reclaimed on exit. Generic; x86 + RISC-V. | done |
 | **ipc-caps** ✅ | IPC endpoints are capabilities, not raw integers: `SEND`/`RECV` take a `CapId`, require `CapType::Endpoint` with `WRITE`/`READ` respectively, and rendezvous on the cap's *object* — so two processes meet only when their caps name the same endpoint, and an unauthorized caller gets `NO_CAP` without blocking. Generic; x86 + RISC-V. | done |
+| **role-caps** ✅ | Per-role grants: each process is loaded with only its role's capability table (producer = send-only, consumer = receive-only, worker = device/memory but no shared-endpoint authority), so the policy is least-authority rather than uniform. Generic; x86 + RISC-V. | done |
 
 ## Alternatives Considered
 

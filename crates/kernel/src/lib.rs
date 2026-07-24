@@ -70,6 +70,12 @@ struct Process {
     frame: UserFrame,
     /// Per-process authority: what this process may invoke via the host contract.
     caps: capabilities::CapSpace<16>,
+    /// The role whose grant table `caps` was built from (recorded for the boot log and so
+    /// the policy a slot is running under is inspectable rather than re-derived).
+    role: Role,
+    /// This process's identity — NOT its table slot, which is recycled. Kernel messages
+    /// speak in identities so a slot's current and former occupants are never conflated.
+    id: u64,
     /// Scheduling / IPC state.
     state: ProcState,
     /// Every address-space frame allocated for this process, freed back to the pool on exit
@@ -88,6 +94,8 @@ impl Process {
         token: 0,
         frame: UserFrame::ZERO,
         caps: capabilities::CapSpace::new(),
+        role: Role::Worker,
+        id: 0,
         state: ProcState::Free,
         frames: [abi::PhysAddr(0); MAX_PROC_FRAMES],
         nframes: 0,
@@ -135,6 +143,11 @@ static mut CURRENT: usize = 0;
 static mut USER_ELF: &[u8] = &[];
 static mut KTOKEN: u64 = 0;
 
+/// Monotonic process identity, handed to each `SPAWN`ed process. Identity is deliberately
+/// NOT the table slot: slots are recycled by `EXIT`/`SPAWN`, and reusing an id would let a
+/// new process be mistaken (by the kernel or by userland) for the one that freed the slot.
+static mut NEXT_ID: u64 = NUM_PROCS as u64;
+
 /// A `&'static mut` to process slot `i`, via a raw pointer (no direct `static mut` ref).
 ///
 /// # Safety
@@ -151,6 +164,77 @@ unsafe fn proc_at<'a>(i: usize) -> &'a mut Process {
 #[inline]
 unsafe fn sched() -> &'static mut sched::Scheduler<MAX_PROCS> {
     &mut *core::ptr::addr_of_mut!(SCHED)
+}
+
+/// What a process is here to do. The role picks its capability set at load time, so the
+/// grant policy is per-role rather than one uniform hand-out: a producer cannot receive, a
+/// consumer cannot send, and neither holds any device or memory authority at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// Sends on the shared endpoint. Send authority only.
+    Producer,
+    /// Receives on the shared endpoint. Receive authority only.
+    Consumer,
+    /// Does device + memory work (and may spawn). No authority on the shared endpoint.
+    Worker,
+}
+
+/// The BOOT policy: which role the `i`th initial process gets. Only sound for the initial
+/// load, where the ids are fresh — a process's authority must never be re-derived from an
+/// index that gets recycled (see the `SPAWN` arm, which passes its child's role explicitly).
+fn boot_role(i: u64) -> Role {
+    match i {
+        0 => Role::Producer,
+        1 => Role::Consumer,
+        _ => Role::Worker,
+    }
+}
+
+/// Human-readable role, for the boot log.
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::Producer => "producer",
+        Role::Consumer => "consumer",
+        Role::Worker => "worker",
+    }
+}
+
+/// A capability slot that exists but confers nothing — used to keep the ids of later grants
+/// aligned across roles. It is a real lookup hit with `NONE` rights, so every gate refuses
+/// it: possession is not authority.
+const NO_AUTHORITY: (abi::CapType, abi::CapRights, u64) =
+    (abi::CapType::Endpoint, abi::CapRights::NONE, 0);
+
+/// The capability set granted to each role, positionally: entry `i` becomes `CapId(i)`.
+///
+/// PROOF(later): a process's reachable authority is exactly the caps its role's table
+/// names — nothing in the kernel adds to a `CapSpace` after `load_process` builds it.
+fn grants_for(role: Role) -> &'static [(abi::CapType, abi::CapRights, u64)] {
+    const MMIO_BASE: u64 = 0xE000_0000;
+    match role {
+        // Send-only on endpoint object 0. No Mmio, no Untyped: a producer that is
+        // compromised cannot map a device, allocate memory, spawn, or even receive.
+        Role::Producer => &[(abi::CapType::Endpoint, abi::CapRights::WRITE, 0)],
+        // Receive-only on endpoint object 0, and nothing else.
+        Role::Consumer => &[(abi::CapType::Endpoint, abi::CapRights::READ, 0)],
+        Role::Worker => &[
+            // CapId(0): no authority on the shared endpoint — a worker is not in the IPC
+            // pair, and the placeholder keeps CapId(1..) aligned with the other roles.
+            NO_AUTHORITY,
+            // CapId(1)/CapId(2): the real device + memory authority.
+            (abi::CapType::Mmio, abi::CapRights::ALL, MMIO_BASE),
+            (abi::CapType::Untyped, abi::CapRights::ALL, 0),
+            // CapId(3): endpoint object 1, RECEIVE-ONLY — holding an endpoint cap is not
+            // permission to send on it, which the demo exercises.
+            (abi::CapType::Endpoint, abi::CapRights::READ, 1),
+            // CapId(4)/CapId(5): deliberately under-powered caps of the RIGHT type, so the
+            // rights half of every gate is exercised on hardware rather than vacuously
+            // true: an Untyped without WRITE cannot allocate or spawn, and an Mmio without
+            // READ cannot map a BAR.
+            (abi::CapType::Untyped, abi::CapRights::READ, 0),
+            (abi::CapType::Mmio, abi::CapRights::WRITE, MMIO_BASE),
+        ],
+    }
 }
 
 /// Resolve an IPC capability to the endpoint it names, enforcing authority: process `proc`
@@ -220,13 +304,18 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
 }
 
 /// Load the user `elf` into process slot `slot`: a fresh address space (kernel shared in),
-/// a mapped user stack, a fresh capability space (Mmio@CapId(1), Untyped@CapId(2)), and an
-/// initial frame entering `_start` with `id_arg` in the first-argument register. Sets the
-/// slot `Ready`; the caller adds it to the run queue. Returns `false` (leaving the slot
-/// untouched enough to retry) if the address space or a frame can't be allocated.
+/// a mapped user stack, a fresh capability space holding exactly `role`'s grant table (see
+/// [`grants_for`]), and an initial frame entering `_start` with `id_arg` in the
+/// first-argument register. Sets the slot `Ready`; the caller adds it to the run queue.
+/// Returns `false` (leaving the slot untouched enough to retry) if the address space or a
+/// frame can't be allocated.
+///
+/// `role` is an explicit parameter, NOT derived from `slot` or `id_arg`: slots are recycled
+/// by `EXIT`/`SPAWN`, so deriving authority from an index would let a process inherit the
+/// authority of whoever previously occupied that slot.
 ///
 /// Shared by boot (`run`) and the `SPAWN` syscall — the only difference is where `fa` comes
-/// from (a `run` local vs the `FA` static).
+/// from (a `run` local vs the `FA` static) and how the role is chosen.
 ///
 /// # Safety
 /// Single-CPU, non-reentrant: no other live borrow of `PROCS[slot]`. `ktoken` must be the
@@ -234,6 +323,7 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
 unsafe fn load_process<A: Arch>(
     slot: usize,
     id_arg: u64,
+    role: Role,
     fa: &mut dyn abi::FrameAllocator,
     ktoken: u64,
     elf: &[u8],
@@ -266,30 +356,15 @@ unsafe fn load_process<A: Arch>(
     match built {
         Some((token, entry)) => {
             let s = proc_at(slot);
+            // Grant this process its ROLE's capability set — least authority, not a uniform
+            // hand-out. `insert` fills the first free slot of a fresh space, so entry `i` of
+            // the table becomes `CapId(i)` and the ids line up across roles.
             s.caps = capabilities::CapSpace::new();
-            // CapId(0): the shared IPC endpoint (object 0), send + receive.
-            let _ = s
-                .caps
-                .insert(abi::CapType::Endpoint, abi::CapRights::ALL, 0);
-            let _ = s
-                .caps
-                .insert(abi::CapType::Mmio, abi::CapRights::ALL, 0xE000_0000);
-            let _ = s.caps.insert(abi::CapType::Untyped, abi::CapRights::ALL, 0);
-            // CapId(3): endpoint object 1, RECEIVE-ONLY — holding an endpoint cap is not
-            // permission to send on it, which the demo exercises.
-            let _ = s
-                .caps
-                .insert(abi::CapType::Endpoint, abi::CapRights::READ, 1);
-            // CapId(4)/CapId(5): deliberately under-powered caps of the RIGHT type, so the
-            // rights half of every gate is exercised on hardware rather than vacuously true:
-            // an Untyped without WRITE cannot allocate or spawn, and an Mmio without READ
-            // cannot map a BAR.
-            let _ = s
-                .caps
-                .insert(abi::CapType::Untyped, abi::CapRights::READ, 0);
-            let _ = s
-                .caps
-                .insert(abi::CapType::Mmio, abi::CapRights::WRITE, 0xE000_0000);
+            for &(cap_type, rights, object) in grants_for(role) {
+                let _ = s.caps.insert(cap_type, rights, object);
+            }
+            s.role = role;
+            s.id = id_arg;
             s.token = token;
             s.frame = A::frame_init(entry, A::USER_STACK_TOP, id_arg);
             s.frames = frames;
@@ -483,12 +558,15 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
             KTOKEN = ktoken;
         }
         for i in 0..NUM_PROCS {
-            // Each process gets its own address space (kernel shared in), stack, and caps,
-            // and an initial frame entering `_start` with its id in the first-arg register.
-            let ok = unsafe { load_process::<A>(i, i as u64, &mut fa, ktoken, user_elf) };
+            // Each process gets its own address space (kernel shared in), stack, and its
+            // ROLE's capabilities, plus an initial frame entering `_start` with its id in
+            // the first-arg register. Deriving the role from `i` is sound only here, at the
+            // initial load, where the ids are fresh and never recycled.
+            let role = boot_role(i as u64);
+            let ok = unsafe { load_process::<A>(i, i as u64, role, &mut fa, ktoken, user_elf) };
             assert!(ok, "failed to load initial process");
             unsafe { sched().add(abi::ThreadId(i)) };
-            let _ = writeln!(con, "  proc {} loaded", i);
+            let _ = writeln!(con, "  proc {} loaded ({})", i, role_name(role));
         }
         unsafe { FA = Some(fa) };
         let first = unsafe { sched().current() }.expect("a ready process").0;
@@ -536,7 +614,12 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
         abi::sysno::EXIT => {
             let code = A::frame_arg(&f, 0);
             let mut con = Console::<A>::new();
-            let _ = writeln!(con, "[kernel] proc {} exited with code {}", cur, code);
+            let _ = writeln!(
+                con,
+                "[kernel] proc {} exited with code {}",
+                proc_at(cur).id,
+                code
+            );
             // Reclaim the process's frames (page tables + stack + ELF + any DMA frames)
             // before freeing the slot, so a spawn/exit cycle does not leak an address space.
             if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
@@ -633,9 +716,9 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             let authorized = proc_at(cur).caps.lookup(cap).is_some_and(|s| {
                 s.cap_type == abi::CapType::Untyped && s.rights.contains(abi::CapRights::WRITE)
             });
-            // Load the embedded image into a fresh process (the child's id = its slot),
-            // add it to the run queue, and return its id (or u64::MAX on failure). The
-            // spawner keeps running (CURRENT unchanged).
+            // Load the embedded image into a free slot, add it to the run queue, and return
+            // the child's id (or u64::MAX on failure). The spawner keeps running (CURRENT
+            // unchanged).
             let free = if authorized {
                 (0..MAX_PROCS).find(|&i| proc_at(i).state == ProcState::Free)
             } else {
@@ -645,15 +728,35 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             let ktoken = *core::ptr::addr_of!(KTOKEN);
             let ret = match free {
                 Some(slot) => {
+                    // A spawned process is always a Worker, chosen HERE rather than derived
+                    // from the slot: slots are recycled, so `boot_role(slot)` would hand a
+                    // child the exited occupant's authority — e.g. spawning into the freed
+                    // producer's slot would grant WRITE on the shared endpoint, which no
+                    // Worker holds. Spawning must never mint authority the caller lacks, and
+                    // the `Untyped + WRITE` gate above means every spawner is a Worker.
+                    let child_id = {
+                        let id = *core::ptr::addr_of!(NEXT_ID);
+                        NEXT_ID = id.wrapping_add(1);
+                        id
+                    };
                     let loaded = match (*core::ptr::addr_of_mut!(FA)).as_mut() {
-                        Some(fa) => load_process::<A>(slot, slot as u64, fa, ktoken, elf),
+                        Some(fa) => {
+                            load_process::<A>(slot, child_id, Role::Worker, fa, ktoken, elf)
+                        }
                         None => false,
                     };
                     if loaded {
                         sched().add(abi::ThreadId(slot));
                         let mut con = Console::<A>::new();
-                        let _ = writeln!(con, "[kernel] proc {} spawned proc {}", cur, slot);
-                        slot as u64
+                        let _ = writeln!(
+                            con,
+                            "[kernel] proc {} spawned proc {} ({}, slot {})",
+                            proc_at(cur).id,
+                            child_id,
+                            role_name(Role::Worker),
+                            slot
+                        );
+                        child_id
                     } else {
                         u64::MAX
                     }

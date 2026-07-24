@@ -468,6 +468,20 @@ pub extern "C" fn _start(id: u64) -> ! {
 fn producer() -> ! {
     tag(0);
     dw!(b"producer: sending 5 values on ep 0\n");
+    // Least authority: this role holds SEND on the endpoint and nothing else. It cannot
+    // receive on the very endpoint it sends to, and holds no device authority at all.
+    tag(0);
+    if recv(0).0 == syserr::NO_CAP {
+        dw!(b"role: producer cannot RECV on its own endpoint (send-only)\n");
+    } else {
+        dw!(b"role: producer CAN recv (bug)\n");
+    }
+    tag(0);
+    if map_bar(CapId(1), 0).is_err() {
+        dw!(b"role: producer holds no device authority\n");
+    } else {
+        dw!(b"role: producer mapped a BAR (bug)\n");
+    }
     let mut i = 0u64;
     while i < 4 {
         let v = 100u64.wrapping_add(i);
@@ -492,6 +506,20 @@ fn producer() -> ! {
 fn consumer() -> ! {
     tag(1);
     dw!(b"consumer: receiving 5 values on ep 0\n");
+    // Least authority: this role holds RECEIVE and nothing else — it cannot inject a
+    // message onto the endpoint it reads, nor allocate memory.
+    tag(1);
+    if send(0, 0xDEAD) == syserr::NO_CAP {
+        dw!(b"role: consumer cannot SEND on its own endpoint (recv-only)\n");
+    } else {
+        dw!(b"role: consumer CAN send (bug)\n");
+    }
+    tag(1);
+    if alloc_vram(CapId(2), 4096).is_err() {
+        dw!(b"role: consumer holds no memory authority\n");
+    } else {
+        dw!(b"role: consumer allocated VRAM (bug)\n");
+    }
     let mut i = 0u64;
     while i < 4 {
         let (status, v) = recv(0);
@@ -566,6 +594,14 @@ fn compute(id: u64) -> ! {
     // IPC authority: endpoints are capabilities, not raw integers. CapId(3) is an
     // Endpoint cap with READ only, and CapId(9) is not held at all — sending on either
     // must be refused, proving the kernel gates IPC on the cap AND its rights.
+    // A worker is not in the IPC pair: its CapId(0) exists but confers nothing, so even
+    // the shared endpoint is closed to it. Possession is not authority.
+    tag(id);
+    if send(0, 0xBEEF) == syserr::NO_CAP {
+        dw!(b"role: worker holds no authority on the shared endpoint\n");
+    } else {
+        dw!(b"role: worker CAN send on the shared endpoint (bug)\n");
+    }
     tag(id);
     if send(3, 0xBEEF) == syserr::NO_CAP {
         dw!(b"ipc: send on read-only ep cap -> NO_CAP (rights enforced)\n");
@@ -635,6 +671,19 @@ fn compute(id: u64) -> ! {
         } else {
             dw!(b"vram: freed 1, realloc FAILED\n");
         }
+    }
+
+    // Regression test for authority amplification via slot recycling: by now the
+    // producer and consumer have exited and freed their slots, so this spawn lands in a
+    // RECYCLED one. The child must STILL be a worker. If the kernel derived authority from
+    // the slot index, this child would inherit the producer's send right on the shared
+    // endpoint (and, running producer(), would block forever and deadlock the boot).
+    if id == 2 {
+        let late = spawn(2);
+        tag(id);
+        dw!(b"late spawn into a recycled slot -> pid ");
+        dbg_dec(late);
+        dw!(b"\n");
     }
 
     exit(id);
