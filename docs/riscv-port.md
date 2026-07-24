@@ -1,8 +1,10 @@
 # Rustproof — RISC-V (rv64) port plan
 
-> Status: in progress (2026-07-23). RV-M0 (boot + portable core) is being brought up in
-> parallel with the x86-64 work. This doc records the architecture-abstraction strategy,
-> the RISC-V boot/trap/paging specifics, and the milestone ladder.
+> Status: **RV-M0/M1/M2 done** (2026-07-23). The RISC-V nucleus boots under QEMU, enables
+> Sv39 paging, and runs an untrusted U-mode program that reaches the kernel only through
+> the capability-gated host contract — reusing the x86 `hostcontract` + capability code
+> unchanged. This doc records the architecture-abstraction strategy, the RISC-V
+> boot/trap/paging specifics, and the milestone ladder.
 
 ## 1. Why this is cheap: most of the kernel is already portable
 
@@ -71,10 +73,10 @@ trait against one arch. See *Alternatives Considered*.
 
 | Milestone | Goal | Reuses | New |
 |---|---|---|---|
-| **RV-M0** | Boot under QEMU virt (S-mode), UART console, trap dump, run the portable core (frame allocator + capabilities + IPC). | `abi`, `mm`, `capabilities`, `ipc` | `arch-riscv64`, `nucleus-riscv` |
-| **RV-M1** | Sv39 paging: build an address space, map/translate, enable `satp`. | `abi` | `vspace-riscv` |
-| **RV-M2** | User mode: `sret` to U-mode, `ecall` syscall entry, the capability-gated host contract (same `hostcontract::dispatch`). | `hostcontract`, `loader` (+`EM_RISCV`) | riscv user-entry + trap syscall path |
-| **RV-M3** | Parity with the x86 M0 core + a RISC-V context switch; then factor the `Arch` HAL and unify the nucleus bins. | all | `sched` riscv `switch`; `Arch` trait |
+| **RV-M0** ✅ | Boot under QEMU virt (S-mode), UART console, trap dump, run the portable core (frame allocator + capabilities + IPC). | `abi`, `mm`, `capabilities`, `ipc` | `arch-riscv64`, `nucleus-riscv` |
+| **RV-M1** ✅ | Sv39 paging: 3 GiB identity gigapages, enable `satp`; build/map/translate a fresh AS. | `abi` | `vspace-riscv` |
+| **RV-M2** ✅ | User mode: `sret` to U-mode, returning `ecall` trap path (`sscratch` stack swap + `SUM`), the capability-gated host contract (same `hostcontract::dispatch`). | `hostcontract` | `loader-riscv`, `riscv-init`, arch `mmu` + trap syscall path |
+| **RV-M3** | A RISC-V context switch (`sched`) + factor the `Arch` HAL to unify the two nucleus bins. | all | `sched` riscv `switch`; `Arch` trait |
 
 ## 5. Toolchain
 

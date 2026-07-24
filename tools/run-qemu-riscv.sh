@@ -15,6 +15,10 @@ BUILD_FLAG=()
 
 EXPECT="rustproof: RV BOOT OK"
 
+echo "== building riscv-init (U-mode user program) =="
+cargo build -p riscv-init --target "$TARGET" "${BUILD_FLAG[@]}"
+cp "target/$TARGET/$PROFILE/riscv-init" crates/nucleus-riscv/user.elf
+
 echo "== building nucleus-riscv ($PROFILE) for $TARGET =="
 cargo build -p nucleus-riscv --target "$TARGET" "${BUILD_FLAG[@]}"
 

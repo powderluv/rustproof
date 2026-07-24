@@ -10,6 +10,7 @@
 pub mod boot;
 pub mod csr;
 pub mod interrupts;
+pub mod mmu;
 pub mod qemu;
 pub mod serial;
 

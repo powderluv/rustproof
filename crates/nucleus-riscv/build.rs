@@ -8,4 +8,12 @@ fn main() {
     println!("cargo:rustc-link-arg-bins=-T{}", script.display());
     println!("cargo:rustc-link-arg-bins=-no-pie");
     println!("cargo:rerun-if-changed=link.ld");
+
+    // Stage the riscv-init user ELF for embedding (tools/run-qemu-riscv.sh copies the real
+    // program here; guarantee the file exists so include_bytes! compiles).
+    let user_elf = manifest.join("user.elf");
+    if !user_elf.exists() {
+        std::fs::write(&user_elf, b"").expect("create placeholder user.elf");
+    }
+    println!("cargo:rerun-if-changed=user.elf");
 }

@@ -11,8 +11,15 @@
 #![no_std]
 #![no_main]
 
+mod paging;
+mod userland;
+
 use abi::{CapRights, CapType, FrameAllocator, MemoryKind, MemoryRegion, MessageInfo, ThreadId};
 use arch_riscv64::{kprintln, qemu};
+
+/// The `riscv-init` user program, staged by `tools/run-qemu-riscv.sh` (empty until then —
+/// `build.rs` guarantees the file exists so `include_bytes!` compiles).
+static USER_ELF: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/user.elf"));
 
 // The boot entry (`_start`) + boot stack live in arch-riscv64; it calls `kmain` below.
 
@@ -130,8 +137,55 @@ pub extern "C" fn kmain(hartid: u64, dtb: u64) -> ! {
         other => kprintln!("[ipc] unexpected action: {:?}", other),
     }
 
+    // ---------------- RV-M1: enable Sv39 paging ----------------
     kprintln!();
-    kprintln!("rustproof: RV BOOT OK");
+    let ksatp = unsafe { paging::build_kernel_identity(&mut fa) };
+    unsafe { arch_riscv64::mmu::enable_paging(ksatp) };
+    kprintln!(
+        "[paging] Sv39 on: satp={:#018x} (3 GiB identity via gigapages)",
+        ksatp
+    );
+    if let Some(mut aspace) = vspace_riscv::AddressSpace::create(0, &mut fa) {
+        let va = abi::VirtAddr(0x1_0000_0000);
+        let target = fa.alloc_frame().expect("test frame");
+        let flags =
+            vspace_riscv::PageFlags::V | vspace_riscv::PageFlags::R | vspace_riscv::PageFlags::W;
+        match aspace.map(va, target, flags, &mut fa) {
+            Ok(()) => {
+                kprintln!(
+                    "[vspace] new AS satp={:#x}; map {:#x} -> {:#x}; translate -> {:#x}",
+                    aspace.satp(),
+                    va.as_u64(),
+                    target.as_u64(),
+                    aspace.translate(va).map(|p| p.as_u64()).unwrap_or(0)
+                );
+                aspace.unmap(va);
+                kprintln!(
+                    "[vspace] unmap -> translate now {}",
+                    if aspace.translate(va).is_none() {
+                        "unmapped"
+                    } else {
+                        "STILL MAPPED?!"
+                    }
+                );
+            }
+            Err(_) => kprintln!("[vspace] map failed"),
+        }
+    }
+
+    // ---------------- RV-M2: userland (U-mode + ecall host contract) ----------------
+    if USER_ELF.len() >= 64 {
+        kprintln!();
+        kprintln!(
+            "[user] loading riscv-init ({} bytes) into a fresh address space",
+            USER_ELF.len()
+        );
+        // Never returns: riscv-init runs in U-mode and its EXIT ecall prints the banner.
+        unsafe { userland::setup_and_enter(USER_ELF, fa, ksatp) }
+    }
+
+    kprintln!();
+    kprintln!("rustproof: RV BOOT OK (no user image)");
     qemu::exit_success();
 }
 

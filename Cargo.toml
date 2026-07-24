@@ -18,6 +18,8 @@ members = [
     "crates/arch-riscv64",
     "crates/vspace-riscv",
     "crates/nucleus-riscv",
+    "crates/loader-riscv",
+    "crates/riscv-init",
     "crates/nucleus",
     "crates/userland-rt",
     "crates/init",
