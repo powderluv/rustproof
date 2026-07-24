@@ -110,14 +110,7 @@ core::arch::global_asm!(
 extern "C" {
     fn __trap_vector();
     /// The nucleus's capability-gated syscall dispatch (`ecall` handler body).
-    fn rustproof_riscv_syscall_dispatch(
-        num: u64,
-        a0: u64,
-        a1: u64,
-        a2: u64,
-        a3: u64,
-        a4: u64,
-    ) -> u64;
+    fn rustproof_syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64;
 }
 
 fn exception_name(code: u64) -> &'static str {
@@ -152,7 +145,7 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
     if !is_interrupt && code == 8 {
         let num = f.regs[17]; // a7
         let ret = unsafe {
-            rustproof_riscv_syscall_dispatch(
+            rustproof_syscall_dispatch(
                 num, f.regs[10], // a0
                 f.regs[11], // a1
                 f.regs[12], // a2

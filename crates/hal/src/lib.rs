@@ -1,0 +1,118 @@
+//! hal — the hardware-abstraction traits the generic nucleus (`kernel` crate) runs on.
+//!
+//! Pure traits over `abi`; the concrete per-arch implementations (and the newtype
+//! [`Space`] wrappers over the arch page-table crates) live in the `kernel` crate. This
+//! keeps `hal` dependency-light and orphan-rule-clean.
+#![no_std]
+
+use abi::{FrameAllocator, MemoryRegion, PhysAddr, VirtAddr};
+
+/// Architecture-neutral page permissions; each arch maps these onto its PTE flag bits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Perms {
+    pub write: bool,
+    pub exec: bool,
+    pub user: bool,
+}
+
+impl Perms {
+    pub const KERNEL_RW: Perms = Perms {
+        write: true,
+        exec: false,
+        user: false,
+    };
+    pub const USER_RW: Perms = Perms {
+        write: true,
+        exec: false,
+        user: true,
+    };
+    pub const USER_RX: Perms = Perms {
+        write: false,
+        exec: true,
+        user: true,
+    };
+
+    /// Permissions for a loaded ELF segment (`PF_W` / `PF_X`), always user + readable.
+    #[inline]
+    pub const fn from_elf(pf_w: bool, pf_x: bool) -> Perms {
+        Perms {
+            write: pf_w,
+            exec: pf_x,
+            user: true,
+        }
+    }
+}
+
+/// An address space (page-table tree) an image can be mapped into.
+pub trait Space: Sized {
+    /// Allocate + zero a fresh root table.
+    fn create(fa: &mut dyn FrameAllocator) -> Option<Self>;
+    /// Map one 4 KiB page `va -> pa` with `perms`, allocating intermediate tables from `fa`.
+    fn map_page(
+        &mut self,
+        va: VirtAddr,
+        pa: PhysAddr,
+        perms: Perms,
+        fa: &mut dyn FrameAllocator,
+    ) -> bool;
+    /// Walk `va` to its physical address (if mapped).
+    fn translate(&self, va: VirtAddr) -> Option<PhysAddr>;
+    /// The value to load into the paging base register (`cr3` on x86, `satp` on RISC-V).
+    fn token(&self) -> u64;
+    /// Copy the kernel's shared mappings (from `kernel_token`) into this user space, so the
+    /// trap/syscall path stays reachable while this space is active. Kernel pages carry no
+    /// user bit, so user mode still cannot reach them.
+    ///
+    /// # Safety
+    /// `kernel_token` must be the active kernel space's token; the root tables must be
+    /// reachable at their physical addresses (identity map).
+    unsafe fn share_kernel(&mut self, kernel_token: u64);
+}
+
+/// The per-arch hardware surface the generic kernel is written against.
+pub trait Arch {
+    /// The arch's address-space type.
+    type Space: Space;
+
+    const NAME: &'static str;
+    /// Base of the user virtual-address window (never overlaps kernel mappings).
+    const USER_BASE: u64;
+    /// Exclusive upper bound of the user window (for pointer validation).
+    const USER_LIMIT: u64;
+    /// Top of the user stack (grows down); [`USER_STACK_PAGES`](Self::USER_STACK_PAGES) below it are mapped.
+    const USER_STACK_TOP: u64;
+    const USER_STACK_PAGES: u64;
+
+    /// Emit raw bytes to the debug console.
+    fn console_write(bytes: &[u8]);
+    /// Shut the guest down (`success` -> clean/zero exit).
+    fn exit(success: bool) -> !;
+    /// Install the trap/interrupt vector(s).
+    fn init_traps();
+    /// Fill `out` with the usable physical memory regions from the boot args (`a0`,`a1`).
+    fn memory_map(a0: u64, a1: u64, out: &mut [MemoryRegion]) -> usize;
+    /// Bytes below which physical memory is reserved (kernel image + firmware).
+    fn reserve_below() -> u64;
+    /// DMA-capable pool ceiling.
+    fn dma_top() -> u64;
+    /// Ensure paging is on (build+enable it if needed) and return the kernel space token.
+    fn setup_paging(fa: &mut dyn FrameAllocator) -> u64;
+    /// Load a user ELF into `space` (via the arch's loader), returning its entry VA.
+    fn load_user(elf: &[u8], space: &mut Self::Space, fa: &mut dyn FrameAllocator) -> Option<u64>;
+
+    /// Drop to user mode at `entry` with stack `user_sp` under `space_token`. Never returns.
+    ///
+    /// # Safety
+    /// `space_token` must name a valid user space that shares the kernel mappings, and
+    /// `entry`/`user_sp` must be mapped user-accessible in it.
+    unsafe fn enter_user(space_token: u64, entry: u64, user_sp: u64) -> !;
+
+    /// Copy into the current user space at `uptr` (validated + arch-permitted).
+    /// # Safety: caller ensures the user space is active.
+    unsafe fn copy_to_user(uptr: u64, bytes: &[u8]) -> bool;
+    /// Copy from the current user space at `uptr`.
+    /// # Safety: caller ensures the user space is active.
+    unsafe fn copy_from_user(uptr: u64, out: &mut [u8]) -> bool;
+    /// True if `[uptr, uptr+len)` lies within the user window.
+    fn user_ptr_ok(uptr: u64, len: usize) -> bool;
+}

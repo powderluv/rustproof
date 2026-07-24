@@ -41,12 +41,16 @@ init + trap dump, an `exit`, control-register access, and — later — context 
 user-mode entry). The portable crates depend only on `abi`. The two `nucleus*` bins are
 thin: they call their arch crate and then run the identical portable-core demo/logic.
 
-**Later (planned): a small `Arch` trait (HAL).** Once both arches have the same set of
-operations (console, traps, `map`/`activate` for paging, `context_switch`, `enter_user`),
-factor them behind a `trait Arch` (or a set of focused traits) and collapse the two
-`nucleus*` bins into one `nucleus` generic over `Arch`, selected by `#[cfg(target_arch)]`
-at the leaves. This is deferred until the RISC-V surface is proven, so we don't design the
-trait against one arch. See *Alternatives Considered*.
+**Now realized (RV-M3): a small `Arch` HAL.** With both arches proven, the shared surface
+is factored into the [`hal`](../crates/hal) crate — pure traits `Arch` + `Space` + `Perms`
+over `abi` (console, traps, memory map, `setup_paging`, `load_user`, `enter_user`,
+user-memory copy, `Space::{create, map_page, translate, token, share_kernel}`). The whole
+kmain now lives once in the [`kernel`](../crates/kernel) crate as `run::<A: Arch>` +
+`handle_syscall::<A>`, with the x86-64 and RISC-V specifics behind `arch_x86::X86` /
+`arch_riscv::Riscv` (newtype `Space` wrappers keep the orphan rule happy). The two
+`nucleus*` bins are now thin shims: boot glue + `kernel::run::<CurrentArch>` + a
+`rustproof_syscall_dispatch` symbol. Both boot the identical portable flow end-to-end
+(context switch, paging, ring-3/U-mode userland, host contract) to `rustproof: BOOT OK`.
 
 ## 3. RISC-V boot & runtime specifics
 
@@ -76,7 +80,7 @@ trait against one arch. See *Alternatives Considered*.
 | **RV-M0** ✅ | Boot under QEMU virt (S-mode), UART console, trap dump, run the portable core (frame allocator + capabilities + IPC). | `abi`, `mm`, `capabilities`, `ipc` | `arch-riscv64`, `nucleus-riscv` |
 | **RV-M1** ✅ | Sv39 paging: 3 GiB identity gigapages, enable `satp`; build/map/translate a fresh AS. | `abi` | `vspace-riscv` |
 | **RV-M2** ✅ | User mode: `sret` to U-mode, returning `ecall` trap path (`sscratch` stack swap + `SUM`), the capability-gated host contract (same `hostcontract::dispatch`). | `hostcontract` | `loader-riscv`, `riscv-init`, arch `mmu` + trap syscall path |
-| **RV-M3** | A RISC-V context switch (`sched`) + factor the `Arch` HAL to unify the two nucleus bins. | all | `sched` riscv `switch`; `Arch` trait |
+| **RV-M3** ✅ | A RISC-V context switch (`sched`) + factor the `Arch` HAL to unify the two nucleus bins into one generic `kernel::run::<A>`. | all | `sched` riscv `switch`; `hal::{Arch, Space}`; `kernel` |
 
 ## 5. Toolchain
 

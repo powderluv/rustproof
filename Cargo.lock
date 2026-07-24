@@ -33,6 +33,13 @@ name = "driver-shim"
 version = "0.0.0"
 
 [[package]]
+name = "hal"
+version = "0.0.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
 name = "hostcontract"
 version = "0.0.0"
 dependencies = [
@@ -55,6 +62,25 @@ name = "ipc"
 version = "0.0.0"
 dependencies = [
  "abi",
+]
+
+[[package]]
+name = "kernel"
+version = "0.0.0"
+dependencies = [
+ "abi",
+ "arch-riscv64",
+ "arch-x86_64",
+ "capabilities",
+ "hal",
+ "hostcontract",
+ "ipc",
+ "loader",
+ "loader-riscv",
+ "mm",
+ "sched",
+ "vspace",
+ "vspace-riscv",
 ]
 
 [[package]]
@@ -88,15 +114,8 @@ dependencies = [
 name = "nucleus"
 version = "0.0.0"
 dependencies = [
- "abi",
  "arch-x86_64",
- "capabilities",
- "hostcontract",
- "ipc",
- "loader",
- "mm",
- "sched",
- "vspace",
+ "kernel",
 ]
 
 [[package]]
@@ -107,15 +126,8 @@ version = "0.0.0"
 name = "nucleus-riscv"
 version = "0.0.0"
 dependencies = [
- "abi",
  "arch-riscv64",
- "capabilities",
- "hostcontract",
- "ipc",
- "loader-riscv",
- "mm",
- "sched",
- "vspace-riscv",
+ "kernel",
 ]
 
 [[package]]

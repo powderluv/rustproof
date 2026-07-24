@@ -1,13 +1,11 @@
-//! Minimal PVH boot-protocol parsing: read the `hvm_start_info` the loader passed in
-//! `%ebx` and extract the physical memory map. Low RAM is identity-mapped, so physical
-//! addresses are dereferenced directly.
+//! Minimal PVH boot-protocol parsing (x86-64): read the `hvm_start_info` the loader
+//! passed in `%ebx` and extract the physical memory map. Low RAM is identity-mapped, so
+//! physical addresses are dereferenced directly.
 use abi::{MemoryKind, MemoryRegion};
 
 const PVH_MAGIC: u32 = 0x336e_c578;
-
-/// The boot trampoline identity-maps the low 1 GiB; the frame allocator (which hands
-/// out page-table frames we then dereference at that identity offset) is clipped here.
-pub const IDENTITY_LIMIT: u64 = 0x4000_0000; // 1 GiB
+/// The boot trampoline identity-maps the low 1 GiB; clip the allocator to it.
+pub const IDENTITY_LIMIT: u64 = 0x4000_0000;
 
 #[repr(C)]
 struct HvmStartInfo {
@@ -41,12 +39,7 @@ fn kind_of(typ: u32) -> MemoryKind {
     }
 }
 
-/// Parse the PVH memory map into `out`, clipped to the identity-mapped window. Returns
-/// the number of regions written. `start_info` is the pointer the loader gave `kmain`.
-///
-/// # Safety-relevant assumption
-/// `start_info` and `memmap_paddr` are firmware-provided physical addresses in low RAM,
-/// which the boot trampoline identity-maps, so they are read directly.
+/// Parse the PVH memory map into `out`, clipped to the identity window. Returns the count.
 pub fn memory_map(start_info: u64, out: &mut [MemoryRegion]) -> usize {
     if start_info == 0 {
         return 0;

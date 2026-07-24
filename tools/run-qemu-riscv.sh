@@ -2,7 +2,7 @@
 # Build the Rustproof RISC-V nucleus and boot it under qemu-system-riscv64, checking
 # the serial console. Cross-builds riscv64gc-unknown-none-elf from any host.
 #
-#   tools/run-qemu-riscv.sh                 # normal boot; expect "rustproof: RV BOOT OK"
+#   tools/run-qemu-riscv.sh                 # normal boot; expect "rustproof: BOOT OK"
 #   PROFILE=debug tools/run-qemu-riscv.sh   # debug profile (default: release)
 # note: no `-u` — bash 3.2 (macOS) errors on empty-array expansion under nounset
 set -eo pipefail
@@ -13,7 +13,7 @@ PROFILE="${PROFILE:-release}"
 BUILD_FLAG=()
 [ "$PROFILE" = "release" ] && BUILD_FLAG+=(--release)
 
-EXPECT="rustproof: RV BOOT OK"
+EXPECT="rustproof: BOOT OK"
 
 echo "== building riscv-init (U-mode user program) =="
 cargo build -p riscv-init --target "$TARGET" "${BUILD_FLAG[@]}"

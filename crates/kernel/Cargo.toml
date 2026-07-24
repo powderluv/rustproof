@@ -1,0 +1,29 @@
+[package]
+name = "kernel"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+abi = { path = "../abi" }
+hal = { path = "../hal" }
+mm = { path = "../mm" }
+capabilities = { path = "../capabilities" }
+ipc = { path = "../ipc" }
+sched = { path = "../sched" }
+hostcontract = { path = "../hostcontract" }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+arch-x86_64 = { path = "../arch-x86_64" }
+vspace = { path = "../vspace" }
+loader = { path = "../loader" }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+arch-riscv64 = { path = "../arch-riscv64" }
+vspace-riscv = { path = "../vspace-riscv" }
+loader-riscv = { path = "../loader-riscv" }
+
+[features]
+# Force a fault after trap setup to exercise the exception dump (x86 CI smoke).
+provoke-fault = []

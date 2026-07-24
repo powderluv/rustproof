@@ -20,6 +20,8 @@ members = [
     "crates/nucleus-riscv",
     "crates/loader-riscv",
     "crates/riscv-init",
+    "crates/hal",
+    "crates/kernel",
     "crates/nucleus",
     "crates/userland-rt",
     "crates/init",

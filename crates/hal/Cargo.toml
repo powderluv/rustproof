@@ -1,10 +1,9 @@
 [package]
-name = "nucleus-riscv"
+name = "hal"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 publish = false
 
 [dependencies]
-kernel = { path = "../kernel" }
-arch-riscv64 = { path = "../arch-riscv64" }
+abi = { path = "../abi" }
