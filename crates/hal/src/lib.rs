@@ -43,6 +43,25 @@ impl Perms {
     }
 }
 
+/// The saved user register state of a process — an opaque, fixed-size POD large enough
+/// for either ISA's trap frame. Each arch casts it to its concrete `TrapFrame` layout;
+/// keeping it concrete (not a generic/associated type) lets the process table be a plain
+/// non-generic static. Only [`Arch`]'s frame methods interpret the contents.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub struct UserFrame(pub [u64; 40]);
+
+impl UserFrame {
+    /// An all-zero frame (never resumed as-is; overwritten by [`Arch::frame_init`]).
+    pub const ZERO: UserFrame = UserFrame([0; 40]);
+}
+
+impl Default for UserFrame {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
 /// An address space (page-table tree) an image can be mapped into.
 pub trait Space: Sized {
     /// Allocate + zero a fresh root table.
@@ -100,12 +119,32 @@ pub trait Arch {
     /// Load a user ELF into `space` (via the arch's loader), returning its entry VA.
     fn load_user(elf: &[u8], space: &mut Self::Space, fa: &mut dyn FrameAllocator) -> Option<u64>;
 
-    /// Drop to user mode at `entry` with stack `user_sp` under `space_token`. Never returns.
+    // ---- trap-frame / scheduling surface -------------------------------------------
+
+    /// How many `u64` words the trap stub saves into a [`UserFrame`] (the arch's
+    /// `TrapFrame` size). The generic trap handler copies exactly this many words out of
+    /// the on-stack frame the stub built.
+    const FRAME_WORDS: usize;
+
+    /// Build the initial frame for a fresh process: enter `_start` at `entry` on stack
+    /// `sp`, with `arg0` in the first-argument register (used to hand each process its id).
+    fn frame_init(entry: u64, sp: u64, arg0: u64) -> UserFrame;
+
+    /// The syscall number the user requested (from the frame's number register).
+    fn frame_num(f: &UserFrame) -> u64;
+    /// Syscall argument `i` (0..=4) from the frame's argument registers.
+    fn frame_arg(f: &UserFrame, i: usize) -> u64;
+    /// Set the syscall return value the user will observe on resume.
+    fn frame_set_ret(f: &mut UserFrame, v: u64);
+
+    /// Load `token` into the paging base register and resume the user state in `frame`
+    /// (`iretq` / `sret`). Never returns.
     ///
     /// # Safety
-    /// `space_token` must name a valid user space that shares the kernel mappings, and
-    /// `entry`/`user_sp` must be mapped user-accessible in it.
-    unsafe fn enter_user(space_token: u64, entry: u64, user_sp: u64) -> !;
+    /// `token` must name a valid user space that shares the kernel mappings; `frame` must
+    /// hold a coherent user register state whose `rip`/`sp` are mapped user-accessible in
+    /// that space. The `frame` pointer must stay valid (it lives in the process table).
+    unsafe fn resume(token: u64, frame: &UserFrame) -> !;
 
     /// Copy into the current user space at `uptr` (validated + arch-permitted).
     /// # Safety: caller ensures the user space is active.

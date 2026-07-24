@@ -15,17 +15,12 @@ pub extern "C" fn kmain(hartid: u64, dtb: u64) -> ! {
     kernel::run::<CurrentArch>(hartid, dtb, USER_ELF)
 }
 
-/// The `ecall`-from-U trap path (arch-riscv64) calls this symbol.
+/// The `ecall`-from-U trap path (arch-riscv64) calls this symbol with a pointer to the
+/// trap frame it assembled on the kernel stack. The scheduler-aware handler never returns.
 #[no_mangle]
-extern "C" fn rustproof_syscall_dispatch(
-    num: u64,
-    a0: u64,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-    a4: u64,
-) -> u64 {
-    kernel::handle_syscall::<CurrentArch>(num, a0, a1, a2, a3, a4)
+extern "C" fn rustproof_syscall_trap(frame: *mut u64) -> ! {
+    // SAFETY: `frame` is the on-kernel-stack trap frame the arch trap vector built.
+    unsafe { kernel::syscall_trap::<CurrentArch>(frame) }
 }
 
 #[panic_handler]

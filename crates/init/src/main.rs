@@ -203,6 +203,15 @@ fn exit(code: u64) -> ! {
     }
 }
 
+/// Cooperatively yield the CPU to the next ready process (no args, no result). Returns to
+/// this process — at the instruction after the syscall — once it is scheduled again.
+fn yield_() {
+    // SAFETY: YIELD touches no user memory and returns nothing meaningful.
+    unsafe {
+        syscall0(sysno::YIELD);
+    }
+}
+
 // ---------------------------------------------------------- static string output
 
 /// Write a string literal to the debug console. The bytes live in their own
@@ -360,26 +369,41 @@ fn dbg_dec(val: u64) {
 
 // ------------------------------------------------------------------- demo entry
 
-/// The ELF entry point. The kernel loader jumps here in ring 3 with a fresh stack.
-/// Runs the host-contract demo and never returns (it exits via the EXIT syscall).
+/// Print this process's id tag (`[proc N] `) so the interleaved scheduler output is
+/// legible. `id` is the value the kernel placed in the first-argument register at entry.
+fn tag(id: u64) {
+    dw!(b"[proc ");
+    dbg_dec(id);
+    dw!(b"] ");
+}
+
+/// The ELF entry point. The kernel loader jumps here in ring 3 with a fresh stack and this
+/// process's id in the first-argument register (`rdi`). Runs the host-contract demo,
+/// cooperatively `YIELD`ing between steps so the concurrently-scheduled sibling processes
+/// interleave, then exits with its id. Never returns (it exits via the EXIT syscall).
 ///
 /// Declared `extern "C"` / `#[no_mangle]` so the linker resolves `_start` (the
-/// `ENTRY` of `link.ld`).
+/// `ENTRY` of `link.ld`); the `id` parameter reads the SysV first-arg register.
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn _start(id: u64) -> ! {
+    tag(id);
     dw!(b"hello from ring 3\n");
+    yield_();
 
     // GET_INFO: report the device the kernel advertises.
     let info = get_info();
+    tag(id);
     dw!(b"gpu gfx_version=");
     dbg_hex(info.gfx_version as u64);
     dw!(b" vram_bytes=");
     dbg_dec(info.vram_bytes);
     dw!(b"\n");
+    yield_();
 
     // MAP_BAR: the kernel grants an Mmio cap at CapId(1); map BAR 0.
     match map_bar(CapId(1), 0) {
         Ok(r) => {
+            tag(id);
             dw!(b"map_bar user_va=");
             dbg_hex(r.user_va);
             dw!(b" size=");
@@ -387,15 +411,18 @@ pub extern "C" fn _start() -> ! {
             dw!(b"\n");
         }
         Err(e) => {
+            tag(id);
             dw!(b"map_bar err=");
             dbg_hex(e);
             dw!(b"\n");
         }
     }
+    yield_();
 
     // ALLOC_VRAM: the kernel grants an Untyped cap at CapId(2); request 4 KiB.
     match alloc_vram(CapId(2), 4096) {
         Ok(r) => {
+            tag(id);
             dw!(b"alloc_vram phys=");
             dbg_hex(r.phys);
             dw!(b" size=");
@@ -403,13 +430,14 @@ pub extern "C" fn _start() -> ! {
             dw!(b"\n");
         }
         Err(e) => {
+            tag(id);
             dw!(b"alloc_vram err=");
             dbg_hex(e);
             dw!(b"\n");
         }
     }
 
-    exit(0);
+    exit(id);
 }
 
 /// Any panic in ring 3 is fatal: report via the exit code and terminate.

@@ -1,8 +1,23 @@
 //! RISC-V (rv64) implementation of the `hal` traits.
 use abi::{FrameAllocator, MemoryKind, MemoryRegion, PhysAddr, VirtAddr};
-use arch_riscv64::{mmu, qemu, serial::Uart};
-use hal::{Arch, Perms, Space};
+use arch_riscv64::interrupts::{self, TrapFrame};
+use arch_riscv64::{csr, mmu, qemu, serial::Uart};
+use hal::{Arch, Perms, Space, UserFrame};
 use vspace_riscv::{PageFlags, PageTable, Pte};
+
+/// Reinterpret the opaque [`UserFrame`] as the RISC-V [`TrapFrame`] (its first 34 words).
+#[inline]
+fn frame(f: &UserFrame) -> &TrapFrame {
+    // SAFETY: UserFrame is `[u64; 40]`, align 16; TrapFrame is 34 `#[repr(C)]` words at
+    // offset 0. The extra words are unused on RISC-V.
+    unsafe { &*(f.0.as_ptr() as *const TrapFrame) }
+}
+
+#[inline]
+fn frame_mut(f: &mut UserFrame) -> &mut TrapFrame {
+    // SAFETY: see `frame`.
+    unsafe { &mut *(f.0.as_mut_ptr() as *mut TrapFrame) }
+}
 
 /// User address space: a `vspace-riscv` Sv39 page-table tree.
 pub struct RiscvSpace(vspace_riscv::AddressSpace);
@@ -121,8 +136,37 @@ impl Arch for Riscv {
             .map(|l| l.entry.as_u64())
     }
 
-    unsafe fn enter_user(space_token: u64, entry: u64, user_sp: u64) -> ! {
-        mmu::enter_user(space_token, entry, user_sp)
+    const FRAME_WORDS: usize = TrapFrame::WORDS;
+
+    fn frame_init(entry: u64, sp: u64, arg0: u64) -> UserFrame {
+        let mut uf = UserFrame::ZERO;
+        let tf = frame_mut(&mut uf);
+        tf.regs[2] = sp; // x2 = sp
+        tf.regs[10] = arg0; // a0 = process id (first arg)
+        tf.sepc = entry;
+        // SPP = 0 (sret -> U-mode), SPIE = 1 (interrupts on after sret), SUM = 1 (kernel
+        // may access user memory while servicing this process's syscalls).
+        tf.sstatus = csr::SSTATUS_SPIE | csr::SSTATUS_SUM;
+        uf
+    }
+
+    fn frame_num(f: &UserFrame) -> u64 {
+        frame(f).regs[17] // a7
+    }
+
+    fn frame_arg(f: &UserFrame, i: usize) -> u64 {
+        // a0..a4 = x10..x14.
+        frame(f).regs.get(10 + i).copied().unwrap_or(0)
+    }
+
+    fn frame_set_ret(f: &mut UserFrame, v: u64) {
+        frame_mut(f).regs[10] = v; // a0 = result
+    }
+
+    unsafe fn resume(token: u64, f: &UserFrame) -> ! {
+        // Switch to the process's address space, then restore its registers and `sret`.
+        mmu::enable_paging(token);
+        interrupts::resume(frame(f) as *const TrapFrame)
     }
 
     unsafe fn copy_to_user(uptr: u64, bytes: &[u8]) -> bool {

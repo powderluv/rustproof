@@ -2,13 +2,17 @@
 //! [`hal::Arch`] and instantiated per-ISA by the thin `nucleus` / `nucleus-riscv` bins.
 //!
 //! [`run`] is the whole kmain: console + traps, the portable core (frame allocator,
-//! capabilities, IPC, a cooperative context switch), then paging + the capability-gated
-//! ring-3/U-mode userland. The x86-64 and RISC-V specifics live entirely behind the
+//! capabilities, IPC, a cooperative context switch), then paging, and finally several
+//! isolated capability-gated user processes under a round-robin scheduler. Every entry
+//! from user mode saves a [`hal::UserFrame`] and re-enters via `Arch::resume`;
+//! [`syscall_trap`] services the call / `YIELD` / `EXIT` and picks the next process (see
+//! `docs/scheduling.md`). The x86-64 and RISC-V specifics live entirely behind the
 //! `hal::Arch` + `hal::Space` implementations in [`arch_x86`] / [`arch_riscv`].
 #![no_std]
 
 use core::fmt::Write as _;
-use hal::{Arch, Perms, Space};
+use core::marker::PhantomData;
+use hal::{Arch, Perms, Space, UserFrame};
 
 #[cfg(target_arch = "x86_64")]
 mod arch_x86;
@@ -22,13 +26,63 @@ mod arch_riscv;
 #[cfg(target_arch = "riscv64")]
 pub use arch_riscv::Riscv as CurrentArch;
 
-// ---- kernel state (single process, single CPU: plain statics) ----
+// ---- kernel state (single CPU: plain statics) ----
 static mut BITMAP: [u64; 12288] = [0; 12288]; // one bit per 4 KiB frame
 static mut FA: Option<mm::BitmapAllocator> = None;
-static mut PROC_CAPS: capabilities::CapSpace<64> = capabilities::CapSpace::new();
 static mut MAIN_CTX: sched::Context = sched::Context::new();
 static mut B_CTX: sched::Context = sched::Context::new();
 static mut B_STACK: [u8; 16 * 1024] = [0; 16 * 1024];
+
+/// Run-queue capacity (also the process-table size).
+const MAX_PROCS: usize = 4;
+/// How many independent copies of the user image to launch.
+const NUM_PROCS: usize = 3;
+
+/// One scheduled user process: its own address space (`token`), its last-saved user
+/// register state (`frame`), and its own capability space — the isolation boundary.
+struct Process {
+    /// Paging-base token (`cr3`/`satp`) of this process's address space.
+    token: u64,
+    /// Saved user register state, resumed by `Arch::resume`.
+    frame: UserFrame,
+    /// Per-process authority: what this process may invoke via the host contract.
+    caps: capabilities::CapSpace<16>,
+    /// False once the process has exited (slot reusable).
+    active: bool,
+}
+
+impl Process {
+    const EMPTY: Process = Process {
+        token: 0,
+        frame: UserFrame::ZERO,
+        caps: capabilities::CapSpace::new(),
+        active: false,
+    };
+}
+
+/// The process table + round-robin run queue + index of the running process. Kept in
+/// sync: `CURRENT == SCHED.current()` at every trap boundary.
+static mut PROCS: [Process; MAX_PROCS] = [Process::EMPTY; MAX_PROCS];
+static mut SCHED: sched::Scheduler<MAX_PROCS> = sched::Scheduler::new();
+static mut CURRENT: usize = 0;
+
+/// A `&'static mut` to process slot `i`, via a raw pointer (no direct `static mut` ref).
+///
+/// # Safety
+/// Single-CPU, non-reentrant: callers hold no other live borrow of `PROCS[i]`.
+#[inline]
+unsafe fn proc_at<'a>(i: usize) -> &'a mut Process {
+    &mut *(core::ptr::addr_of_mut!(PROCS) as *mut Process).add(i)
+}
+
+/// A `&'static mut` to the scheduler, via a raw pointer.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: callers hold no other live borrow of `SCHED`.
+#[inline]
+unsafe fn sched() -> &'static mut sched::Scheduler<MAX_PROCS> {
+    &mut *core::ptr::addr_of_mut!(SCHED)
+}
 
 /// Stubbed gfx1201 identity returned by the host contract's `GET_INFO`.
 const GPU_INFO: abi::GpuInfo = abi::GpuInfo {
@@ -193,48 +247,131 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &[u8]) -> ! {
     let ktoken = A::setup_paging(&mut fa);
     let _ = writeln!(con, "\n[paging] enabled; kernel token = {:#018x}", ktoken);
 
-    // ---------------- userland: capability-gated ring-3/U-mode ----------------
+    // ---------------- userland: N isolated capability-gated processes ----------------
     if user_elf.len() >= 64 {
-        let mut space = A::Space::create(&mut fa).expect("user address space");
-        unsafe { space.share_kernel(ktoken) };
-        let entry = A::load_user(user_elf, &mut space, &mut fa).expect("load user ELF");
-        for i in 1..=A::USER_STACK_PAGES {
-            let va = abi::VirtAddr(A::USER_STACK_TOP - i * abi::PAGE_SIZE);
-            let frame = fa.alloc_frame().expect("user stack frame");
-            space.map_page(va, frame, Perms::USER_RW, &mut fa);
+        let _ = writeln!(
+            con,
+            "\n[proc] loading {} isolated user processes",
+            NUM_PROCS
+        );
+        for i in 0..NUM_PROCS {
+            // Each process gets its own address space (kernel shared in) + own stack.
+            let mut space = A::Space::create(&mut fa).expect("user address space");
+            unsafe { space.share_kernel(ktoken) };
+            let entry = A::load_user(user_elf, &mut space, &mut fa).expect("load user ELF");
+            for p in 1..=A::USER_STACK_PAGES {
+                let va = abi::VirtAddr(A::USER_STACK_TOP - p * abi::PAGE_SIZE);
+                let frame = fa.alloc_frame().expect("user stack frame");
+                space.map_page(va, frame, Perms::USER_RW, &mut fa);
+            }
+            // Populate this process's slot: its own caps (Mmio@CapId(1), Untyped@CapId(2);
+            // slot 0 is a placeholder so the first grant lands at CapId(1)), token, and an
+            // initial frame that enters `_start` with its process id in the first-arg reg.
+            let slot = unsafe { proc_at(i) };
+            let _ = slot
+                .caps
+                .insert(abi::CapType::Endpoint, abi::CapRights::NONE, 0);
+            let _ = slot
+                .caps
+                .insert(abi::CapType::Mmio, abi::CapRights::ALL, 0xE000_0000);
+            let _ = slot
+                .caps
+                .insert(abi::CapType::Untyped, abi::CapRights::ALL, 0);
+            slot.token = space.token();
+            slot.frame = A::frame_init(entry, A::USER_STACK_TOP, i as u64);
+            slot.active = true;
+            unsafe { sched().add(abi::ThreadId(i)) };
+            let _ = writeln!(con, "  proc {} loaded (entry {:#x})", i, entry);
         }
-        // Grant caps: slot 0 placeholder, Mmio@CapId(1), Untyped@CapId(2).
-        unsafe {
-            let caps = &mut *core::ptr::addr_of_mut!(PROC_CAPS);
-            let _ = caps.insert(abi::CapType::Endpoint, abi::CapRights::NONE, 0);
-            let _ = caps.insert(abi::CapType::Mmio, abi::CapRights::ALL, 0xE000_0000);
-            let _ = caps.insert(abi::CapType::Untyped, abi::CapRights::ALL, 0);
-        }
-        let token = space.token();
         unsafe { FA = Some(fa) };
-        let _ = writeln!(con, "[user] entering user mode (entry {:#x})", entry);
-        unsafe { A::enter_user(token, entry, A::USER_STACK_TOP) };
+        let first = unsafe { sched().current() }.expect("a ready process").0;
+        unsafe { CURRENT = first };
+        let _ = writeln!(
+            con,
+            "[proc] starting scheduler at process {} (round-robin)\n",
+            first
+        );
+        // Hand off to the scheduler: this resumes process `first` in user mode, and the
+        // trap handler drives every switch thereafter. Never returns here.
+        let p = unsafe { proc_at(first) };
+        unsafe { A::resume(p.token, &p.frame) };
     }
 
     let _ = writeln!(con, "\nrustproof: BOOT OK (no user image)");
     A::exit(true)
 }
 
-/// The syscall/`ecall` handler body — called by the arch entry stub via the
-/// `rustproof_syscall_dispatch` symbol the thin bin exports. `EXIT` ends the run.
-pub fn handle_syscall<A: Arch>(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
-    if num == abi::sysno::EXIT {
-        let mut con = Console::<A>::new();
-        let _ = writeln!(con, "\n[kernel] user exited with code {}", a0);
-        let _ = writeln!(con, "rustproof: BOOT OK");
-        A::exit(true);
+/// The scheduler-aware trap handler — the arch entry stub calls this (via the
+/// `rustproof_syscall_trap` symbol the thin bin exports) with a pointer to the
+/// [`UserFrame`]-shaped register save the stub just built on the kernel stack. It persists
+/// the running process's state, services the syscall / `YIELD` / `EXIT`, picks the next
+/// ready process, and resumes it. Never returns (it re-enters user mode via `A::resume`,
+/// or halts the guest when the last process exits).
+///
+/// # Safety
+/// `frame` must point at `A::FRAME_WORDS` valid `u64`s (the on-stack trap frame).
+pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
+    let cur = CURRENT;
+    // Snapshot the running process's live user state into a local frame, so servicing the
+    // syscall never holds a `&mut` to the process table across `hostcontract::dispatch`
+    // (which re-borrows the same slot for the capability lookup).
+    let mut f = UserFrame::ZERO;
+    core::ptr::copy_nonoverlapping(frame, f.0.as_mut_ptr(), A::FRAME_WORDS);
+
+    match A::frame_num(&f) {
+        abi::sysno::YIELD => {
+            // Round-robin to the next ready process (the same one if it is alone).
+            CURRENT = sched().next().map(|t| t.0).unwrap_or(cur);
+        }
+        abi::sysno::EXIT => {
+            let code = A::frame_arg(&f, 0);
+            let mut con = Console::<A>::new();
+            let _ = writeln!(con, "[kernel] proc {} exited with code {}", cur, code);
+            proc_at(cur).active = false;
+            sched().remove(abi::ThreadId(cur));
+            match sched().current() {
+                None => {
+                    // The last process has exited: the run is done.
+                    let _ = writeln!(con, "\nrustproof: BOOT OK");
+                    A::exit(true);
+                }
+                Some(t) => CURRENT = t.0,
+            }
+        }
+        num => {
+            // A host-contract syscall: serviced under the current process's page tables
+            // (still active — we have not switched) with its own capability space. CURRENT
+            // is left unchanged, so the same process resumes with the result in `rax`/`a0`.
+            let a = [
+                A::frame_arg(&f, 0),
+                A::frame_arg(&f, 1),
+                A::frame_arg(&f, 2),
+                A::frame_arg(&f, 3),
+                A::frame_arg(&f, 4),
+            ];
+            let mut env = KEnv::<A> {
+                proc_idx: cur,
+                _p: PhantomData,
+            };
+            let ret = hostcontract::dispatch(&mut env, num, a[0], a[1], a[2], a[3], a[4]);
+            A::frame_set_ret(&mut f, ret);
+        }
     }
-    let mut env = KEnv::<A>(core::marker::PhantomData);
-    hostcontract::dispatch(&mut env, num, a0, a1, a2, a3, a4)
+
+    // Persist `cur`'s (possibly result-updated) frame, then resume whoever is now current.
+    proc_at(cur).frame = f;
+    let next = CURRENT;
+    let token = proc_at(next).token;
+    A::resume(token, &proc_at(next).frame)
 }
 
-/// The real `HostEnv`, backed by kernel state + the current `Arch`'s user-memory access.
-struct KEnv<A>(core::marker::PhantomData<A>);
+/// The real `HostEnv`, backed by the running process's capability space + kernel state and
+/// the current `Arch`'s user-memory access.
+struct KEnv<A> {
+    /// Index of the process on whose behalf the syscall is serviced.
+    proc_idx: usize,
+    _p: PhantomData<A>,
+}
 
 impl<A: Arch> abi::HostEnv for KEnv<A> {
     fn debug_write(&mut self, bytes: &[u8]) {
@@ -244,7 +381,8 @@ impl<A: Arch> abi::HostEnv for KEnv<A> {
         GPU_INFO
     }
     fn cap_lookup(&self, cap: abi::CapId) -> Option<(abi::CapType, abi::CapRights, u64)> {
-        let caps = unsafe { &*core::ptr::addr_of!(PROC_CAPS) };
+        // SAFETY: single-CPU; no other live borrow of this process slot during dispatch.
+        let caps = unsafe { &proc_at(self.proc_idx).caps };
         caps.lookup(cap).map(|s| (s.cap_type, s.rights, s.object))
     }
     fn alloc_dma(&mut self) -> Option<abi::PhysAddr> {

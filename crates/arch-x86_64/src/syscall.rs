@@ -1,16 +1,86 @@
-//! `syscall`/`sysret` fast system-call support + ring-3 entry.
+//! `syscall` fast system-call support + a full trap-frame save/resume path.
 //!
-//! The convention (fixed, shared with userland via `abi`): user sets `rax` = number,
-//! args `a0..a4` in `rdi, rsi, rdx, r10, r8`, executes `syscall`; the result comes back
-//! in `rax`. `rcx`/`r11` are clobbered by the instruction (they carry the user `rip`/
-//! `rflags`). The entry stub marshals those registers into the C-ABI call
-//! `rustproof_syscall_dispatch(num, a0, a1, a2, a3, a4)`, which the nucleus provides.
+//! The user convention (fixed, shared via `abi`): `rax` = number, args `a0..a4` in
+//! `rdi, rsi, rdx, r10, r8`, execute `syscall`; the result comes back in `rax`. The
+//! instruction clobbers `rcx`/`r11` (they carry the user `rip`/`rflags`).
+//!
+//! Unlike a plain register-marshalling stub, the entry here saves the **entire** user
+//! register state into a [`TrapFrame`] laid out so its tail is a hardware `iretq` frame,
+//! then calls `rustproof_syscall_trap(frame)` — which never returns: it services the call
+//! (or switches process) and re-enters user mode via [`resume`]. This is the same frame a
+//! timer interrupt will build, so preemption reuses this path (see `docs/scheduling.md`).
 use core::arch::{asm, naked_asm};
 
 const IA32_EFER: u32 = 0xC000_0080;
 const IA32_STAR: u32 = 0xC000_0081;
 const IA32_LSTAR: u32 = 0xC000_0082;
 const IA32_FMASK: u32 = 0xC000_0084;
+
+/// User segment selectors (GDT entries with RPL 3); see [`crate::gdt`].
+const USER_CS: u64 = 0x2B; // code64, RPL 3
+const USER_SS: u64 = 0x23; // data,   RPL 3
+
+/// The saved user register state on a trap. The 15 GPRs are followed by the 5-word
+/// hardware `iretq` frame (`rip, cs, rflags, rsp, ss`), so [`resume`] can pop the GPRs and
+/// `iretq` straight out of this struct. `#[repr(C)]` fixes the field order the entry stub's
+/// push sequence and [`resume`]'s pop sequence both depend on.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TrapFrame {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    // ---- hardware iretq frame ----
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+impl TrapFrame {
+    /// The number of `u64` words in a frame (must match `hal::Arch::FRAME_WORDS`).
+    pub const WORDS: usize = 20;
+
+    /// Build the initial frame for a fresh process: enter ring 3 at `entry` on stack `sp`,
+    /// with `arg0` in `rdi` (the SysV first-argument register) and `IF` set.
+    pub const fn new_user(entry: u64, sp: u64, arg0: u64) -> TrapFrame {
+        TrapFrame {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rbp: 0,
+            rdi: arg0,
+            rsi: 0,
+            rdx: 0,
+            rcx: 0,
+            rbx: 0,
+            rax: 0,
+            rip: entry,
+            cs: USER_CS,
+            rflags: 0x202, // IF set, reserved bit 1
+            rsp: sp,
+            ss: USER_SS,
+        }
+    }
+}
 
 #[inline]
 unsafe fn wrmsr(msr: u32, val: u64) {
@@ -27,16 +97,17 @@ unsafe fn rdmsr(msr: u32) -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
-// Provided by the nucleus: the actual capability-gated dispatch (uses kernel state).
+// Provided by the nucleus: the scheduler-aware trap handler. Receives the on-stack frame
+// and never returns — it resumes some process via `resume`.
 extern "C" {
-    fn rustproof_syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64;
+    fn rustproof_syscall_trap(frame: *mut TrapFrame) -> !;
 }
 
 #[repr(C, align(16))]
 struct KStack([u8; 16 * 1024]);
 
-// Where the entry stub parks the user rsp while it runs on the kernel stack. Single-CPU
-// only (a per-CPU slot would be needed for SMP).
+// Single-CPU kernel trap stack + a scratch slot for the user rsp while the stub builds the
+// frame. A per-CPU slot would be needed for SMP.
 static mut USER_RSP: u64 = 0;
 static mut SYSCALL_KSTACK: KStack = KStack([0; 16 * 1024]);
 
@@ -54,67 +125,75 @@ pub fn init() {
     }
 }
 
-/// `syscall` entry: switch to the kernel stack, marshal the user register args into the
-/// C-ABI dispatch call, then `sysretq` back to ring 3 with the result in `rax`.
+/// `syscall` entry: switch to the kernel trap stack, build a full [`TrapFrame`] (synthesize
+/// the hardware `iretq` tail from the instruction-clobbered `rcx`/`r11` + the stashed user
+/// `rsp`), then hand it to `rustproof_syscall_trap`, which never returns.
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry() {
-    // The syscall must be register-transparent (Linux convention): everything except the
-    // return value (rax) and the instruction-clobbered rcx/r11 is preserved for the user.
-    // Callee-saved regs (rbx/rbp/r12-r15) are preserved by the dispatch fn per the C ABI;
-    // we save the caller-saved regs the user relies on across the call.
     naked_asm!(
-        "mov [{user_rsp}], rsp",           // stash user rsp
-        "lea rsp, [{kstack} + {ksize}]",   // switch to the kernel syscall stack (16-aligned)
-        "push rcx",                        // user rip  (syscall put it in rcx)
-        "push r11",                        // user rflags
-        "push rdi",                        // save caller-saved user regs
-        "push rsi",
+        "mov [{user_rsp}], rsp",           // stash user rsp (needed for the iretq frame)
+        "lea rsp, [{kstack} + {ksize}]",   // switch to the kernel trap stack (16-aligned)
+        // Synthesize the hardware iretq frame (pushed high addr -> low): ss, rsp, rflags, cs, rip.
+        "push {user_ss}",
+        "push qword ptr [{user_rsp}]",     // user rsp
+        "push r11",                        // user rflags (syscall stashed it here)
+        "push {user_cs}",
+        "push rcx",                        // user rip (syscall stashed it here)
+        // Save the GPRs so the final rsp lands on `r15` (matching TrapFrame's low->high order).
+        "push rax",
+        "push rbx",
+        "push rcx",
         "push rdx",
-        "push r10",
+        "push rsi",
+        "push rdi",
+        "push rbp",
         "push r8",
-        "push r9",                         // 8 pushes -> rsp stays 16-aligned for the call
-        // user (rax=num, rdi,rsi,rdx,r10,r8) -> dispatch(rdi=num, rsi,rdx,rcx,r8,r9)
-        "mov r9, r8",
-        "mov r8, r10",
-        "mov rcx, rdx",
-        "mov rdx, rsi",
-        "mov rsi, rdi",
-        "mov rdi, rax",
-        "call {dispatch}",                 // rax = result (preserved through the pops below)
-        "pop r9",
-        "pop r8",
-        "pop r10",
-        "pop rdx",
-        "pop rsi",
-        "pop rdi",
-        "pop r11",                         // user rflags
-        "pop rcx",                         // user rip
-        "mov rsp, [{user_rsp}]",           // restore user rsp
-        "sysretq",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",                        // 20 pushes total -> rsp 16-aligned for the call
+        "mov rdi, rsp",                    // arg0 = &TrapFrame
+        "call {trap}",
+        "ud2",                             // rustproof_syscall_trap never returns
         user_rsp = sym USER_RSP,
         kstack = sym SYSCALL_KSTACK,
         ksize = const 16 * 1024,
-        dispatch = sym rustproof_syscall_dispatch,
+        user_ss = const USER_SS,
+        user_cs = const USER_CS,
+        trap = sym rustproof_syscall_trap,
     );
 }
 
-/// Drop to ring 3 at `entry` with stack `user_stack_top`, via `iretq`. Never returns
-/// (the process runs until it makes an `EXIT` syscall). CR3 must already point at the
-/// user address space (with the kernel shared in), and both `entry` and the stack must be
-/// mapped USER-accessible.
-pub unsafe fn enter_user(entry: u64, user_stack_top: u64) -> ! {
+/// Restore the user register state in `frame` and return to ring 3 via `iretq`. Never
+/// returns. `cr3` must already point at the target process's address space (the caller
+/// loads it); `frame` and the code here are in the kernel mappings shared into every space.
+///
+/// # Safety
+/// `frame` must point at a coherent [`TrapFrame`] whose `rip`/`rsp`/segments are valid for
+/// the currently-active address space.
+pub unsafe fn resume(frame: *const TrapFrame) -> ! {
     asm!(
-        "push {ss}",       // user SS  (0x20 | RPL3)
-        "push {rsp}",      // user RSP
-        "push {rflags}",   // RFLAGS with IF set
-        "push {cs}",       // user CS  (0x28 | RPL3)
-        "push {rip}",      // user RIP
+        "mov rsp, {f}",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
         "iretq",
-        ss = in(reg) 0x23u64,
-        rsp = in(reg) user_stack_top,
-        rflags = in(reg) 0x202u64,
-        cs = in(reg) 0x2Bu64,
-        rip = in(reg) entry,
+        f = in(reg) frame,
         options(noreturn),
     );
 }

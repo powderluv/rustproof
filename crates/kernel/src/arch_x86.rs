@@ -1,7 +1,22 @@
 //! x86-64 implementation of the `hal` traits.
 use abi::{FrameAllocator, MemoryRegion, PhysAddr, VirtAddr};
+use arch_x86_64::syscall::TrapFrame;
 use arch_x86_64::{cpu, qemu, serial::Serial, syscall};
-use hal::{Arch, Perms, Space};
+use hal::{Arch, Perms, Space, UserFrame};
+
+/// Reinterpret the opaque [`UserFrame`] as the x86 [`TrapFrame`] (its first 20 words).
+#[inline]
+fn frame(f: &UserFrame) -> &TrapFrame {
+    // SAFETY: UserFrame is `[u64; 40]`, align 16; TrapFrame is 20 `#[repr(C)]` words at
+    // offset 0. The extra words are unused on x86.
+    unsafe { &*(f.0.as_ptr() as *const TrapFrame) }
+}
+
+#[inline]
+fn frame_mut(f: &mut UserFrame) -> &mut TrapFrame {
+    // SAFETY: see `frame`.
+    unsafe { &mut *(f.0.as_mut_ptr() as *mut TrapFrame) }
+}
 
 /// User address space: a `vspace` 4-level page-table tree.
 pub struct X86Space(vspace::AddressSpace);
@@ -103,9 +118,37 @@ impl Arch for X86 {
             .map(|l| l.entry.as_u64())
     }
 
-    unsafe fn enter_user(space_token: u64, entry: u64, user_sp: u64) -> ! {
-        cpu::write_cr3(space_token);
-        syscall::enter_user(entry, user_sp)
+    const FRAME_WORDS: usize = TrapFrame::WORDS;
+
+    fn frame_init(entry: u64, sp: u64, arg0: u64) -> UserFrame {
+        let mut uf = UserFrame::ZERO;
+        *frame_mut(&mut uf) = TrapFrame::new_user(entry, sp, arg0);
+        uf
+    }
+
+    fn frame_num(f: &UserFrame) -> u64 {
+        frame(f).rax
+    }
+
+    fn frame_arg(f: &UserFrame, i: usize) -> u64 {
+        let tf = frame(f);
+        match i {
+            0 => tf.rdi,
+            1 => tf.rsi,
+            2 => tf.rdx,
+            3 => tf.r10,
+            4 => tf.r8,
+            _ => 0,
+        }
+    }
+
+    fn frame_set_ret(f: &mut UserFrame, v: u64) {
+        frame_mut(f).rax = v;
+    }
+
+    unsafe fn resume(token: u64, f: &UserFrame) -> ! {
+        cpu::write_cr3(token);
+        syscall::resume(frame(f) as *const TrapFrame)
     }
 
     unsafe fn copy_to_user(uptr: u64, bytes: &[u8]) -> bool {

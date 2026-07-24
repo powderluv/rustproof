@@ -43,14 +43,16 @@ thin: they call their arch crate and then run the identical portable-core demo/l
 
 **Now realized (RV-M3): a small `Arch` HAL.** With both arches proven, the shared surface
 is factored into the [`hal`](../crates/hal) crate — pure traits `Arch` + `Space` + `Perms`
-over `abi` (console, traps, memory map, `setup_paging`, `load_user`, `enter_user`,
-user-memory copy, `Space::{create, map_page, translate, token, share_kernel}`). The whole
-kmain now lives once in the [`kernel`](../crates/kernel) crate as `run::<A: Arch>` +
-`handle_syscall::<A>`, with the x86-64 and RISC-V specifics behind `arch_x86::X86` /
-`arch_riscv::Riscv` (newtype `Space` wrappers keep the orphan rule happy). The two
-`nucleus*` bins are now thin shims: boot glue + `kernel::run::<CurrentArch>` + a
-`rustproof_syscall_dispatch` symbol. Both boot the identical portable flow end-to-end
-(context switch, paging, ring-3/U-mode userland, host contract) to `rustproof: BOOT OK`.
+over `abi` (console, traps, memory map, `setup_paging`, `load_user`, the trap-frame
+`frame_*`/`resume` surface, user-memory copy,
+`Space::{create, map_page, translate, token, share_kernel}`). The whole kmain now lives
+once in the [`kernel`](../crates/kernel) crate as `run::<A: Arch>` + `syscall_trap::<A>`,
+with the x86-64 and RISC-V specifics behind `arch_x86::X86` / `arch_riscv::Riscv` (newtype
+`Space` wrappers keep the orphan rule happy). The two `nucleus*` bins are now thin shims:
+boot glue + `kernel::run::<CurrentArch>` + a `rustproof_syscall_trap` symbol. Both boot the
+identical portable flow end-to-end (context switch, paging, ring-3/U-mode userland, host
+contract) to `rustproof: BOOT OK` — and now run several isolated processes under a
+round-robin scheduler (see [`scheduling.md`](scheduling.md)).
 
 ## 3. RISC-V boot & runtime specifics
 

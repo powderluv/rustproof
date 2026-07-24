@@ -192,6 +192,8 @@ pub mod sysno {
     pub const MAP_BAR: u64 = 3;
     /// Host contract: `a0` = Untyped capability id, `a1` = byte size, `a2` = `*mut AllocResp`.
     pub const ALLOC_VRAM: u64 = 4;
+    /// Cooperatively yield the CPU to the next ready process. No args, no result.
+    pub const YIELD: u64 = 5;
 }
 
 /// Syscall result codes returned in `rax`. `OK` is 0; errors are large sentinels so
