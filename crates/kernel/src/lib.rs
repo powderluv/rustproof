@@ -280,6 +280,16 @@ unsafe fn load_process<A: Arch>(
             let _ = s
                 .caps
                 .insert(abi::CapType::Endpoint, abi::CapRights::READ, 1);
+            // CapId(4)/CapId(5): deliberately under-powered caps of the RIGHT type, so the
+            // rights half of every gate is exercised on hardware rather than vacuously true:
+            // an Untyped without WRITE cannot allocate or spawn, and an Mmio without READ
+            // cannot map a BAR.
+            let _ = s
+                .caps
+                .insert(abi::CapType::Untyped, abi::CapRights::READ, 0);
+            let _ = s
+                .caps
+                .insert(abi::CapType::Mmio, abi::CapRights::WRITE, 0xE000_0000);
             s.token = token;
             s.frame = A::frame_init(entry, A::USER_STACK_TOP, id_arg);
             s.frames = frames;
@@ -618,10 +628,11 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             // Creating a process is authority: require the caller to present an Untyped
             // capability (`a0` = cap id), like ALLOC_VRAM. This bounds who can spawn.
             let cap = abi::CapId(A::frame_arg(&f, 0) as usize);
-            let authorized = proc_at(cur)
-                .caps
-                .lookup(cap)
-                .is_some_and(|s| s.cap_type == abi::CapType::Untyped);
+            // Type AND rights, per `docs/host-contract.md`: "rights ⊇ need" on every op.
+            // A spawn consumes memory out of the untyped region — a mutation — so `WRITE`.
+            let authorized = proc_at(cur).caps.lookup(cap).is_some_and(|s| {
+                s.cap_type == abi::CapType::Untyped && s.rights.contains(abi::CapRights::WRITE)
+            });
             // Load the embedded image into a fresh process (the child's id = its slot),
             // add it to the run queue, and return its id (or u64::MAX on failure). The
             // spawner keeps running (CURRENT unchanged).

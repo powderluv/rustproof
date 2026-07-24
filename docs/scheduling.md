@@ -52,12 +52,21 @@ concrete lets the process table be a plain non-generic static.
   *who it can talk to*, since IPC endpoints are capabilities (see `ipc-caps`
   below) rather than integers any process could name.
 
-Honest scope on IPC authority: the *mechanism* is enforced (cap type + rights
-checked on every `SEND`/`RECV`, rendezvous keyed on the cap's object), but the
-*policy* is still uniform — `load_process` grants every process the same starting
-caps, so today they all hold the shared endpoint. Per-role grants (and passing
-endpoint caps to a child at `SPAWN`) are the natural next step; the enforcement
-point they need already exists.
+Every authority-granting op now checks BOTH halves of the capability — the object
+type and `rights ⊇ need`, as `host-contract.md` specifies: `SEND` needs `WRITE`
+and `RECV` needs `READ` on an `Endpoint`; `MAP_BAR` needs `READ` on an `Mmio`
+(mapping exposes the device's registers); `ALLOC_VRAM` and `SPAWN` need `WRITE`
+on an `Untyped` (both carve memory out of it). `FREE_VRAM` needs no capability —
+releasing your own frame grants no authority — and is ownership-checked instead.
+So that the rights half is never vacuously true, `load_process` also mints two
+deliberately under-powered caps (a `WRITE`-less `Untyped`, a `READ`-less `Mmio`)
+that the demo uses to prove each refusal on real hardware.
+
+Honest scope on IPC authority: the *mechanism* is enforced, but the *policy* is
+still uniform — `load_process` grants every process the same starting caps, so
+today they all hold the shared endpoint. Per-role grants (and passing endpoint
+caps to a child at `SPAWN`) are the natural next step; the enforcement point they
+need already exists.
 
 Load-bearing detail: an x86 interrupt/exception gate clears `IF`/`TF` but **not**
 `DF`, and `std` is unprivileged — so a ring-3 process can enter the kernel with

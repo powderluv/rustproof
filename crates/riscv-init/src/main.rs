@@ -281,11 +281,11 @@ fn recv(cap: u64) -> (u64, u64) {
     (status, word)
 }
 
-/// Spawn a new process running this same image. `a0` presents our Untyped capability
-/// (`CapId(2)`) as spawn authority. Returns the new id, or `u64::MAX` on failure.
-fn spawn() -> u64 {
+/// Spawn a new process running this same image, presenting `cap` as spawn authority (an
+/// Untyped capability carrying `WRITE`). Returns the new id, or `u64::MAX` on failure.
+fn spawn(cap: u64) -> u64 {
     // SAFETY: SPAWN takes a cap id and returns a pid; no user memory is touched.
-    unsafe { syscall(sysno::SPAWN, 2, 0, 0, 0, 0) }
+    unsafe { syscall(sysno::SPAWN, cap, 0, 0, 0, 0) }
 }
 
 /// Allocate one VRAM frame via the Untyped cap; returns its physical address, or 0 on
@@ -381,7 +381,7 @@ fn compute(id: u64) -> ! {
     // Proc 2 dynamically spawns one child process (which runs this same compute path); the
     // child's `[proc N]` ticks then appear in the schedule, proving runtime process creation.
     if id == 2 {
-        let child = spawn();
+        let child = spawn(2);
         tag(id);
         debug_write(b"spawned child pid=");
         dbg_dec(child);
@@ -441,6 +441,28 @@ fn compute(id: u64) -> ! {
         debug_write(b"ipc: recv on unheld cap -> NO_CAP (no block)\n");
     } else {
         debug_write(b"ipc: recv on unheld cap ALLOWED (bug)\n");
+    }
+
+    // Rights are checked on the REST of the host contract too, not just IPC: CapId(4) is an
+    // Untyped cap without WRITE and CapId(5) an Mmio cap without READ — right type, wrong
+    // rights, so every one of these must be refused.
+    tag(id);
+    if alloc_vram(CapId(4), 4096).is_err() {
+        debug_write(b"caps: alloc_vram via WRITE-less Untyped -> NO_CAP\n");
+    } else {
+        debug_write(b"caps: alloc_vram via WRITE-less Untyped ALLOWED (bug)\n");
+    }
+    tag(id);
+    if spawn(4) == u64::MAX {
+        debug_write(b"caps: spawn via WRITE-less Untyped -> refused\n");
+    } else {
+        debug_write(b"caps: spawn via WRITE-less Untyped ALLOWED (bug)\n");
+    }
+    tag(id);
+    if map_bar(CapId(5), 0).is_err() {
+        debug_write(b"caps: map_bar via READ-less Mmio -> NO_CAP\n");
+    } else {
+        debug_write(b"caps: map_bar via READ-less Mmio ALLOWED (bug)\n");
     }
 
     // VRAM quota + FREE_VRAM: allocate until the per-process quota is hit (the kernel

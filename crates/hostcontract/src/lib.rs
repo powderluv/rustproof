@@ -17,7 +17,8 @@
 //! VERIFIED* (the cap check is verified; the actual MMIO mapping is a TRUSTED-STUB here).
 
 use abi::{
-    syserr, sysno, AllocResp, CapId, CapType, GpuInfo, HostEnv, MapBarResp, PhysAddr, PAGE_SIZE,
+    syserr, sysno, AllocResp, CapId, CapRights, CapType, GpuInfo, HostEnv, MapBarResp, PhysAddr,
+    PAGE_SIZE,
 };
 
 /// Bytes copied out of user memory per `read_user_bytes` call in `DEBUG_WRITE`.
@@ -117,8 +118,10 @@ fn sys_get_info(env: &mut dyn HostEnv, uptr: u64) -> u64 {
 fn sys_map_bar(env: &mut dyn HostEnv, cap_id: u64, resp_ptr: u64) -> u64 {
     let cap = CapId(cap_id as usize);
     let base = match env.cap_lookup(cap) {
-        Some((CapType::Mmio, _rights, base)) => base,
-        // Missing cap or wrong object type: no authority to map a BAR.
+        // Type AND rights, per `docs/host-contract.md`: "rights ⊇ need" on every op.
+        // Mapping a BAR at minimum exposes the device's registers, so it needs `READ`.
+        Some((CapType::Mmio, rights, base)) if rights.contains(CapRights::READ) => base,
+        // Missing cap, wrong object type, or insufficient rights: no authority.
         _ => return syserr::NO_CAP,
     };
     // TRUSTED-STUB: placeholder mapping — real code installs a PTE for the device BAR.
@@ -143,8 +146,10 @@ fn sys_map_bar(env: &mut dyn HostEnv, cap_id: u64, resp_ptr: u64) -> u64 {
 fn sys_alloc_vram(env: &mut dyn HostEnv, cap_id: u64, resp_ptr: u64) -> u64 {
     let cap = CapId(cap_id as usize);
     match env.cap_lookup(cap) {
-        Some((CapType::Untyped, _rights, _obj)) => {}
-        // Missing cap or wrong object type: no authority to allocate VRAM.
+        // Type AND rights, per `docs/host-contract.md`: "rights ⊇ need" on every op.
+        // Allocating carves memory out of the untyped region — a mutation — so `WRITE`.
+        Some((CapType::Untyped, rights, _obj)) if rights.contains(CapRights::WRITE) => {}
+        // Missing cap, wrong object type, or insufficient rights: no authority.
         _ => return syserr::NO_CAP,
     }
     let frame: PhysAddr = match env.alloc_dma() {
@@ -476,6 +481,32 @@ mod tests {
         env.frames_left = 4;
         let ptr = env.va(0);
         let r = dispatch(&mut env, sysno::ALLOC_VRAM, cap.0 as u64, 0, ptr, 0, 0);
+        assert_eq!(r, syserr::NO_CAP);
+    }
+
+    #[test]
+    fn alloc_vram_without_write_right_is_no_cap() {
+        // Right object type, insufficient rights: allocating mutates the untyped region.
+        let mut env = MockEnv::new(4096);
+        let cap = CapId(2);
+        env.caps.push((cap, (CapType::Untyped, CapRights::READ, 0)));
+        env.frames_left = 4;
+        let ptr = env.va(0);
+        let r = dispatch(&mut env, sysno::ALLOC_VRAM, cap.0 as u64, 0, ptr, 0, 0);
+        assert_eq!(r, syserr::NO_CAP);
+        // And nothing was allocated behind the refusal.
+        assert_eq!(env.frames_left, 4);
+    }
+
+    #[test]
+    fn map_bar_without_read_right_is_no_cap() {
+        // Right object type, insufficient rights: mapping a BAR exposes device registers.
+        let mut env = MockEnv::new(4096);
+        let cap = CapId(1);
+        env.caps
+            .push((cap, (CapType::Mmio, CapRights::WRITE, 0xE000_0000)));
+        let ptr = env.va(0);
+        let r = dispatch(&mut env, sysno::MAP_BAR, cap.0 as u64, 0, ptr, 0, 0);
         assert_eq!(r, syserr::NO_CAP);
     }
 
