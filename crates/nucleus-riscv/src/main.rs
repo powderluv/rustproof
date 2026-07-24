@@ -23,6 +23,14 @@ extern "C" fn rustproof_syscall_trap(frame: *mut u64) -> ! {
     unsafe { kernel::syscall_trap::<CurrentArch>(frame) }
 }
 
+/// The supervisor-timer trap path (arch-riscv64) calls this symbol with the same frame
+/// layout. The scheduler preempts the running process and never returns.
+#[no_mangle]
+extern "C" fn rustproof_timer_trap(frame: *mut u64) -> ! {
+    // SAFETY: `frame` is the on-kernel-stack timer trap frame the arch trap vector built.
+    unsafe { kernel::preempt_trap::<CurrentArch>(frame) }
+}
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     arch_riscv64::kprintln!("nucleus-riscv PANIC: {}", info);

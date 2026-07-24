@@ -96,10 +96,16 @@ core::arch::global_asm!(
 
 extern "C" {
     fn __trap_vector();
-    /// The nucleus's scheduler-aware trap handler. Receives the on-stack frame and never
+    /// The nucleus's scheduler-aware syscall handler. Receives the on-stack frame and never
     /// returns — it resumes some process via [`resume`].
     fn rustproof_syscall_trap(frame: *mut u64) -> !;
+    /// The nucleus's timer-preemption handler. Receives the on-stack frame and never
+    /// returns — it re-arms the timer (via `Arch::end_of_interrupt`) and resumes a process.
+    fn rustproof_timer_trap(frame: *mut u64) -> !;
 }
+
+/// `scause` code for a supervisor timer interrupt (with the interrupt bit set).
+const INTR_S_TIMER: u64 = 5;
 
 fn exception_name(code: u64) -> &'static str {
     match code {
@@ -136,6 +142,14 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame) -> ! {
         f.sepc = f.sepc.wrapping_add(4);
         // SAFETY: `frame` is the on-stack trap frame; the handler never returns.
         unsafe { rustproof_syscall_trap(frame as *mut u64) }
+    }
+
+    // Supervisor timer interrupt: preempt the running process. `sepc` is the interrupted
+    // PC (NOT advanced — the instruction re-executes on resume); the generic handler
+    // re-arms the timer via `Arch::end_of_interrupt` and resumes a process.
+    if is_interrupt && code == INTR_S_TIMER {
+        // SAFETY: `frame` is the on-stack trap frame; the handler never returns.
+        unsafe { rustproof_timer_trap(frame as *mut u64) }
     }
 
     fatal_dump(f, scause, is_interrupt, code);

@@ -162,12 +162,13 @@ fn exit(code: u64) -> ! {
     }
 }
 
-/// Cooperatively yield the CPU to the next ready process (no args, no result). Returns to
-/// this process once it is scheduled again, at the instruction after the `ecall`.
-fn yield_() {
-    // SAFETY: YIELD touches no user memory and returns nothing meaningful.
-    unsafe {
-        syscall(sysno::YIELD, 0, 0, 0, 0, 0);
+/// Busy-compute for ~`iters` iterations without making any syscall, so only the supervisor
+/// timer interrupt can interleave this process with its siblings. `core::hint::black_box`
+/// keeps the loop from being optimized away.
+fn spin(iters: u64) {
+    let mut i = 0u64;
+    while core::hint::black_box(i) < iters {
+        i = i.wrapping_add(1);
     }
 }
 
@@ -249,36 +250,44 @@ fn tag(id: u64) {
 }
 
 /// The ELF entry point. The kernel loader jumps here in U-mode with a fresh stack and this
-/// process's id in the first-argument register (`a0`). Runs the host-contract demo,
-/// cooperatively `YIELD`ing between steps so concurrently-scheduled sibling processes
-/// interleave, then exits with its id. Never returns (it exits via the EXIT syscall).
+/// process's id in the first-argument register (`a0`). It runs a compute loop with **no**
+/// syscalls between prints, so the only thing that can interleave it with its siblings is
+/// the supervisor timer preempting it — if the interleaved `[proc N] tick K` lines appear,
+/// preemptive scheduling works on RISC-V. It then exercises the per-process host contract
+/// and exits with its id. Never returns (it exits via the EXIT syscall).
 ///
 /// Declared `extern "C"` / `#[no_mangle]` so the linker resolves `_start` (the
 /// `ENTRY` of `link.ld`); the `id` parameter reads the first-arg register.
 #[no_mangle]
 pub extern "C" fn _start(id: u64) -> ! {
     tag(id);
-    debug_write(b"hello from ring 3 (riscv)\n");
-    yield_();
+    debug_write(b"start (compute loop, no yields -- preemption only)\n");
 
-    // GET_INFO: report the device the kernel advertises.
+    // Pure compute: NO syscall between ticks. Without preemption, process `id` would run
+    // this whole loop and exit before any sibling got the CPU; the interleaved output is
+    // the timer preempting mid-`spin`. Each process's register/PC state is saved and
+    // restored exactly across every preemption (that is what makes the loop resume).
+    let mut tick = 0u64;
+    while tick < 5 {
+        tag(id);
+        debug_write(b"tick ");
+        dbg_dec(tick);
+        debug_write(b"\n");
+        spin(5_000_000);
+        tick = tick.wrapping_add(1);
+    }
+
+    // Per-process capabilities still gate the host contract under preemption.
     let info = get_info();
     tag(id);
     debug_write(b"gpu gfx_version=");
     dbg_hex(info.gfx_version as u64);
-    debug_write(b" vram_bytes=");
-    dbg_dec(info.vram_bytes);
     debug_write(b"\n");
-    yield_();
-
-    // MAP_BAR: the kernel grants an Mmio cap at CapId(1); map BAR 0.
     match map_bar(CapId(1), 0) {
         Ok(r) => {
             tag(id);
             debug_write(b"map_bar user_va=");
             dbg_hex(r.user_va);
-            debug_write(b" size=");
-            dbg_hex(r.size);
             debug_write(b"\n");
         }
         Err(e) => {
@@ -288,16 +297,11 @@ pub extern "C" fn _start(id: u64) -> ! {
             debug_write(b"\n");
         }
     }
-    yield_();
-
-    // ALLOC_VRAM: the kernel grants an Untyped cap at CapId(2); request 4 KiB.
     match alloc_vram(CapId(2), 4096) {
         Ok(r) => {
             tag(id);
             debug_write(b"alloc_vram phys=");
             dbg_hex(r.phys);
-            debug_write(b" size=");
-            dbg_hex(r.size);
             debug_write(b"\n");
         }
         Err(e) => {

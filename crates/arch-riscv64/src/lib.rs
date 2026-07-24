@@ -13,6 +13,7 @@ pub mod interrupts;
 pub mod mmu;
 pub mod qemu;
 pub mod serial;
+pub mod timer;
 
 /// Write formatted text to the NS16550A UART. The console is a fixed, stateless sink (ZST).
 #[macro_export]

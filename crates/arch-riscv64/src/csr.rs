@@ -19,6 +19,17 @@ pub const SCAUSE: u32 = 0x142;
 pub const STVAL: u32 = 0x143;
 /// `satp` — supervisor address translation & protection (MODE | ASID | root PPN).
 pub const SATP: u32 = 0x180;
+/// `sie` — supervisor interrupt-enable (per-source; STIE bit 5 = timer).
+pub const SIE: u32 = 0x104;
+/// `time` — the machine timebase counter, readable from S/U mode (QEMU virt: 10 MHz).
+pub const TIME: u32 = 0xC01;
+/// `stimecmp` — supervisor timer compare (Sstc): a timer interrupt is pending while
+/// `time >= stimecmp`. Writing it forward both clears the pending interrupt and schedules
+/// the next one, so it is the S-mode timer's arm + ack in one.
+pub const STIMECMP: u32 = 0x14D;
+
+/// `sie.STIE` (bit 5): enable the supervisor timer interrupt source.
+pub const SIE_STIE: u64 = 1 << 5;
 
 /// `sstatus.SPP` (bit 8): previous privilege — 0 returns to U-mode on `sret`.
 pub const SSTATUS_SPP: u64 = 1 << 8;

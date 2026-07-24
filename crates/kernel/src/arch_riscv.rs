@@ -1,7 +1,7 @@
 //! RISC-V (rv64) implementation of the `hal` traits.
 use abi::{FrameAllocator, MemoryKind, MemoryRegion, PhysAddr, VirtAddr};
 use arch_riscv64::interrupts::{self, TrapFrame};
-use arch_riscv64::{csr, mmu, qemu, serial::Uart};
+use arch_riscv64::{csr, mmu, qemu, serial::Uart, timer};
 use hal::{Arch, Perms, Space, UserFrame};
 use vspace_riscv::{PageFlags, PageTable, Pte};
 
@@ -164,10 +164,16 @@ impl Arch for Riscv {
     }
 
     fn start_preemption() {
-        // RISC-V has no timer wired yet; scheduling stays cooperative (YIELD-driven).
+        // Enable the Sstc supervisor timer + arm the first tick. Ticks fire in U-mode
+        // (an S-interrupt is delivered there regardless of sstatus.SIE); the kernel runs
+        // with SIE clear, so the handler stays non-reentrant.
+        unsafe { timer::init() }
     }
 
-    fn end_of_interrupt() {}
+    fn end_of_interrupt() {
+        // Ack + schedule the next tick (writing stimecmp forward clears the pending one).
+        unsafe { timer::rearm() }
+    }
 
     unsafe fn resume(token: u64, f: &UserFrame) -> ! {
         // Switch to the process's address space, then restore its registers and `sret`.
