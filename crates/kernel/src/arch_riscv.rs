@@ -163,6 +163,12 @@ impl Arch for Riscv {
         frame_mut(f).regs[10] = v; // a0 = result
     }
 
+    fn frame_set_ret2(f: &mut UserFrame, v: u64) {
+        // a1 — part of the trap frame and restored by `resume`, so the user sees it on
+        // return (their stub declares it as an output).
+        frame_mut(f).regs[11] = v;
+    }
+
     fn start_preemption() {
         // Enable the Sstc supervisor timer + arm the first tick. Ticks fire in U-mode
         // (an S-interrupt is delivered there regardless of sstatus.SIE); the kernel runs

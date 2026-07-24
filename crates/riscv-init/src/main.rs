@@ -249,16 +249,36 @@ fn tag(id: u64) {
     debug_write(b"] ");
 }
 
-/// Send one `word` to endpoint `ep` (blocks until a receiver takes it). Returns `syserr::OK`.
-fn send(ep: u64, word: u64) -> u64 {
+/// Send one `word` on the endpoint named by capability `cap` (needs `WRITE`; blocks until a
+/// receiver takes it). Returns `syserr::OK`, or `NO_CAP` if we lack the authority.
+fn send(cap: u64, word: u64) -> u64 {
     // SAFETY: SEND passes two scalars and returns a status; no user memory is touched.
-    unsafe { syscall(sysno::SEND, ep, word, 0, 0, 0) }
+    unsafe { syscall(sysno::SEND, cap, word, 0, 0, 0) }
 }
 
-/// Receive one word from endpoint `ep` (blocks until a sender delivers). Returns the word.
-fn recv(ep: u64) -> u64 {
-    // SAFETY: RECV passes the endpoint and returns the delivered word; no memory is touched.
-    unsafe { syscall(sysno::RECV, ep, 0, 0, 0, 0) }
+/// Receive one word on the endpoint named by capability `cap` (needs `READ`; blocks until a
+/// sender delivers). Returns `(status, word)`: the status is `syserr::OK` or `NO_CAP`, and
+/// the word is meaningful only when the status is `OK`.
+///
+/// This needs its own stub rather than [`syscall`]: the kernel returns the payload in a
+/// SECOND register (`a1`), which the compiler must be told the `ecall` clobbers — and the
+/// two-register split is what keeps a delivered word that happens to equal a [`syserr`]
+/// sentinel distinguishable from a real error.
+fn recv(cap: u64) -> (u64, u64) {
+    let status: u64;
+    let word: u64;
+    // SAFETY: as the other stub — `ecall` traps to S-mode and touches no user memory here.
+    // `a1` is declared as an output because the kernel writes the payload there.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") sysno::RECV,
+            inlateout("a0") cap => status,
+            lateout("a1") word,
+            options(nostack),
+        );
+    }
+    (status, word)
 }
 
 /// Spawn a new process running this same image. `a0` presents our Untyped capability
@@ -306,7 +326,7 @@ fn producer() -> ! {
     tag(0);
     debug_write(b"producer: sending 5 values on ep 0\n");
     let mut i = 0u64;
-    while i < 5 {
+    while i < 4 {
         let v = 100u64.wrapping_add(i);
         send(0, v);
         tag(0);
@@ -315,21 +335,41 @@ fn producer() -> ! {
         debug_write(b"\n");
         i = i.wrapping_add(1);
     }
+    // Fifth value: the NO_CAP error sentinel sent as ORDINARY DATA. The word domain is the
+    // whole u64, so this is a legal payload; the consumer must still see a successful
+    // receive. (Regression test: status and payload ride in separate registers.)
+    send(0, syserr::NO_CAP);
+    tag(0);
+    debug_write(b"sent NO_CAP-valued word as data\n");
     exit(0);
 }
 
-/// IPC consumer: receive five values on endpoint 0, blocking until each arrives.
+/// IPC consumer: receive five values on endpoint 0, blocking until each arrives. The fifth
+/// is bit-identical to the `NO_CAP` sentinel and must still report as a successful receive.
 fn consumer() -> ! {
     tag(1);
     debug_write(b"consumer: receiving 5 values on ep 0\n");
     let mut i = 0u64;
-    while i < 5 {
-        let v = recv(0);
+    while i < 4 {
+        let (status, v) = recv(0);
         tag(1);
-        debug_write(b"recv ");
-        dbg_dec(v);
-        debug_write(b"\n");
+        if status == syserr::OK {
+            debug_write(b"recv ");
+            dbg_dec(v);
+            debug_write(b"\n");
+        } else {
+            debug_write(b"recv FAILED status=");
+            dbg_hex(status);
+            debug_write(b"\n");
+        }
         i = i.wrapping_add(1);
+    }
+    let (status, v) = recv(0);
+    tag(1);
+    if status == syserr::OK && v == syserr::NO_CAP {
+        debug_write(b"recv NO_CAP-valued word as DATA (status separate from payload)\n");
+    } else {
+        debug_write(b"recv sentinel word MISREAD as error (bug)\n");
     }
     exit(1);
 }
@@ -393,6 +433,14 @@ fn compute(id: u64) -> ! {
         debug_write(b"ipc: send on unheld cap -> NO_CAP (authority enforced)\n");
     } else {
         debug_write(b"ipc: send on unheld cap ALLOWED (bug)\n");
+    }
+    // RECV refusal must also be unambiguous — and must not block us.
+    tag(id);
+    let (status, _) = recv(9);
+    if status == syserr::NO_CAP {
+        debug_write(b"ipc: recv on unheld cap -> NO_CAP (no block)\n");
+    } else {
+        debug_write(b"ipc: recv on unheld cap ALLOWED (bug)\n");
     }
 
     // VRAM quota + FREE_VRAM: allocate until the per-process quota is hit (the kernel

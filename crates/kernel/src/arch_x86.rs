@@ -146,6 +146,12 @@ impl Arch for X86 {
         frame_mut(f).rax = v;
     }
 
+    fn frame_set_ret2(f: &mut UserFrame, v: u64) {
+        // `rdx` — a caller-saved arg register, part of the trap frame and restored by
+        // `resume`, so the user sees it on return (their stub declares it as an output).
+        frame_mut(f).rdx = v;
+    }
+
     fn start_preemption() {
         // Remap the PICs (IRQ0 -> vector 0x20), point that vector at the timer stub, and
         // start a ~100 Hz PIT tick. Interrupts stay masked in the kernel, so the first

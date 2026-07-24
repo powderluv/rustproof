@@ -136,6 +136,12 @@ pub trait Arch {
     fn frame_arg(f: &UserFrame, i: usize) -> u64;
     /// Set the syscall return value the user will observe on resume.
     fn frame_set_ret(f: &mut UserFrame, v: u64);
+    /// Set a SECOND return value, in a register distinct from the status one. Needed by any
+    /// syscall that returns both a status and an unrestricted 64-bit payload (`RECV`): the
+    /// payload domain is the whole `u64`, so it cannot share a register with the `syserr`
+    /// sentinels without the two becoming indistinguishable. User stubs for such calls must
+    /// declare this register as an asm output.
+    fn frame_set_ret2(f: &mut UserFrame, v: u64);
 
     /// Enable preemptive scheduling: start a periodic timer interrupt that drives the
     /// scheduler (so a non-cooperating process is time-sliced). A no-op on arches where

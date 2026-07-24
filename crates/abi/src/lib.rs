@@ -194,11 +194,20 @@ pub mod sysno {
     pub const ALLOC_VRAM: u64 = 4;
     /// Cooperatively yield the CPU to the next ready process. No args, no result.
     pub const YIELD: u64 = 5;
-    /// Send one word to an endpoint (rendezvous): `a0` = endpoint id, `a1` = word.
-    /// Returns `syserr::OK`; blocks until a receiver takes the word.
+    /// Send one word to an endpoint (rendezvous): `a0` = an `Endpoint` capability (needs
+    /// `WRITE`), `a1` = the word. Returns `syserr::OK`, or `NO_CAP` without blocking if the
+    /// capability is missing/wrong-typed/lacks `WRITE`; otherwise blocks until a receiver
+    /// takes the word.
     pub const SEND: u64 = 6;
-    /// Receive one word from an endpoint (rendezvous): `a0` = endpoint id. Returns the
-    /// word; blocks until a sender delivers one.
+    /// Receive one word from an endpoint (rendezvous): `a0` = an `Endpoint` capability
+    /// (needs `READ`). Blocks until a sender delivers.
+    ///
+    /// Returns TWO values in separate registers: the status (`OK` / `NO_CAP`) in the usual
+    /// return register, and the delivered word in the second one (x86 `rdx`, RISC-V `a1`).
+    /// The split is load-bearing, not cosmetic: the word is an unrestricted `u64` chosen by
+    /// the sender, so a single-register protocol would make a legitimately received word
+    /// equal to a [`syserr`] sentinel indistinguishable from a real error. User stubs MUST
+    /// declare the second register as an asm output.
     pub const RECV: u64 = 7;
     /// Spawn a new process running the same embedded image. Returns the new process id, or
     /// `u64::MAX` on failure (no free slot / out of memory).

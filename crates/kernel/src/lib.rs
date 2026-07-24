@@ -559,7 +559,10 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                 Some(ep) => match find_blocked_recv(ep) {
                     Some(r) => {
                         // A receiver is waiting: hand it the word, wake it, return OK to us.
-                        A::frame_set_ret(&mut proc_at(r).frame, word);
+                        // The receiver gets status + payload in SEPARATE registers (see the
+                        // RECV arm) so an arbitrary word can never be read as an error.
+                        A::frame_set_ret(&mut proc_at(r).frame, abi::syserr::OK);
+                        A::frame_set_ret2(&mut proc_at(r).frame, word);
                         proc_at(r).state = ProcState::Ready;
                         sched().add(abi::ThreadId(r));
                         A::frame_set_ret(&mut f, abi::syserr::OK);
@@ -578,15 +581,22 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             }
         }
         abi::sysno::RECV => {
-            // Synchronous rendezvous: `a0` = an Endpoint capability; returns the word.
-            // Receiving requires READ on that cap.
+            // Synchronous rendezvous: `a0` = an Endpoint capability. Receiving requires READ
+            // on that cap. Status comes back in the return register and the delivered word in
+            // the SECOND one: the word is an unrestricted u64 chosen by the sender, so
+            // sharing one register with the `syserr` sentinels would make a legitimately
+            // received `NO_CAP`-valued word indistinguishable from a refusal.
             match endpoint_of(cur, A::frame_arg(&f, 0), abi::CapRights::READ) {
                 // No such cap, wrong type, or no READ right: refuse without blocking.
-                None => A::frame_set_ret(&mut f, abi::syserr::NO_CAP),
+                None => {
+                    A::frame_set_ret(&mut f, abi::syserr::NO_CAP);
+                    A::frame_set_ret2(&mut f, 0); // no payload on the error path
+                }
                 Some(ep) => match find_blocked_send(ep) {
                     Some((s, word)) => {
                         // A sender waits: take its word, return it, wake the sender (OK).
-                        A::frame_set_ret(&mut f, word);
+                        A::frame_set_ret(&mut f, abi::syserr::OK);
+                        A::frame_set_ret2(&mut f, word);
                         A::frame_set_ret(&mut proc_at(s).frame, abi::syserr::OK);
                         proc_at(s).state = ProcState::Ready;
                         sched().add(abi::ThreadId(s));
