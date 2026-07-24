@@ -200,6 +200,9 @@ pub mod sysno {
     /// Receive one word from an endpoint (rendezvous): `a0` = endpoint id. Returns the
     /// word; blocks until a sender delivers one.
     pub const RECV: u64 = 7;
+    /// Spawn a new process running the same embedded image. Returns the new process id, or
+    /// `u64::MAX` on failure (no free slot / out of memory).
+    pub const SPAWN: u64 = 8;
 }
 
 /// Syscall result codes returned in `rax`. `OK` is 0; errors are large sentinels so

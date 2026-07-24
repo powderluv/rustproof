@@ -401,6 +401,13 @@ fn recv(ep: u64) -> u64 {
     unsafe { syscall1(sysno::RECV, ep) }
 }
 
+/// Spawn a new process running this same image. `a0` presents our Untyped capability
+/// (`CapId(2)`) as spawn authority. Returns the new id, or `u64::MAX` on failure.
+fn spawn() -> u64 {
+    // SAFETY: SPAWN takes a cap id and returns a pid; no user memory is touched.
+    unsafe { syscall1(sysno::SPAWN, 2) }
+}
+
 /// The ELF entry point (ring 3, fresh stack, id in the first-argument register). The demo
 /// is role-selected by `id`: proc 0 produces + `SEND`s five values, proc 1 `RECV`s + prints
 /// them (cross-address-space IPC rendezvous), and any other proc runs a preemptible compute
@@ -457,6 +464,15 @@ fn consumer() -> ! {
 /// per-process host contract afterward, then exits. `spin` deliberately sets DF=1 (a
 /// standing regression test for the kernel's interrupt-entry `cld`; see `spin`).
 fn compute(id: u64) -> ! {
+    // Proc 2 dynamically spawns one child process (which runs this same compute path); the
+    // child's `[proc N]` ticks then appear in the schedule, proving runtime process creation.
+    if id == 2 {
+        let child = spawn();
+        tag(id);
+        dw!(b"spawned child pid=");
+        dbg_dec(child);
+        dw!(b"\n");
+    }
     tag(id);
     dw!(b"start (compute loop, no yields -- preemption only)\n");
     let mut tick = 0u64;

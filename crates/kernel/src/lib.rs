@@ -33,9 +33,10 @@ static mut MAIN_CTX: sched::Context = sched::Context::new();
 static mut B_CTX: sched::Context = sched::Context::new();
 static mut B_STACK: [u8; 16 * 1024] = [0; 16 * 1024];
 
-/// Run-queue capacity (also the process-table size).
-const MAX_PROCS: usize = 4;
-/// How many independent copies of the user image to launch.
+/// Run-queue capacity (also the process-table size): the initial processes plus headroom
+/// for `SPAWN`ed ones.
+const MAX_PROCS: usize = 6;
+/// How many independent copies of the user image to launch at boot.
 const NUM_PROCS: usize = 3;
 
 /// Scheduling state of a process slot. `Ready` processes are exactly those in the run
@@ -52,6 +53,10 @@ enum ProcState {
     BlockedRecv { ep: u64 },
 }
 
+/// How many physical frames a process may hold (tracked for reclamation on exit): its
+/// address space (page tables + stack + ELF segments, ~25) plus any DMA frames it allocs.
+const MAX_PROC_FRAMES: usize = 64;
+
 /// One scheduled user process: its own address space (`token`), its last-saved user
 /// register state (`frame`), and its own capability space — the isolation boundary.
 struct Process {
@@ -63,6 +68,10 @@ struct Process {
     caps: capabilities::CapSpace<16>,
     /// Scheduling / IPC state.
     state: ProcState,
+    /// Every physical frame allocated for this process, freed back to the pool on exit so a
+    /// spawn/exit cycle does not leak an address space. `frames[..nframes]` are live.
+    frames: [abi::PhysAddr; MAX_PROC_FRAMES],
+    nframes: usize,
 }
 
 impl Process {
@@ -71,7 +80,37 @@ impl Process {
         frame: UserFrame::ZERO,
         caps: capabilities::CapSpace::new(),
         state: ProcState::Free,
+        frames: [abi::PhysAddr(0); MAX_PROC_FRAMES],
+        nframes: 0,
     };
+}
+
+/// A [`FrameAllocator`](abi::FrameAllocator) that records every frame it hands out (into a
+/// caller-provided list) while delegating to the real allocator, so a process's frames can
+/// be reclaimed when it exits. Because it only records what *this* process allocates, it
+/// never captures the shared kernel frames — `share_kernel` copies a pointer, it does not
+/// allocate. If the list is full the allocation fails (frame returned), bounding a process
+/// rather than leaking an untracked frame.
+struct RecordingAlloc<'a> {
+    inner: &'a mut dyn abi::FrameAllocator,
+    frames: &'a mut [abi::PhysAddr; MAX_PROC_FRAMES],
+    n: &'a mut usize,
+}
+
+impl abi::FrameAllocator for RecordingAlloc<'_> {
+    fn alloc_frame(&mut self) -> Option<abi::PhysAddr> {
+        let p = self.inner.alloc_frame()?;
+        if *self.n >= MAX_PROC_FRAMES {
+            self.inner.free_frame(p);
+            return None;
+        }
+        self.frames[*self.n] = p;
+        *self.n += 1;
+        Some(p)
+    }
+    fn free_frame(&mut self, frame: abi::PhysAddr) {
+        self.inner.free_frame(frame);
+    }
 }
 
 /// The process table + round-robin run queue + index of the running process. Kept in
@@ -79,6 +118,11 @@ impl Process {
 static mut PROCS: [Process; MAX_PROCS] = [Process::EMPTY; MAX_PROCS];
 static mut SCHED: sched::Scheduler<MAX_PROCS> = sched::Scheduler::new();
 static mut CURRENT: usize = 0;
+
+/// The embedded user image + kernel token, stashed at boot so the `SPAWN` syscall can load
+/// a fresh process (it runs after `run` has consumed its locals).
+static mut USER_ELF: &[u8] = &[];
+static mut KTOKEN: u64 = 0;
 
 /// A `&'static mut` to process slot `i`, via a raw pointer (no direct `static mut` ref).
 ///
@@ -138,8 +182,85 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
         );
         A::exit(false);
     }
+    // Report the free-frame count: with per-process reclamation on exit it should be back
+    // near the pre-userland count (proving spawn/exit does not leak an address space).
+    if let Some(fa) = (*core::ptr::addr_of!(FA)).as_ref() {
+        let _ = writeln!(con, "[mm] {} frames free after all exits", fa.free_count());
+    }
     let _ = writeln!(con, "\nrustproof: BOOT OK");
     A::exit(true)
+}
+
+/// Load the user `elf` into process slot `slot`: a fresh address space (kernel shared in),
+/// a mapped user stack, a fresh capability space (Mmio@CapId(1), Untyped@CapId(2)), and an
+/// initial frame entering `_start` with `id_arg` in the first-argument register. Sets the
+/// slot `Ready`; the caller adds it to the run queue. Returns `false` (leaving the slot
+/// untouched enough to retry) if the address space or a frame can't be allocated.
+///
+/// Shared by boot (`run`) and the `SPAWN` syscall — the only difference is where `fa` comes
+/// from (a `run` local vs the `FA` static).
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of `PROCS[slot]`. `ktoken` must be the
+/// active kernel token so `share_kernel` and the page-table writes are reachable.
+unsafe fn load_process<A: Arch>(
+    slot: usize,
+    id_arg: u64,
+    fa: &mut dyn abi::FrameAllocator,
+    ktoken: u64,
+    elf: &[u8],
+) -> bool {
+    use abi::FrameAllocator as _;
+    // Build the address space through a recorder so every allocated frame is tracked for
+    // reclamation on exit. Kept in a local list until the build succeeds.
+    let mut frames = [abi::PhysAddr(0); MAX_PROC_FRAMES];
+    let mut n = 0usize;
+    let mut rec = RecordingAlloc {
+        inner: fa,
+        frames: &mut frames,
+        n: &mut n,
+    };
+    let built: Option<(u64, u64)> = (|| {
+        let mut space = A::Space::create(&mut rec)?;
+        space.share_kernel(ktoken);
+        let entry = A::load_user(elf, &mut space, &mut rec)?;
+        for p in 1..=A::USER_STACK_PAGES {
+            let va = abi::VirtAddr(A::USER_STACK_TOP - p * abi::PAGE_SIZE);
+            let frame = rec.alloc_frame()?;
+            if !space.map_page(va, frame, Perms::USER_RW, &mut rec) {
+                return None;
+            }
+        }
+        Some((space.token(), entry))
+    })();
+    drop(rec);
+
+    match built {
+        Some((token, entry)) => {
+            let s = proc_at(slot);
+            s.caps = capabilities::CapSpace::new();
+            let _ = s
+                .caps
+                .insert(abi::CapType::Endpoint, abi::CapRights::NONE, 0);
+            let _ = s
+                .caps
+                .insert(abi::CapType::Mmio, abi::CapRights::ALL, 0xE000_0000);
+            let _ = s.caps.insert(abi::CapType::Untyped, abi::CapRights::ALL, 0);
+            s.token = token;
+            s.frame = A::frame_init(entry, A::USER_STACK_TOP, id_arg);
+            s.frames = frames;
+            s.nframes = n;
+            s.state = ProcState::Ready;
+            true
+        }
+        None => {
+            // Roll back a partial build so a failed load leaks nothing.
+            for i in 0..n {
+                fa.free_frame(frames[i]);
+            }
+            false
+        }
+    }
 }
 
 /// Stubbed gfx1201 identity returned by the host contract's `GET_INFO`.
@@ -193,7 +314,7 @@ extern "C" fn thread_b<A: Arch>() -> ! {
 
 /// The generic kmain. `a0`/`a1` are the arch boot args (x86 PVH `start_info`; RISC-V
 /// `hartid`/`dtb`); `user_elf` is the embedded user program. Never returns.
-pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &[u8]) -> ! {
+pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
     use abi::FrameAllocator as _;
     let mut con = Console::<A>::new();
     let _ = writeln!(con);
@@ -312,34 +433,18 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &[u8]) -> ! {
             "\n[proc] loading {} isolated user processes",
             NUM_PROCS
         );
+        // Stash the image + kernel token so the SPAWN syscall can load more processes later.
+        unsafe {
+            USER_ELF = user_elf;
+            KTOKEN = ktoken;
+        }
         for i in 0..NUM_PROCS {
-            // Each process gets its own address space (kernel shared in) + own stack.
-            let mut space = A::Space::create(&mut fa).expect("user address space");
-            unsafe { space.share_kernel(ktoken) };
-            let entry = A::load_user(user_elf, &mut space, &mut fa).expect("load user ELF");
-            for p in 1..=A::USER_STACK_PAGES {
-                let va = abi::VirtAddr(A::USER_STACK_TOP - p * abi::PAGE_SIZE);
-                let frame = fa.alloc_frame().expect("user stack frame");
-                space.map_page(va, frame, Perms::USER_RW, &mut fa);
-            }
-            // Populate this process's slot: its own caps (Mmio@CapId(1), Untyped@CapId(2);
-            // slot 0 is a placeholder so the first grant lands at CapId(1)), token, and an
-            // initial frame that enters `_start` with its process id in the first-arg reg.
-            let slot = unsafe { proc_at(i) };
-            let _ = slot
-                .caps
-                .insert(abi::CapType::Endpoint, abi::CapRights::NONE, 0);
-            let _ = slot
-                .caps
-                .insert(abi::CapType::Mmio, abi::CapRights::ALL, 0xE000_0000);
-            let _ = slot
-                .caps
-                .insert(abi::CapType::Untyped, abi::CapRights::ALL, 0);
-            slot.token = space.token();
-            slot.frame = A::frame_init(entry, A::USER_STACK_TOP, i as u64);
-            slot.state = ProcState::Ready;
+            // Each process gets its own address space (kernel shared in), stack, and caps,
+            // and an initial frame entering `_start` with its id in the first-arg register.
+            let ok = unsafe { load_process::<A>(i, i as u64, &mut fa, ktoken, user_elf) };
+            assert!(ok, "failed to load initial process");
             unsafe { sched().add(abi::ThreadId(i)) };
-            let _ = writeln!(con, "  proc {} loaded (entry {:#x})", i, entry);
+            let _ = writeln!(con, "  proc {} loaded", i);
         }
         unsafe { FA = Some(fa) };
         let first = unsafe { sched().current() }.expect("a ready process").0;
@@ -388,6 +493,16 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             let code = A::frame_arg(&f, 0);
             let mut con = Console::<A>::new();
             let _ = writeln!(con, "[kernel] proc {} exited with code {}", cur, code);
+            // Reclaim the process's frames (page tables + stack + ELF + any DMA frames)
+            // before freeing the slot, so a spawn/exit cycle does not leak an address space.
+            if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
+                use abi::FrameAllocator as _;
+                let p = proc_at(cur);
+                for i in 0..p.nframes {
+                    fa.free_frame(p.frames[i]);
+                }
+                p.nframes = 0;
+            }
             proc_at(cur).state = ProcState::Free;
             sched().remove(abi::ThreadId(cur));
             match sched().current() {
@@ -435,6 +550,43 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                     None => nothing_runnable::<A>(),
                 }
             }
+        }
+        abi::sysno::SPAWN => {
+            // Creating a process is authority: require the caller to present an Untyped
+            // capability (`a0` = cap id), like ALLOC_VRAM. This bounds who can spawn.
+            let cap = abi::CapId(A::frame_arg(&f, 0) as usize);
+            let authorized = proc_at(cur)
+                .caps
+                .lookup(cap)
+                .is_some_and(|s| s.cap_type == abi::CapType::Untyped);
+            // Load the embedded image into a fresh process (the child's id = its slot),
+            // add it to the run queue, and return its id (or u64::MAX on failure). The
+            // spawner keeps running (CURRENT unchanged).
+            let free = if authorized {
+                (0..MAX_PROCS).find(|&i| proc_at(i).state == ProcState::Free)
+            } else {
+                None
+            };
+            let elf = *core::ptr::addr_of!(USER_ELF);
+            let ktoken = *core::ptr::addr_of!(KTOKEN);
+            let ret = match free {
+                Some(slot) => {
+                    let loaded = match (*core::ptr::addr_of_mut!(FA)).as_mut() {
+                        Some(fa) => load_process::<A>(slot, slot as u64, fa, ktoken, elf),
+                        None => false,
+                    };
+                    if loaded {
+                        sched().add(abi::ThreadId(slot));
+                        let mut con = Console::<A>::new();
+                        let _ = writeln!(con, "[kernel] proc {} spawned proc {}", cur, slot);
+                        slot as u64
+                    } else {
+                        u64::MAX
+                    }
+                }
+                None => u64::MAX,
+            };
+            A::frame_set_ret(&mut f, ret);
         }
         num => {
             // A host-contract syscall: serviced under the current process's page tables
@@ -504,8 +656,23 @@ impl<A: Arch> abi::HostEnv for KEnv<A> {
         caps.lookup(cap).map(|s| (s.cap_type, s.rights, s.object))
     }
     fn alloc_dma(&mut self) -> Option<abi::PhysAddr> {
-        let fa = unsafe { (*core::ptr::addr_of_mut!(FA)).as_mut()? };
-        fa.alloc_dma_frame()
+        use abi::FrameAllocator as _;
+        // SAFETY: single-CPU, non-reentrant; FA and the process slot are disjoint statics.
+        unsafe {
+            let fa = (*core::ptr::addr_of_mut!(FA)).as_mut()?;
+            let p = fa.alloc_dma_frame()?;
+            let proc = proc_at(self.proc_idx);
+            if proc.nframes >= MAX_PROC_FRAMES {
+                // At the tracking cap: an untracked frame would never be reclaimed on exit
+                // (a leak), so fail the allocation and return the frame, mirroring
+                // `RecordingAlloc`. The 64-frame list bounds a process's footprint.
+                fa.free_frame(p);
+                return None;
+            }
+            proc.frames[proc.nframes] = p;
+            proc.nframes += 1;
+            Some(p)
+        }
     }
     fn write_user_bytes(&mut self, uptr: u64, bytes: &[u8]) -> bool {
         unsafe { A::copy_to_user(uptr, bytes) }
