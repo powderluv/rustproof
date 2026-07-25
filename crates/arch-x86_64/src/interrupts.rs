@@ -181,8 +181,13 @@ unsafe fn read_cr2() -> u64 {
 extern "C" fn exception_dispatch(frame: *const ExceptionFrame) -> ! {
     let f = unsafe { &*frame };
     // The CPU pushes the interrupted CS; its low two bits are the privilege level that was
-    // running, so RPL 3 means user code faulted — its failure, not the machine's.
-    if f.cs & 3 == 3 {
+    // running, so RPL 3 means user code faulted — its failure, not the machine's. But only
+    // for a SYNCHRONOUS exception: NMI (2) and #MC (18) are machine events that merely
+    // happened to arrive while a process was running, and #DF (8) means the CPU could not
+    // deliver an earlier exception at all. Killing the current process for those would
+    // blame it for something it did not do, and would paper over a broken kernel.
+    let attributable = !matches!(f.vector, 2 | 8 | 18);
+    if attributable && f.cs & 3 == 3 {
         let name = vector_name(f.vector);
         let addr = if f.vector == 14 {
             // SAFETY: reading CR2 is always valid; it holds the faulting address for #PF.

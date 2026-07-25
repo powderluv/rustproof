@@ -681,6 +681,27 @@ fn compute(id: u64) -> ! {
         dbg_dec(child);
         dw!(b"\n");
     }
+    // Hostile-flag regression, the sibling of the DF test in `spin`: ring 3 can set
+    // RFLAGS.NT with `popfq`, and a leaked NT makes the kernel's OWN `iretq` raise #GP —
+    // reported with kernel CS, so it would take the fatal branch and halt the guest. The
+    // syscall entry mask must strip it. If it does not, this boot ends here.
+    tag(id);
+    // SAFETY: only toggles RFLAGS.NT, which is architecturally writable from ring 3 and
+    // affects nothing this program does; the kernel is responsible for not leaking it in.
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {t}",
+            "or {t}, 0x4000",
+            "push {t}",
+            "popfq",
+            t = out(reg) _,
+            options(nomem),
+        );
+    }
+    let _ = get_info(); // any syscall: the return path is what NT would break
+    dw!(b"flags: survived a syscall with RFLAGS.NT set\n");
+
     tag(id);
     dw!(b"start (compute loop, no yields -- preemption only)\n");
     let mut tick = 0u64;

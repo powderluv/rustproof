@@ -120,8 +120,14 @@ pub fn init() {
         wrmsr(IA32_EFER, rdmsr(IA32_EFER) | (1 << 0) | (1 << 11));
         wrmsr(IA32_STAR, (0x18u64 << 48) | (0x08u64 << 32));
         wrmsr(IA32_LSTAR, syscall_entry as *const () as u64);
-        // Clear IF, DF, TF on kernel entry (no nested interrupts, defined direction).
-        wrmsr(IA32_FMASK, 0x200 | 0x400 | 0x100);
+        // Clear IF, DF, TF, NT and AC on kernel entry. NT is load-bearing for safety, not
+        // hygiene: ring 3 can set it with `popfq` (POPF only protects IF/IOPL at CPL >
+        // IOPL), and in 64-bit mode `iretq` raises #GP(0) whenever NT is set — so a leaked
+        // NT faults the kernel's OWN return-to-user path, is reported with kernel CS, and
+        // takes the fatal branch in `exception_dispatch`: an unprivileged guest halt. AC
+        // goes too, so a user-set alignment-check flag can never fault kernel accesses.
+        // (Linux masks both in MSR_SYSCALL_MASK for the same reasons.)
+        wrmsr(IA32_FMASK, 0x200 | 0x400 | 0x100 | 0x4000 | 0x4_0000);
     }
 }
 

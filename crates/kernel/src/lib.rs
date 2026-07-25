@@ -166,6 +166,11 @@ static mut KTOKEN: u64 = 0;
 /// new process be mistaken (by the kernel or by userland) for the one that freed the slot.
 static mut NEXT_ID: u64 = NUM_PROCS as u64;
 
+/// How many processes were killed by a CPU fault. Reported at the end so a run in which
+/// something crashed is distinguishable from one where every process exited cleanly —
+/// otherwise both print the same success line and a crash reads as a clean boot.
+static mut KILLED: u64 = 0;
+
 /// Physical base of the stand-in "device" window every `Mmio` capability names. Reserved
 /// at boot from the frame allocator and filled with a signature, so a process that maps it
 /// through `MAP_BAR` can prove it really reached that physical memory — the same path a
@@ -536,7 +541,12 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
     if let Some(fa) = (*core::ptr::addr_of!(FA)).as_ref() {
         let _ = writeln!(con, "[mm] {} frames free after all exits", fa.free_count());
     }
-    let _ = writeln!(con, "\nrustproof: BOOT OK");
+    let killed = *core::ptr::addr_of!(KILLED);
+    if killed > 0 {
+        let _ = writeln!(con, "\nrustproof: BOOT OK ({} process(es) killed)", killed);
+    } else {
+        let _ = writeln!(con, "\nrustproof: BOOT OK");
+    }
     A::exit(true)
 }
 
@@ -858,7 +868,7 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
 ///
 /// # Safety
 /// Single-CPU, non-reentrant: no other live borrow of the process table or the ledger.
-unsafe fn teardown_process(idx: usize) {
+unsafe fn teardown_process<A: Arch>(idx: usize) {
     // Reclaim the process's frames (page tables + stack + ELF + any DMA frames) before
     // freeing the slot, so a spawn/exit cycle does not leak an address space.
     if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
@@ -909,6 +919,36 @@ unsafe fn teardown_process(idx: usize) {
     }
     proc_at(idx).state = ProcState::Free;
     sched().remove(abi::ThreadId(idx));
+
+    // A process that dies must not strand a peer mid-rendezvous. The IPC matcher keys on
+    // the blocked state's endpoint, so a peer blocked on an endpoint that no LIVE process
+    // can still answer would wait forever — and the run would end reporting a deadlock
+    // rather than the clean finish it actually is. Wake exactly those with NO_CAP.
+    for i in 0..MAX_PROCS {
+        let (ep, needed_by_peer) = match proc_at(i).state {
+            // A blocked sender needs someone holding READ on that endpoint to take it.
+            ProcState::BlockedSend { ep, .. } => (ep, abi::CapRights::READ),
+            // A blocked receiver needs someone holding WRITE to deliver.
+            ProcState::BlockedRecv { ep, .. } => (ep, abi::CapRights::WRITE),
+            _ => continue,
+        };
+        let answerable = (0..MAX_PROCS).any(|j| {
+            j != i && proc_at(j).state != ProcState::Free && holds_endpoint(j, ep, needed_by_peer)
+        });
+        if answerable {
+            continue;
+        }
+        let was_recv = matches!(proc_at(i).state, ProcState::BlockedRecv { .. });
+        let p = proc_at(i);
+        A::frame_set_ret(&mut p.frame, abi::syserr::NO_CAP);
+        if was_recv {
+            A::frame_set_ret2(&mut p.frame, 0);
+            A::frame_set_ret3(&mut p.frame, 0);
+        }
+        p.state = ProcState::Ready;
+        p.pending_len = 0;
+        sched().add(abi::ThreadId(i));
+    }
 }
 
 /// A CPU fault taken while USER code was running: kill that process and carry on. Never
@@ -933,7 +973,8 @@ pub unsafe fn fault_trap<A: Arch>(what: &str, addr: u64) -> ! {
         what,
         addr
     );
-    teardown_process(cur);
+    KILLED = KILLED.wrapping_add(1);
+    teardown_process::<A>(cur);
     match sched().current() {
         Some(t) => CURRENT = t.0,
         None => nothing_runnable::<A>(),
@@ -1000,7 +1041,7 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                 proc_at(cur).id,
                 code
             );
-            teardown_process(cur);
+            teardown_process::<A>(cur);
             match sched().current() {
                 Some(t) => CURRENT = t.0,
                 None => nothing_runnable::<A>(), // all exited (BOOT OK) or deadlocked

@@ -195,6 +195,23 @@ broken. Before this, any process could halt the whole guest with a wild pointer,
 which is the opposite of what an isolation kernel is for. The demo has a process
 dereference a null pointer on purpose and asserts the boot still completes.
 
+Two things that classification depends on. First, only *synchronous* vectors may
+be blamed on the running process: NMI, #MC and #DF are machine events (or a
+failure to deliver an earlier exception) that merely arrived while a process
+happened to be running, so they stay fatal. Second, the syscall entry mask must
+strip every RFLAGS bit a user could weaponise — not just `IF`/`DF`/`TF` but `NT`
+and `AC`: ring 3 can set `NT` with `popfq`, and in 64-bit mode a set `NT` makes
+`iretq` raise #GP, so a leaked one would fault the kernel's OWN return-to-user
+path, be reported with kernel `CS`, and halt the guest — the very DoS this
+mechanism removes. The `init` demo sets `NT` before a syscall and asserts the
+boot survives, next to the `DF` test.
+
+A process that dies — by fault or by `EXIT` — must not strand a peer parked in a
+rendezvous. Teardown wakes any process blocked on an endpoint that no surviving
+process can still answer, or the run would end reporting a deadlock that is
+really just a dead counterparty. And a boot in which anything was killed says so
+(`BOOT OK (N process(es) killed)`), so a crash cannot read as a clean run.
+
 Load-bearing detail: an x86 interrupt/exception gate clears `IF`/`TF` but **not**
 `DF`, and `std` is unprivileged — so a ring-3 process can enter the kernel with
 `DF=1`. The Rust handler's `rep movs`-lowered copies (e.g. the trap-frame save)
