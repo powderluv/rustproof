@@ -223,6 +223,12 @@ pub mod sysno {
     pub const SPAWN: u64 = 8;
     /// `a1` value for [`SPAWN`] meaning "delegate nothing".
     pub const NO_DELEGATE: u64 = u64::MAX;
+    /// Revoke every capability derived from `a0` (one of the caller's own capabilities) by
+    /// delegation, transitively — the children it was handed to, the grandchildren they
+    /// passed it on to, and anything derived from those within a holder's own space.
+    /// Returns `OK`, or `NO_CAP` if the caller does not hold `a0`. The caller keeps its own
+    /// capability; only the derivations are destroyed.
+    pub const REVOKE: u64 = 10;
     /// Free a VRAM frame previously returned by `ALLOC_VRAM`: `a0` = its physical address.
     /// Returns `OK`, or `FAULT` if the caller does not own that frame.
     pub const FREE_VRAM: u64 = 9;

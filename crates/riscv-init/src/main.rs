@@ -296,6 +296,13 @@ fn spawn_delegating(cap: u64, deleg: u64, rights: u64) -> u64 {
     unsafe { syscall(sysno::SPAWN, cap, deleg, rights, 0, 0) }
 }
 
+/// Revoke every capability derived from our capability `cap` by delegation (transitively).
+/// We keep `cap` itself. Returns `syserr::OK`, or `NO_CAP` if we do not hold it.
+fn revoke(cap: u64) -> u64 {
+    // SAFETY: REVOKE takes a cap id and returns a status; no user memory is touched.
+    unsafe { syscall(sysno::REVOKE, cap, 0, 0, 0, 0) }
+}
+
 /// Allocate one VRAM frame via the Untyped cap; returns its physical address, or 0 on
 /// failure (per-process quota reached or out of memory).
 fn alloc_vram_phys() -> u64 {
@@ -557,6 +564,33 @@ fn compute(id: u64) -> ! {
         debug_write(b"\n");
     }
 
+    // Revoke everything we delegated from CapId(2). Our own capability survives; the
+    // child's copy of it must vanish, which the child observes and reports.
+    if id == 2 {
+        tag(id);
+        if revoke(2) == syserr::OK {
+            debug_write(b"revoke: revoked delegations of CapId(2)\n");
+        } else {
+            debug_write(b"revoke: refused (bug)\n");
+        }
+        // Our own capability is untouched: revoking grants does not disarm us. NOTE the
+        // error code matters here — we are at our VRAM quota from the loop above, so a
+        // refusal is expected; only NO_CAP would mean revocation destroyed our own cap.
+        tag(id);
+        match alloc_vram(CapId(2), 4096) {
+            Ok(r) => {
+                free_vram(r.phys);
+                debug_write(b"revoke: our own CapId(2) still works\n");
+            }
+            Err(e) if e != syserr::NO_CAP => {
+                debug_write(
+                    b"revoke: our own CapId(2) survives (refused on quota, not authority)\n",
+                );
+            }
+            Err(_) => debug_write(b"revoke: revoking cost us our own cap (bug)\n"),
+        }
+    }
+
     exit(id);
 }
 
@@ -580,22 +614,60 @@ fn child(id: u64) -> ! {
         debug_write(b"child: mapped a BAR (bug)\n");
     }
 
-    // The delegated capability lands at CapId(0) — the first free slot of an empty table.
-    let deleg = alloc_vram(CapId(0), 4096);
-    tag(id);
-    if id == 3 {
-        if let Ok(r) = deleg {
+    // Use the delegated capability, then pass it on once. Passing it on makes the
+    // revocation test TRANSITIVE: the parent's REVOKE must reach not just us but the
+    // grandchild we handed it to. Self-limiting — the spawn fails once slots run out.
+    let have = match alloc_vram(CapId(0), 4096) {
+        Ok(r) => {
             free_vram(r.phys);
-            debug_write(b"deleg: delegated Untyped WORKS (authority no role granted it)\n");
-        } else {
-            debug_write(b"deleg: delegated Untyped REFUSED (bug)\n");
+            true
         }
-    } else if deleg.is_err() {
+        Err(_) => false,
+    };
+    tag(id);
+    if have {
+        debug_write(b"deleg: delegated Untyped WORKS (authority no role granted it)\n");
+    } else {
         debug_write(
             b"deleg: parent asked ALL on its READ-only cap -> still refused (no amplification)\n",
         );
-    } else {
-        debug_write(b"deleg: amplified a READ-only cap (bug)\n");
+    }
+    if have {
+        let g = spawn_delegating(0, 0, 0b111);
+        tag(id);
+        if g == u64::MAX {
+            debug_write(b"deleg: no free slot to pass it on\n");
+        } else {
+            debug_write(b"deleg: passed our cap on to pid ");
+            dbg_dec(g);
+            debug_write(b"\n");
+        }
+    }
+
+    // Our parent revokes while we run. A capability that keeps working after revocation
+    // would be the bug — and for a grandchild, so would one that is never reached.
+    if have {
+        let mut seen = false;
+        let mut i = 0u64;
+        while i < 60 {
+            match alloc_vram(CapId(0), 4096) {
+                Ok(r) => {
+                    free_vram(r.phys);
+                }
+                Err(_) => {
+                    seen = true;
+                    break;
+                }
+            }
+            spin(2_000_000);
+            i = i.wrapping_add(1);
+        }
+        tag(id);
+        if seen {
+            debug_write(b"revoke: delegated cap REVOKED by parent (no longer usable)\n");
+        } else {
+            debug_write(b"revoke: delegated cap still usable after revoke (bug)\n");
+        }
     }
 
     // Still preemptible, with DF deliberately set inside spin() (see `spin`).

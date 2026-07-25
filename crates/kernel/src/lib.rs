@@ -53,6 +53,9 @@ enum ProcState {
     BlockedRecv { ep: u64 },
 }
 
+/// Capability slots per process.
+const CAP_SLOTS: usize = 16;
+
 /// How many address-space frames a process may hold (tracked for reclamation on exit): its
 /// page tables + stack + ELF segments, ~25. VRAM frames are tracked + quota'd separately.
 const MAX_PROC_FRAMES: usize = 64;
@@ -69,7 +72,7 @@ struct Process {
     /// Saved user register state, resumed by `Arch::resume`.
     frame: UserFrame,
     /// Per-process authority: what this process may invoke via the host contract.
-    caps: capabilities::CapSpace<16>,
+    caps: capabilities::CapSpace<CAP_SLOTS>,
     /// The role whose grant table `caps` was built from (recorded for the boot log and so
     /// the policy a slot is running under is inspectable rather than re-derived).
     role: Role,
@@ -147,6 +150,152 @@ static mut KTOKEN: u64 = 0;
 /// NOT the table slot: slots are recycled by `EXIT`/`SPAWN`, and reusing an id would let a
 /// new process be mistaken (by the kernel or by userland) for the one that freed the slot.
 static mut NEXT_ID: u64 = NUM_PROCS as u64;
+
+/// How many live cross-space delegations the kernel tracks. A `SPAWN` that would delegate
+/// with the ledger full is refused rather than performed untracked — an untracked
+/// delegation is one that could never be revoked.
+const MAX_DELEGATIONS: usize = 16;
+
+/// One cross-space delegation edge: the capability at `child_cap` in process `child` was
+/// derived from `parent_cap` in process `parent`.
+///
+/// This lives in the kernel rather than in `CapSpace` on purpose: `CapSlot.parent` is a slot
+/// index interpreted *within one space*, so it cannot express a cross-space edge — writing a
+/// parent's index into the child's space would name an unrelated slot of the child's own
+/// table and corrupt `revoke_subtree`. The two mechanisms compose: this ledger walks edges
+/// between spaces, and `revoke_subtree` finishes the job inside each one.
+#[derive(Clone, Copy)]
+struct Delegation {
+    parent: usize,
+    parent_cap: usize,
+    child: usize,
+    child_cap: usize,
+    /// Identity of the child at delegation time. Slots are recycled, so a record is only
+    /// acted on while the slot still holds *that* process — otherwise a stale edge could
+    /// strip a capability from an unrelated later occupant.
+    child_id: u64,
+    /// Identity of the parent, for exactly the same reason: BOTH endpoints of an edge are
+    /// slot indices, so matching a revocation source by slot alone would let whoever later
+    /// occupies that slot revoke through an edge it has no relation to.
+    parent_id: u64,
+    live: bool,
+}
+
+impl Delegation {
+    const EMPTY: Delegation = Delegation {
+        parent: 0,
+        parent_cap: 0,
+        child: 0,
+        child_cap: 0,
+        child_id: 0,
+        parent_id: 0,
+        live: false,
+    };
+}
+
+static mut DELEGATIONS: [Delegation; MAX_DELEGATIONS] = [Delegation::EMPTY; MAX_DELEGATIONS];
+
+/// A `&'static mut` to delegation record `i`.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: callers hold no other live borrow of `DELEGATIONS[i]`.
+#[inline]
+unsafe fn deleg_at<'a>(i: usize) -> &'a mut Delegation {
+    &mut *(core::ptr::addr_of_mut!(DELEGATIONS) as *mut Delegation).add(i)
+}
+
+/// Index of a free delegation record, if any.
+///
+/// # Safety
+/// Single-CPU, non-reentrant.
+unsafe fn free_delegation() -> Option<usize> {
+    (0..MAX_DELEGATIONS).find(|&i| !deleg_at(i).live)
+}
+
+/// Destroy every capability derived from `root_cap` in process `root_proc`, transitively.
+///
+/// Walks the cross-space ledger to a fixpoint: any delegation whose source has been revoked
+/// is itself revoked, which then makes ITS child a revoked source (grandchildren and deeper).
+/// Inside each holder, `revoke_subtree` removes the delegated capability along with anything
+/// that holder derived from it. The root capability itself is untouched — a process revoking
+/// its own grants does not disarm itself.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table or the ledger.
+unsafe fn revoke_delegations<A: Arch>(root_proc: usize, root_cap: usize) {
+    // Sources whose derivations must die, as (slot, identity, cap slot). Identity is part
+    // of the key because slots are recycled: matching on the slot pair alone would let an
+    // unrelated later occupant of a slot inherit revocation authority over someone else's
+    // children. Bounded: at most one entry per ledger record, plus the root.
+    let mut revoked = [(usize::MAX, u64::MAX, usize::MAX); MAX_DELEGATIONS + 1];
+    revoked[0] = (root_proc, proc_at(root_proc).id, root_cap);
+    let mut nrev = 1;
+
+    loop {
+        let mut progress = false;
+        for i in 0..MAX_DELEGATIONS {
+            let d = *deleg_at(i);
+            if !d.live {
+                continue;
+            }
+            if !revoked[..nrev]
+                .iter()
+                .any(|&(p, pid, c)| p == d.parent && pid == d.parent_id && c == d.parent_cap)
+            {
+                continue;
+            }
+            deleg_at(i).live = false;
+            progress = true;
+            // Only strip the capability while the slot still holds the same process.
+            let p = proc_at(d.child);
+            if p.state != ProcState::Free && p.id == d.child_id {
+                p.caps.revoke_subtree(abi::CapId(d.child_cap));
+                // Revoking an endpoint capability must also end any rendezvous it is parked
+                // in: the IPC matcher keys on the blocked state's endpoint, not on present
+                // authority, so a process left blocked would go on sending or receiving
+                // through an endpoint it no longer holds. Wake it with NO_CAP instead.
+                let stranded = match p.state {
+                    ProcState::BlockedSend { ep, .. } => {
+                        !holds_endpoint(d.child, ep, abi::CapRights::WRITE)
+                    }
+                    ProcState::BlockedRecv { ep } => {
+                        !holds_endpoint(d.child, ep, abi::CapRights::READ)
+                    }
+                    _ => false,
+                };
+                if stranded {
+                    let p = proc_at(d.child);
+                    A::frame_set_ret(&mut p.frame, abi::syserr::NO_CAP);
+                    A::frame_set_ret2(&mut p.frame, 0);
+                    p.state = ProcState::Ready;
+                    sched().add(abi::ThreadId(d.child));
+                }
+            }
+            if nrev < revoked.len() {
+                revoked[nrev] = (d.child, d.child_id, d.child_cap);
+                nrev += 1;
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+}
+
+/// Does process `proc` still hold ANY endpoint capability naming `ep` with `needed` rights?
+/// Used after a revocation to decide whether a blocked process has been stranded — it may
+/// legitimately hold a second capability to the same endpoint.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table.
+unsafe fn holds_endpoint(proc: usize, ep: u64, needed: abi::CapRights) -> bool {
+    let caps = &proc_at(proc).caps;
+    (0..CAP_SLOTS).any(|i| {
+        caps.lookup(abi::CapId(i)).is_some_and(|s| {
+            s.cap_type == abi::CapType::Endpoint && s.object == ep && s.rights.contains(needed)
+        })
+    })
+}
 
 /// A `&'static mut` to process slot `i`, via a raw pointer (no direct `static mut` ref).
 ///
@@ -648,6 +797,40 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                 }
                 p.nvram = 0;
             }
+            // Splice this process out of the delegation ledger. Its capability space is
+            // gone and its slot is about to be reused, so every edge naming it must go —
+            // but an edge INTO it is first re-parented onto its own source, or an
+            // ancestor's REVOKE would silently miss the grandchildren this process
+            // delegated onward and report success while they kept the capability.
+            let gone_id = proc_at(cur).id;
+            for i in 0..MAX_DELEGATIONS {
+                let inc = *deleg_at(i);
+                if !inc.live || inc.child != cur || inc.child_id != gone_id {
+                    continue;
+                }
+                for j in 0..MAX_DELEGATIONS {
+                    let out = deleg_at(j);
+                    if out.live
+                        && out.parent == cur
+                        && out.parent_id == gone_id
+                        && out.parent_cap == inc.child_cap
+                    {
+                        out.parent = inc.parent;
+                        out.parent_id = inc.parent_id;
+                        out.parent_cap = inc.parent_cap;
+                    }
+                }
+                deleg_at(i).live = false;
+            }
+            // Anything still rooted here derives from a capability this process held in its
+            // own right, so no surviving process can revoke through it: drop those edges
+            // rather than leave them naming a slot someone else is about to occupy.
+            for i in 0..MAX_DELEGATIONS {
+                let d = deleg_at(i);
+                if d.live && d.parent == cur && d.parent_id == gone_id {
+                    d.live = false;
+                }
+            }
             proc_at(cur).state = ProcState::Free;
             sched().remove(abi::ThreadId(cur));
             match sched().current() {
@@ -748,8 +931,9 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                 None
             };
             // Asking to delegate a capability you do not hold refuses the whole spawn,
-            // rather than silently producing a child without it.
-            let deleg_ok = !want_deleg || delegated.is_some();
+            // rather than silently producing a child without it. So does a full ledger:
+            // an untracked delegation is one that could never be revoked.
+            let deleg_ok = !want_deleg || (delegated.is_some() && free_delegation().is_some());
             // Load the embedded image into a free slot, add it to the run queue, and return
             // the child's id (or u64::MAX on failure). The spawner keeps running (CURRENT
             // unchanged).
@@ -783,7 +967,22 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                         // in the first free slot of the child's space, i.e. immediately
                         // after its role's grants.
                         if let Some((cap_type, rights, object)) = delegated {
-                            let _ = proc_at(slot).caps.insert(cap_type, rights, object);
+                            if let Some(child_cap) =
+                                proc_at(slot).caps.insert(cap_type, rights, object)
+                            {
+                                // Record the cross-space edge so this can be revoked later.
+                                if let Some(rec) = free_delegation() {
+                                    *deleg_at(rec) = Delegation {
+                                        parent: cur,
+                                        parent_cap: deleg_arg as usize,
+                                        child: slot,
+                                        child_cap: child_cap.0,
+                                        child_id,
+                                        parent_id: proc_at(cur).id,
+                                        live: true,
+                                    };
+                                }
+                            }
                         }
                         sched().add(abi::ThreadId(slot));
                         let mut con = Console::<A>::new();
@@ -808,6 +1007,25 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                 None => u64::MAX,
             };
             A::frame_set_ret(&mut f, ret);
+        }
+        abi::sysno::REVOKE => {
+            // Revoke everything derived from one of OUR capabilities. Holding it is the
+            // authority to revoke its derivations — no separate right, and no way to
+            // revoke a capability you were never the source of.
+            let cap = abi::CapId(A::frame_arg(&f, 0) as usize);
+            if proc_at(cur).caps.lookup(cap).is_some() {
+                revoke_delegations::<A>(cur, cap.0);
+                let mut con = Console::<A>::new();
+                let _ = writeln!(
+                    con,
+                    "[kernel] proc {} revoked delegations of cap {}",
+                    proc_at(cur).id,
+                    cap.0
+                );
+                A::frame_set_ret(&mut f, abi::syserr::OK);
+            } else {
+                A::frame_set_ret(&mut f, abi::syserr::NO_CAP);
+            }
         }
         num => {
             // A host-contract syscall: serviced under the current process's page tables

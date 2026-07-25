@@ -102,10 +102,41 @@ delegated `Untyped`, which no role table could have given it. The negative case
 hands another child a `READ`-only `Untyped` *with full rights requested*; it is
 still refused.
 
-Honest scope on what remains: the role table is a static boot policy, delegation
-is one capability per spawn, and there is no revocation of a delegated capability
-after the fact (`CapSpace::revoke_subtree` exists within a space, but a delegated
-cap is a fresh root in the child's space, so it is not linked to the parent's).
+Delegated capabilities can be **revoked**. `REVOKE(cap)` destroys everything
+derived from one of the caller's own capabilities — transitively: the children it
+was handed to, the grandchildren they passed it on to, and (via
+`CapSpace::revoke_subtree`) anything a holder derived from it inside its own
+space. The caller keeps its own capability; revoking grants does not disarm you.
+
+The cross-space edges live in a fixed kernel ledger rather than in `CapSpace`,
+because `CapSlot.parent` is a slot index within *one* space and cannot express
+them. The two mechanisms compose: the ledger walks between spaces,
+`revoke_subtree` finishes the job inside each one.
+
+Three properties that mattered enough to get wrong once each:
+
+- **Both endpoints of an edge carry an identity**, not just a slot. Slots are
+  recycled, so matching a revocation source by slot alone would hand whoever next
+  occupies that slot revocation authority over a third party's capabilities.
+- **`EXIT` splices, it does not cut.** An edge *into* the exiting process is
+  re-parented onto that process's own source before being dropped, so an
+  ancestor's `REVOKE` still reaches grandchildren delegated onward. Dropping the
+  edge outright would make revocation report success while silently
+  under-revoking.
+- **Revoking an endpoint capability ends the rendezvous it is parked in.** The IPC
+  matcher keys on a blocked process's endpoint, not on present authority, so a
+  process left blocked would go on sending or receiving through an endpoint it no
+  longer holds; it is woken with `NO_CAP` instead — unless it still holds another
+  capability naming that endpoint.
+
+A `SPAWN` that would delegate with the ledger full is refused, since an untracked
+delegation is one that could never be revoked.
+
+Honest scope on what remains: the role table is a static boot policy; delegation
+is one capability per spawn; revocation is by capability, so there is no "revoke
+everything I gave process X" (loop over your caps instead); and a process exiting
+does not revoke what it delegated — the children keep those capabilities until
+someone with the source capability revokes them.
 
 Load-bearing detail: an x86 interrupt/exception gate clears `IF`/`TF` but **not**
 `DF`, and `std` is unprivileged — so a ring-3 process can enter the kernel with
@@ -128,6 +159,7 @@ compute loop with `DF=1` as a standing regression test.
 | **ipc-caps** ✅ | IPC endpoints are capabilities, not raw integers: `SEND`/`RECV` take a `CapId`, require `CapType::Endpoint` with `WRITE`/`READ` respectively, and rendezvous on the cap's *object* — so two processes meet only when their caps name the same endpoint, and an unauthorized caller gets `NO_CAP` without blocking. Generic; x86 + RISC-V. | done |
 | **role-caps** ✅ | Per-role grants: each process is loaded with only its role's capability table (producer = send-only, consumer = receive-only, worker = device/memory but no shared-endpoint authority), so the policy is least-authority rather than uniform. Generic; x86 + RISC-V. | done |
 | **cap-delegation** ✅ | `SPAWN` can hand the child one of the caller's own capabilities, attenuated: the child gets `caller_rights ∩ requested`, so a parent may narrow but never widen authority, and delegating a cap it does not hold refuses the spawn. Generic; x86 + RISC-V. | done |
+| **cap-revocation** ✅ | `REVOKE(cap)` destroys every capability derived from one of the caller's own, transitively across spaces (kernel ledger) and within each space (`revoke_subtree`); the caller keeps its own. Generic; x86 + RISC-V. | done |
 
 ## Alternatives Considered
 
