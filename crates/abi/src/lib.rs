@@ -295,6 +295,17 @@ pub trait HostEnv {
     /// Allocate one DMA-capable physical frame for `ALLOC_VRAM`, honoring the caller's
     /// per-process VRAM quota. `None` if the quota is reached or memory is exhausted.
     fn alloc_dma(&mut self) -> Option<PhysAddr>;
+    /// Map `pages` 4 KiB pages of physical memory starting at `phys` into the calling
+    /// process's address space, user-accessible and writable ONLY if `writable`, returning
+    /// the user virtual address. The permission must come from the capability that
+    /// authorised the mapping: installing a writable page for a read-only capability would
+    /// hand out authority the capability does not carry. `None` if it could not be
+    /// installed. Re-mapping an already-mapped window replaces it (so permissions can
+    /// change and a retry is not poisoned).
+    fn map_device(&mut self, phys: u64, pages: u64, writable: bool) -> Option<u64>;
+    /// Remove the calling process's device mapping, if any. Used to undo a mapping whose
+    /// response could not be delivered, and to tear down authority on revocation.
+    fn unmap_device(&mut self);
     /// Free a VRAM frame (at physical address `phys`) previously handed to the caller by
     /// [`alloc_dma`](Self::alloc_dma). Returns `false` if the caller does not own it (so a
     /// process can only free its own VRAM, never another's).

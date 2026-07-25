@@ -26,6 +26,13 @@ impl Perms {
         exec: false,
         user: true,
     };
+    /// User-readable only: no write, no execute. What a device window mapped through a
+    /// capability that carries `READ` but not `WRITE` must get.
+    pub const USER_RO: Perms = Perms {
+        write: false,
+        exec: false,
+        user: true,
+    };
     pub const USER_RX: Perms = Perms {
         write: false,
         exec: true,
@@ -74,10 +81,20 @@ pub trait Space: Sized {
         perms: Perms,
         fa: &mut dyn FrameAllocator,
     ) -> bool;
+    /// Remove the mapping at `va`, if any. Returns the physical address that was mapped.
+    fn unmap_page(&mut self, va: VirtAddr) -> Option<PhysAddr>;
     /// Walk `va` to its physical address (if mapped).
     fn translate(&self, va: VirtAddr) -> Option<PhysAddr>;
     /// The value to load into the paging base register (`cr3` on x86, `satp` on RISC-V).
     fn token(&self) -> u64;
+    /// Wrap an ALREADY-LIVE space named by `token` (a `cr3`/`satp` value) for further
+    /// mapping. Used to install a mapping into a process's space from a syscall, where the
+    /// kernel holds the token rather than the original `Space` value.
+    ///
+    /// # Safety
+    /// `token` must name a live page-table tree whose frames are reachable (identity map).
+    unsafe fn from_token(token: u64) -> Self;
+
     /// Copy the kernel's shared mappings (from `kernel_token`) into this user space, so the
     /// trap/syscall path stays reachable while this space is active. Kernel pages carry no
     /// user bit, so user mode still cannot reach them.
@@ -101,6 +118,9 @@ pub trait Arch {
     /// Top of the user stack (grows down); [`USER_STACK_PAGES`](Self::USER_STACK_PAGES) below it are mapped.
     const USER_STACK_TOP: u64;
     const USER_STACK_PAGES: u64;
+    /// Base of the per-process window where device (MMIO) mappings are installed. Sits
+    /// between the loaded image and the stack, so it collides with neither.
+    const USER_MMIO_BASE: u64;
 
     /// Emit raw bytes to the debug console.
     fn console_write(bytes: &[u8]);

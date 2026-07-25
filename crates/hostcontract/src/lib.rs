@@ -14,7 +14,8 @@
 //! returns) so it only ever reaches us as an invalid selector.
 //!
 //! Maps to `docs/host-contract.md`: `GET_INFO`/`ALLOC_VRAM` are VERIFIED, `MAP_BAR` is
-//! VERIFIED* (the cap check is verified; the actual MMIO mapping is a TRUSTED-STUB here).
+//! VERIFIED* (the cap check is verified and gates a real mapping installed by the
+//! integrator; only the BAR geometry — the window size — is still fixed rather than probed).
 
 use abi::{
     syserr, sysno, AllocResp, CapId, CapRights, CapType, GpuInfo, HostEnv, MapBarResp, PhysAddr,
@@ -27,9 +28,9 @@ const DEBUG_CHUNK: usize = 256;
 /// hostile length is clamped here so the copy loop is always bounded.
 const DEBUG_MAX_TOTAL: u64 = 64 * 1024;
 
-/// Stub BAR window size reported by `MAP_BAR`: 256 MiB, the gfx1201 VRAM aperture with
-/// ReBAR off (see `docs/host-contract.md`). The real size comes from the device later.
-const STUB_BAR_SIZE: u64 = 256 * 1024 * 1024;
+/// Pages of a device window a single `MAP_BAR` installs. Fixed geometry for now (a real
+/// backend reads the BAR size from PCI config space).
+const STUB_BAR_PAGES: u64 = 1;
 
 /// Reinterpret a `#[repr(C)]` plain-old-data value as its raw little-endian bytes.
 ///
@@ -111,29 +112,42 @@ fn sys_get_info(env: &mut dyn HostEnv, uptr: u64) -> u64 {
 /// [`MapBarResp`] to user pointer `resp_ptr`.
 ///
 /// VERIFIED* per `docs/host-contract.md`: the capability CHECK below is the verified,
-/// load-bearing part. Building the response is a TRUSTED-STUB — no real MMIO PTE is
-/// installed; `user_va` is derived from the capability's object base as a placeholder
-/// and `size` is the stub BAR window. A real backend replaces the response construction
-/// but keeps this exact cap gate in front of it.
+/// load-bearing part, and it now gates a REAL mapping — the integrator installs page-table
+/// entries for the window the capability names, so a process that holds an `Mmio`
+/// capability can actually reach the device, and one that does not cannot name it at all.
+/// What remains stubbed is only the BAR *geometry*: the window size is fixed rather than
+/// read from PCI config space.
 fn sys_map_bar(env: &mut dyn HostEnv, cap_id: u64, resp_ptr: u64) -> u64 {
     let cap = CapId(cap_id as usize);
-    let base = match env.cap_lookup(cap) {
+    let (base, writable) = match env.cap_lookup(cap) {
         // Type AND rights, per `docs/host-contract.md`: "rights ⊇ need" on every op.
-        // Mapping a BAR at minimum exposes the device's registers, so it needs `READ`.
-        Some((CapType::Mmio, rights, base)) if rights.contains(CapRights::READ) => base,
+        // Mapping a BAR at minimum exposes the device's registers, so it needs `READ` —
+        // and the mapping is writable only if the capability also carries `WRITE`, or the
+        // mapping would confer authority the capability does not.
+        Some((CapType::Mmio, rights, base)) if rights.contains(CapRights::READ) => {
+            (base, rights.contains(CapRights::WRITE))
+        }
         // Missing cap, wrong object type, or insufficient rights: no authority.
         _ => return syserr::NO_CAP,
     };
-    // TRUSTED-STUB: placeholder mapping — real code installs a PTE for the device BAR.
+    // Install the mapping. The capability's object is the physical base it names, so a
+    // caller can only ever map a window some capability of its own already authorises.
+    let user_va = match env.map_device(base, STUB_BAR_PAGES, writable) {
+        Some(va) => va,
+        None => return syserr::NO_MEM,
+    };
     let resp = MapBarResp {
-        user_va: base,
-        size: STUB_BAR_SIZE,
+        user_va,
+        size: STUB_BAR_PAGES * PAGE_SIZE,
     };
     // SAFETY: `resp` is a live `#[repr(C)]` POD; see `as_bytes`.
     let bytes = unsafe { as_bytes(&resp) };
     if env.write_user_bytes(resp_ptr, bytes) {
         syserr::OK
     } else {
+        // The caller never learns the address, so leaving the window mapped would hand it
+        // authority it cannot see and cannot drop. Undo, so MAP_BAR is all-or-nothing.
+        env.unmap_device();
         syserr::FAULT
     }
 }
@@ -200,6 +214,8 @@ mod tests {
         info: GpuInfo,
         /// Physical addresses currently handed out and not yet freed (ownership tracking).
         held: Vec<u64>,
+        /// Device windows this env was asked to map, as `(phys, pages, writable)`.
+        mapped: Vec<(u64, u64, bool)>,
     }
 
     impl MockEnv {
@@ -212,6 +228,7 @@ mod tests {
                 frames_left: 0,
                 info: GpuInfo::default(),
                 held: Vec::new(),
+                mapped: Vec::new(),
             }
         }
         /// User VA of offset `off` into the flat user-memory buffer.
@@ -243,6 +260,15 @@ mod tests {
             self.next_frame += PAGE_SIZE;
             self.held.push(p);
             Some(PhysAddr(p))
+        }
+        fn map_device(&mut self, phys: u64, pages: u64, writable: bool) -> Option<u64> {
+            // Mock: hand back a deterministic VA derived from the request, and record what
+            // was asked for — including the permission, which the tests assert on.
+            self.mapped.push((phys, pages, writable));
+            Some(BASE_VA + 0x10_0000 + phys)
+        }
+        fn unmap_device(&mut self) {
+            self.mapped.clear();
         }
         fn free_dma(&mut self, phys: u64) -> bool {
             // Only a frame this env handed out (and still holds) can be freed.
@@ -390,7 +416,7 @@ mod tests {
         let mut env = MockEnv::new(4096);
         let cap = CapId(7);
         let base = 0xE000_0000u64;
-        env.caps.push((cap, (CapType::Mmio, CapRights::READ, base)));
+        env.caps.push((cap, (CapType::Mmio, CapRights::ALL, base)));
         let off = 256;
 
         let ptr = env.va(off);
@@ -405,8 +431,57 @@ mod tests {
         );
         assert_eq!(r, syserr::OK);
         let resp: MapBarResp = decode(env.peek(off, core::mem::size_of::<MapBarResp>()));
-        assert_eq!(resp.user_va, base);
-        assert_eq!(resp.size, STUB_BAR_SIZE);
+        assert_eq!(resp.size, STUB_BAR_PAGES * PAGE_SIZE);
+        // The VA is whatever the integrator installed the mapping at — the contract is that
+        // it asked for exactly the window the capability names, which the mock records.
+        assert_eq!(env.mapped, vec![(base, STUB_BAR_PAGES, true)]);
+        assert_eq!(resp.user_va, BASE_VA + 0x10_0000 + base);
+    }
+
+    #[test]
+    fn map_bar_read_only_cap_maps_read_only() {
+        // The mapping must carry exactly the capability's authority: READ without WRITE
+        // has to produce a non-writable window, or attenuating a capability would not
+        // attenuate the access it grants.
+        let mut env = MockEnv::new(4096);
+        let cap = CapId(7);
+        let base = 0xE000_0000u64;
+        env.caps.push((cap, (CapType::Mmio, CapRights::READ, base)));
+        let ptr = env.va(0);
+        assert_eq!(
+            dispatch(&mut env, sysno::MAP_BAR, cap.0 as u64, 0, ptr, 0, 0),
+            syserr::OK
+        );
+        assert_eq!(env.mapped, vec![(base, STUB_BAR_PAGES, false)]);
+    }
+
+    #[test]
+    fn map_bar_undoes_the_mapping_when_the_response_faults() {
+        // All-or-nothing: a caller that never learns the address must not be left holding
+        // a window it cannot see or drop.
+        let mut env = MockEnv::new(4096);
+        let cap = CapId(7);
+        env.caps
+            .push((cap, (CapType::Mmio, CapRights::ALL, 0xE000_0000)));
+        // A resp pointer outside the mock's user window faults on write-back.
+        assert_eq!(
+            dispatch(&mut env, sysno::MAP_BAR, cap.0 as u64, 0, 1, 0, 0),
+            syserr::FAULT
+        );
+        assert!(env.mapped.is_empty());
+    }
+
+    #[test]
+    fn map_bar_maps_nothing_without_the_capability() {
+        // The mapping must be gated by the cap, not merely the response: a refused caller
+        // must not have had a window installed behind the error.
+        let mut env = MockEnv::new(4096);
+        let ptr = env.va(0);
+        assert_eq!(
+            dispatch(&mut env, sysno::MAP_BAR, 42, 0, ptr, 0, 0),
+            syserr::NO_CAP
+        );
+        assert!(env.mapped.is_empty());
     }
 
     #[test]

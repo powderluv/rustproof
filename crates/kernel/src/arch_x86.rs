@@ -46,12 +46,23 @@ impl Space for X86Space {
         self.0.map(va, pa, f, fa).is_ok()
     }
 
+    fn unmap_page(&mut self, va: VirtAddr) -> Option<PhysAddr> {
+        self.0.unmap(va)
+    }
+
     fn translate(&self, va: VirtAddr) -> Option<PhysAddr> {
         self.0.translate(va)
     }
 
     fn token(&self) -> u64 {
         self.0.pml4_phys().as_u64()
+    }
+
+    unsafe fn from_token(token: u64) -> Self {
+        X86Space(vspace::AddressSpace::new(
+            PhysAddr(token & 0x000f_ffff_ffff_f000),
+            0,
+        ))
     }
 
     unsafe fn share_kernel(&mut self, kernel_token: u64) {
@@ -107,6 +118,7 @@ impl Arch for X86 {
     const USER_LIMIT: u64 = 0x81_0000_0000;
     const USER_STACK_TOP: u64 = 0x80_4000_0000;
     const USER_STACK_PAGES: u64 = 16;
+    const USER_MMIO_BASE: u64 = 0x80_2000_0000;
 
     fn console_write(bytes: &[u8]) {
         for &b in bytes {

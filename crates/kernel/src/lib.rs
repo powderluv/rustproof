@@ -166,6 +166,16 @@ static mut KTOKEN: u64 = 0;
 /// new process be mistaken (by the kernel or by userland) for the one that freed the slot.
 static mut NEXT_ID: u64 = NUM_PROCS as u64;
 
+/// Physical base of the stand-in "device" window every `Mmio` capability names. Reserved
+/// at boot from the frame allocator and filled with a signature, so a process that maps it
+/// through `MAP_BAR` can prove it really reached that physical memory — the same path a
+/// driver process would use for a real BAR, without needing the hardware.
+static mut DEVICE_PHYS: u64 = 0;
+/// Pages of that window. One page for now: the frame allocator makes no contiguity
+/// promise, and a real BAR is a contiguous physical range, so a larger stand-in would
+/// have to reserve one deliberately.
+const DEVICE_PAGES: u64 = 1;
+
 /// How many live cross-space delegations the kernel tracks. A `SPAWN` that would delegate
 /// with the ledger full is refused rather than performed untracked — an untracked
 /// delegation is one that could never be revoked.
@@ -269,6 +279,13 @@ unsafe fn revoke_delegations<A: Arch>(root_proc: usize, root_cap: usize) {
                 // in: the IPC matcher keys on the blocked state's endpoint, not on present
                 // authority, so a process left blocked would go on sending or receiving
                 // through an endpoint it no longer holds. Wake it with NO_CAP instead.
+                // Revoking a capability must revoke the AUTHORITY it granted, not just the
+                // slot: a device window stays mapped and usable after its capability is
+                // gone unless the mapping is torn down too.
+                if !holds_mmio(d.child) {
+                    unmap_device_window::<A>(d.child);
+                }
+                let p = proc_at(d.child);
                 let stranded = match p.state {
                     ProcState::BlockedSend { ep, .. } => {
                         !holds_endpoint(d.child, ep, abi::CapRights::WRITE)
@@ -306,6 +323,36 @@ unsafe fn revoke_delegations<A: Arch>(root_proc: usize, root_cap: usize) {
             break;
         }
     }
+}
+
+/// Remove process `proc`'s device window mapping, if any, and refresh the translation if
+/// that process's space is the active one.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table.
+unsafe fn unmap_device_window<A: Arch>(proc: usize) {
+    let token = proc_at(proc).token;
+    let mut space = A::Space::from_token(token);
+    for i in 0..DEVICE_PAGES {
+        let _ = space.unmap_page(abi::VirtAddr(A::USER_MMIO_BASE + i * abi::PAGE_SIZE));
+    }
+    if proc == CURRENT {
+        A::activate(token);
+    }
+}
+
+/// Does process `proc` still hold ANY `Mmio` capability carrying `READ` — i.e. any
+/// remaining authority to have the device window mapped at all?
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table.
+unsafe fn holds_mmio(proc: usize) -> bool {
+    let caps = &proc_at(proc).caps;
+    (0..CAP_SLOTS).any(|i| {
+        caps.lookup(abi::CapId(i)).is_some_and(|s| {
+            s.cap_type == abi::CapType::Mmio && s.rights.contains(abi::CapRights::READ)
+        })
+    })
 }
 
 /// Does process `proc` still hold ANY endpoint capability naming `ep` with `needed` rights?
@@ -551,6 +598,13 @@ unsafe fn load_process<A: Arch>(
             // the table becomes `CapId(i)` and the ids line up across roles.
             s.caps = capabilities::CapSpace::new();
             for &(cap_type, rights, object) in grants_for(role) {
+                // An `Mmio` grant names the device window the kernel reserved at boot; the
+                // table cannot hold that address because it is only known at run time.
+                let object = if cap_type == abi::CapType::Mmio {
+                    *core::ptr::addr_of!(DEVICE_PHYS)
+                } else {
+                    object
+                };
                 let _ = s.caps.insert(cap_type, rights, object);
             }
             s.role = role;
@@ -744,6 +798,24 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
             "\n[proc] loading {} isolated user processes",
             NUM_PROCS
         );
+        // Reserve the stand-in device window and sign it, so a process that maps it can
+        // prove it reached this exact physical memory.
+        {
+            use abi::FrameAllocator as _;
+            let first = fa.alloc_frame().expect("device window");
+            let sig = b"RUSTPROOF-DEVICE";
+            // SAFETY: the frames were just allocated and are identity-mapped kernel memory.
+            unsafe {
+                core::ptr::copy_nonoverlapping(sig.as_ptr(), first.as_u64() as *mut u8, sig.len());
+                DEVICE_PHYS = first.as_u64();
+            }
+            let _ = writeln!(
+                con,
+                "[dev] device window reserved at {:#x} ({} pages)",
+                first.as_u64(),
+                DEVICE_PAGES
+            );
+        }
         // Stash the image + kernel token so the SPAWN syscall can load more processes later.
         unsafe {
             USER_ELF = user_elf;
@@ -1200,6 +1272,63 @@ impl<A: Arch> abi::HostEnv for KEnv<A> {
         let caps = unsafe { &proc_at(self.proc_idx).caps };
         caps.lookup(cap).map(|s| (s.cap_type, s.rights, s.object))
     }
+    fn map_device(&mut self, phys: u64, pages: u64, writable: bool) -> Option<u64> {
+        // SAFETY: single-CPU, non-reentrant; the caller's space is the active one.
+        unsafe {
+            // The KERNEL decides what may be mapped, not the caller and not the size the
+            // contract layer asked for: the request must lie entirely inside the window
+            // reserved at boot, or a mismatch between the two would map whatever ordinary
+            // RAM happened to follow it into a user process.
+            let window = *core::ptr::addr_of!(DEVICE_PHYS);
+            if window == 0 || phys != window || pages > DEVICE_PAGES {
+                return None;
+            }
+            let proc = proc_at(self.proc_idx);
+            let token = proc.token;
+            let base = A::USER_MMIO_BASE;
+            // Page-table frames come from the allocator and are charged to this process, so
+            // they are reclaimed on exit like the rest of its address space.
+            let fa = (*core::ptr::addr_of_mut!(FA)).as_mut()?;
+            let mut rec = RecordingAlloc {
+                inner: fa,
+                frames: &mut proc.frames,
+                n: &mut proc.nframes,
+            };
+            let mut space = A::Space::from_token(token);
+            // The mapping carries exactly the authority the capability did: a `READ`-only
+            // capability must not produce a writable page, or attenuating a capability
+            // (e.g. on delegation) would not attenuate the access it grants.
+            let perms = if writable {
+                Perms::USER_RW
+            } else {
+                Perms::USER_RO
+            };
+            for i in 0..DEVICE_PAGES {
+                // Drop any previous window first, so a repeat call is idempotent rather
+                // than failing "already mapped", and so re-mapping can change permissions.
+                let _ = space.unmap_page(abi::VirtAddr(base + i * abi::PAGE_SIZE));
+            }
+            for i in 0..pages {
+                let va = abi::VirtAddr(base + i * abi::PAGE_SIZE);
+                let pa = abi::PhysAddr(phys + i * abi::PAGE_SIZE);
+                if !space.map_page(va, pa, perms, &mut rec) {
+                    return None;
+                }
+            }
+            // The mapping went into the live tree we are running on; make sure the CPU sees
+            // it rather than a stale translation for this window.
+            A::activate(token);
+            Some(base)
+        }
+    }
+
+    fn unmap_device(&mut self) {
+        // SAFETY: single-CPU, non-reentrant; the caller's space is the active one.
+        unsafe {
+            unmap_device_window::<A>(self.proc_idx);
+        }
+    }
+
     fn alloc_dma(&mut self) -> Option<abi::PhysAddr> {
         // SAFETY: single-CPU, non-reentrant; FA and the process slot are disjoint statics.
         unsafe {

@@ -307,6 +307,15 @@ fn recv_bytes(cap: u64, buf: &mut [u8]) -> (u64, u64, usize) {
     (status, word, n as usize)
 }
 
+/// Probe whether `va` is still MAPPED, without risking a fault: `DEBUG_WRITE` makes the
+/// kernel READ one byte from there through its permission-checked copy, so the status says
+/// whether the page is still present and user-readable. (It emits that byte to the console,
+/// which is why the probe is one byte of the device signature.)
+fn mapped_probe(va: u64) -> u64 {
+    // SAFETY: the kernel validates `va` itself; a bad address returns FAULT, not a fault.
+    unsafe { syscall(sysno::DEBUG_WRITE, va, 1, 0, 0, 0) }
+}
+
 /// RECV with a RAW destination address, for the memory-safety regression tests below.
 fn recv_raw(cap: u64, dst: u64, max: u64) -> u64 {
     let status: u64;
@@ -527,6 +536,39 @@ fn compute(id: u64) -> ! {
             debug_write(b"map_bar user_va=");
             dbg_hex(r.user_va);
             debug_write(b"\n");
+            // The mapping is REAL: read the signature the kernel wrote into that physical
+            // window, then write through it and read our write back. Neither would work if
+            // MAP_BAR had only reported an address without installing page tables.
+            // SAFETY: the kernel just mapped `size` bytes here user-readable/writable.
+            let dev = r.user_va as *mut u8;
+            let mut sig = [0u8; 16];
+            let mut i = 0usize;
+            while i < 16 {
+                sig[i] = unsafe { core::ptr::read_volatile(dev.wrapping_add(i)) };
+                i += 1;
+            }
+            tag(id);
+            if &sig == b"RUSTPROOF-DEVICE" {
+                debug_write(b"mmio: read device signature through the mapping\n");
+            } else {
+                debug_write(b"mmio: device signature WRONG (bug)\n");
+            }
+            unsafe { core::ptr::write_volatile(dev.wrapping_add(32), 0x5Au8) };
+            tag(id);
+            if unsafe { core::ptr::read_volatile(dev.wrapping_add(32)) } == 0x5A {
+                debug_write(b"mmio: wrote and read back through the mapping\n");
+            } else {
+                debug_write(b"mmio: device write did not stick (bug)\n");
+            }
+            // Probe the page's writability WITHOUT faulting: RECV validates its buffer
+            // against the page tables before checking the capability, so an unheld cap
+            // yields NO_CAP when the buffer is writable and FAULT when it is not.
+            tag(id);
+            if recv_raw(9, r.user_va, 16) == syserr::NO_CAP {
+                debug_write(b"mmio: full-rights cap gives a WRITABLE window\n");
+            } else {
+                debug_write(b"mmio: full-rights window not writable (bug)\n");
+            }
         }
         Err(e) => {
             tag(id);
@@ -641,10 +683,10 @@ fn compute(id: u64) -> ! {
     // the slot index, this child would inherit the producer's send right on the shared
     // endpoint (and, running producer(), would block forever and deadlock the boot).
     if id == 2 {
-        // Also attempt an AMPLIFICATION: delegate CapId(4) — our Untyped cap that has
-        // READ but no WRITE — while requesting full rights. The child must receive only
-        // READ (intersection), so its delegated cap still cannot allocate.
-        let late = spawn_delegating(2, 4, 0b111);
+        // Delegate our DEVICE capability (CapId(1), full rights) attenuated to READ only.
+        // The child must get a read-only window: attenuating the capability has to
+        // attenuate the access it grants, or delegation would widen authority.
+        let late = spawn_delegating(2, 1, 0b001);
         tag(id);
         debug_write(b"late spawn into a recycled slot -> pid ");
         dbg_dec(late);
@@ -655,8 +697,13 @@ fn compute(id: u64) -> ! {
     // child's copy of it must vanish, which the child observes and reports.
     if id == 2 {
         tag(id);
+        // Let the child we just spawned actually map its delegated window first —
+        // otherwise we revoke before it ever holds the authority and the teardown is
+        // untested rather than tested.
+        spin(40_000_000);
+        let _ = revoke(1); // also revoke what we delegated of our DEVICE capability
         if revoke(2) == syserr::OK {
-            debug_write(b"revoke: revoked delegations of CapId(2)\n");
+            debug_write(b"revoke: revoked delegations of CapId(1) and CapId(2)\n");
         } else {
             debug_write(b"revoke: refused (bug)\n");
         }
@@ -699,6 +746,51 @@ fn child(id: u64) -> ! {
         debug_write(b"child: no device authority of its own\n");
     } else {
         debug_write(b"child: mapped a BAR (bug)\n");
+    }
+
+    // What did our parent delegate? A device capability takes the mapping path.
+    if let Ok(r) = map_bar(CapId(0), 0) {
+        let dev = r.user_va as *mut u8;
+        let mut sig = [0u8; 16];
+        let mut i = 0usize;
+        while i < 16 {
+            sig[i] = unsafe { core::ptr::read_volatile(dev.wrapping_add(i)) };
+            i += 1;
+        }
+        tag(id);
+        if &sig == b"RUSTPROOF-DEVICE" {
+            debug_write(b"mmio: read device signature through a delegated cap\n");
+        } else {
+            debug_write(b"mmio: delegated device signature WRONG (bug)\n");
+        }
+        // Our capability was attenuated to READ, so the window must NOT be writable.
+        // Probed without faulting, as in the worker.
+        tag(id);
+        if recv_raw(9, r.user_va, 16) == syserr::FAULT {
+            debug_write(b"mmio: READ-only cap gives a READ-ONLY window (no amplification)\n");
+        } else {
+            debug_write(b"mmio: READ-only cap gave a WRITABLE window (bug)\n");
+        }
+        // Revoking the capability must also tear down the mapping it authorised —
+        // otherwise the authority survives its capability. Watch for it to vanish.
+        let mut gone = false;
+        let mut k = 0u64;
+        while k < 60 {
+            if mapped_probe(r.user_va) != syserr::OK {
+                gone = true;
+                break;
+            }
+            spin(2_000_000);
+            k = k.wrapping_add(1);
+        }
+        debug_write(b"\n");
+        tag(id);
+        if gone {
+            debug_write(b"mmio: mapping torn down when the cap was REVOKED\n");
+        } else {
+            debug_write(b"mmio: mapping survived revocation (bug)\n");
+        }
+        exit(id);
     }
 
     // Use the delegated capability, then pass it on once. Passing it on makes the

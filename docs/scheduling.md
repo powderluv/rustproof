@@ -115,6 +115,24 @@ buffer directly. Two paths follow from that:
 - **Sender blocks first** — park the payload in the *sender's* kernel buffer;
   when a receiver arrives, its space is active, so the copy out is immediate.
 
+`MAP_BAR` installs a **real** mapping rather than reporting an address, and the
+mapping carries exactly the capability's authority: a `READ`-only `Mmio`
+capability produces a read-only window, so attenuating a capability (on
+delegation, say) attenuates the access it grants. Revoking the capability tears
+the mapping down — otherwise the authority would outlive the capability that
+conferred it, which is the one thing revocation exists to prevent. And the call
+is all-or-nothing: if the response cannot be delivered, the window is unmapped
+again, since a caller that never learns the address cannot see or drop it. The
+capability's object is the physical base it names, so a caller can only map a
+window one of its own capabilities authorises — and the kernel independently
+bounds the request to the device window it reserved at boot, so a mismatch
+between the contract layer's idea of the window size and the kernel's can never
+hand a process the ordinary RAM that happens to follow it. The page-table frames
+the mapping consumes are charged to that process and reclaimed on exit like the
+rest of its address space. The demo reads a signature the kernel wrote into that
+physical page, then writes through the mapping and reads it back — neither would
+work if `MAP_BAR` had only reported an address.
+
 Copies on a process's behalf are **permission-checked, not just range-checked**.
 `copy_to_user`/`copy_from_user` walk the active page tables and require the pages
 to be mapped, user-accessible, and (for writes) writable — a range check alone
@@ -190,6 +208,7 @@ compute loop with `DF=1` as a standing regression test.
 | **cap-delegation** ✅ | `SPAWN` can hand the child one of the caller's own capabilities, attenuated: the child gets `caller_rights ∩ requested`, so a parent may narrow but never widen authority, and delegating a cap it does not hold refuses the spawn. Generic; x86 + RISC-V. | done |
 | **cap-revocation** ✅ | `REVOKE(cap)` destroys every capability derived from one of the caller's own, transitively across spaces (kernel ledger) and within each space (`revoke_subtree`); the caller keeps its own. Generic; x86 + RISC-V. | done |
 | **ipc-payload** ✅ | IPC messages carry a byte payload across address spaces (per-process kernel buffer; deferred copy-out when the receiver blocked first), with the copied length returned in a third register. Generic; x86 + RISC-V. | done |
+| **real-mapbar** ✅ | `MAP_BAR` installs a REAL page-table mapping of the window its `Mmio` capability names, instead of reporting a placeholder address: a holder can read and write that physical memory, a non-holder cannot name it, and the kernel bounds every request to the window it reserved. Generic; x86 + RISC-V. | done |
 
 ## Alternatives Considered
 
