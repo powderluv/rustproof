@@ -372,6 +372,30 @@ impl AddressSpace {
     ///
     // PROOF(later): `translate` reflects the last `map`/`unmap` on `va` — i.e.
     // the concrete page-walk is a refinement of the abstract va→pa mapping.
+    /// Flags of the leaf entry mapping `va`, or `None` if `va` is unmapped.
+    ///
+    /// The kernel uses this to check that a user pointer is not merely inside the user
+    /// window but actually MAPPED with the rights an access needs — a range check alone
+    /// lets a ring-0 copy fault on an unmapped page or write through a read-only one.
+    /// Intermediate tables here are built permissive (`USER | WRITABLE`), so the leaf's
+    /// flags govern the effective permission.
+    pub fn leaf_flags(&self, va: VirtAddr) -> Option<PageFlags> {
+        let mut table_pa = self.pml4;
+        for level in [3u32, 2, 1, 0] {
+            let idx = va.table_index(level);
+            // SAFETY: `table_pa` is a live table frame reached by the walk; `idx` < 512.
+            let entry = unsafe { self.read_entry(table_pa, idx) };
+            if !entry.is_present() {
+                return None;
+            }
+            if level == 0 || entry.is_huge() {
+                return Some(entry.flags());
+            }
+            table_pa = entry.addr();
+        }
+        None
+    }
+
     pub fn translate(&self, va: VirtAddr) -> Option<PhysAddr> {
         let mut table_pa = self.pml4;
         // Levels PML4=3, PDPT=2, PD=1, PT=0.

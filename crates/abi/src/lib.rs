@@ -144,6 +144,10 @@ pub struct CapId(pub usize);
 
 // ---------------------------------------------------------------- threads / IPC
 
+/// Largest byte payload a single IPC message may carry, in addition to its word. Both
+/// endpoints of a rendezvous copy through a kernel buffer of this size.
+pub const MAX_MSG_BYTES: usize = 128;
+
 /// Identifier of a thread / scheduling context.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[repr(transparent)]
@@ -194,16 +198,25 @@ pub mod sysno {
     pub const ALLOC_VRAM: u64 = 4;
     /// Cooperatively yield the CPU to the next ready process. No args, no result.
     pub const YIELD: u64 = 5;
-    /// Send one word to an endpoint (rendezvous): `a0` = an `Endpoint` capability (needs
-    /// `WRITE`), `a1` = the word. Returns `syserr::OK`, or `NO_CAP` without blocking if the
-    /// capability is missing/wrong-typed/lacks `WRITE`; otherwise blocks until a receiver
-    /// takes the word.
-    pub const SEND: u64 = 6;
-    /// Receive one word from an endpoint (rendezvous): `a0` = an `Endpoint` capability
-    /// (needs `READ`). Blocks until a sender delivers.
+    /// Send to an endpoint (rendezvous): `a0` = an `Endpoint` capability (needs `WRITE`),
+    /// `a1` = the word, `a2` = pointer to an optional byte payload, `a3` = its length
+    /// (0 for a word-only message; more than [`MAX_MSG_BYTES`](crate::MAX_MSG_BYTES) is
+    /// rejected with `FAULT`). The payload is copied out of the sender's address space
+    /// before the call returns, so the sender's buffer may be reused immediately.
     ///
-    /// Returns TWO values in separate registers: the status (`OK` / `NO_CAP`) in the usual
-    /// return register, and the delivered word in the second one (x86 `rdx`, RISC-V `a1`).
+    /// Returns `syserr::OK`, or `NO_CAP` without blocking if the capability is
+    /// missing/wrong-typed/lacks `WRITE`; otherwise blocks until a receiver takes it.
+    pub const SEND: u64 = 6;
+    /// Receive from an endpoint (rendezvous): `a0` = an `Endpoint` capability (needs
+    /// `READ`), `a1` = pointer to a buffer for the byte payload, `a2` = its capacity (0 to
+    /// accept the word only). Blocks until a sender delivers.
+    ///
+    /// Returns THREE values in separate registers: the status (`OK` / `NO_CAP`) in the
+    /// usual return register, the delivered word in the second (x86 `rdx`, RISC-V `a1`),
+    /// and the number of payload bytes actually copied in the third (the `a3` argument
+    /// register: x86 `r10`, RISC-V `a3`). A payload larger than the receiver's capacity is
+    /// truncated to it — the sender cannot know the receiver's buffer size, so the copied
+    /// count is what the receiver must believe.
     /// The split is load-bearing, not cosmetic: the word is an unrestricted `u64` chosen by
     /// the sender, so a single-register protocol would make a legitimately received word
     /// equal to a [`syserr`] sentinel indistinguishable from a real error. User stubs MUST

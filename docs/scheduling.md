@@ -102,6 +102,35 @@ delegated `Untyped`, which no role table could have given it. The negative case
 hands another child a `READ`-only `Untyped` *with full rights requested*; it is
 still refused.
 
+An IPC message carries a word **and** an optional byte payload (up to
+`abi::MAX_MSG_BYTES`), so a message can hold a request rather than just a
+token. The payload crosses address spaces through a per-process kernel buffer,
+which is what makes it work at all: at `SEND` time the *sender's* space is
+active and the receiver's is not, so the kernel cannot write the receiver's
+buffer directly. Two paths follow from that:
+
+- **Receiver already blocked** — copy the payload into the receiver's kernel
+  buffer now, and copy it out into its user buffer in `resume_process`, after
+  switching to its space and just before returning to it (the deferred path).
+- **Sender blocks first** — park the payload in the *sender's* kernel buffer;
+  when a receiver arrives, its space is active, so the copy out is immediate.
+
+Copies on a process's behalf are **permission-checked, not just range-checked**.
+`copy_to_user`/`copy_from_user` walk the active page tables and require the pages
+to be mapped, user-accessible, and (for writes) writable — a range check alone
+would let a ring-0 copy fault on an unmapped page (fatal: the exception handler
+halts) or write straight through a page the loader mapped read-only, since x86
+ring-0 stores bypass the R/W bit unless `CR0.WP` is set, which `boot.s` now also
+does. `RECV` vets the buffer it offers at entry, before any rendezvous is
+consumed, so the deferred copy cannot fail after a sender has been told `OK`.
+
+A payload larger than the kernel buffer is rejected (`FAULT`) rather than
+silently truncated — the sender could not otherwise learn it was cut. A payload
+larger than the *receiver's* buffer IS truncated, since the sender cannot know
+that size; `RECV` returns the byte count actually copied, in a third register
+distinct from both the status and the word. The demo exercises both copy paths
+and checks the bytes arrive intact.
+
 Delegated capabilities can be **revoked**. `REVOKE(cap)` destroys everything
 derived from one of the caller's own capabilities — transitively: the children it
 was handed to, the grandchildren they passed it on to, and (via
@@ -160,6 +189,7 @@ compute loop with `DF=1` as a standing regression test.
 | **role-caps** ✅ | Per-role grants: each process is loaded with only its role's capability table (producer = send-only, consumer = receive-only, worker = device/memory but no shared-endpoint authority), so the policy is least-authority rather than uniform. Generic; x86 + RISC-V. | done |
 | **cap-delegation** ✅ | `SPAWN` can hand the child one of the caller's own capabilities, attenuated: the child gets `caller_rights ∩ requested`, so a parent may narrow but never widen authority, and delegating a cap it does not hold refuses the spawn. Generic; x86 + RISC-V. | done |
 | **cap-revocation** ✅ | `REVOKE(cap)` destroys every capability derived from one of the caller's own, transitively across spaces (kernel ledger) and within each space (`revoke_subtree`); the caller keeps its own. Generic; x86 + RISC-V. | done |
+| **ipc-payload** ✅ | IPC messages carry a byte payload across address spaces (per-process kernel buffer; deferred copy-out when the receiver blocked first), with the copied length returned in a third register. Generic; x86 + RISC-V. | done |
 
 ## Alternatives Considered
 

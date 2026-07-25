@@ -66,6 +66,41 @@ impl Space for RiscvSpace {
     }
 }
 
+/// Is `[uptr, uptr+len)` inside the user window AND actually mapped, with U access and
+/// (when `need_write`) write permission, in the CURRENTLY ACTIVE address space?
+///
+/// A range check alone is not enough for a supervisor copy on a user's behalf: an in-range
+/// but unmapped (or read-only) address raises a store/load page fault in S-mode, which the
+/// trap handler treats as fatal and halts the guest. That is the caller's failure to
+/// report, not the kernel's to die on. `sstatus.SUM` lets S-mode reach U pages, but the
+/// hardware still enforces the PTE bits, which is exactly what this pre-checks.
+fn user_range_mapped(uptr: u64, len: usize, need_write: bool) -> bool {
+    if !Riscv::user_ptr_ok(uptr, len) {
+        return false;
+    }
+    if len == 0 {
+        return true;
+    }
+    let mut need = PageFlags::V | PageFlags::U;
+    if need_write {
+        need = need | PageFlags::W;
+    }
+    // SAFETY: reading satp is always valid; the active tree is identity-mapped low RAM.
+    let satp = unsafe { csr::read::<{ csr::SATP }>() };
+    let root = (satp & ((1u64 << 44) - 1)) << 12;
+    let space = vspace_riscv::AddressSpace::new(PhysAddr(root), 0);
+    let mut va = uptr & !(abi::PAGE_SIZE - 1);
+    let end = uptr.saturating_add(len as u64);
+    while va < end {
+        match space.leaf_flags(VirtAddr(va)) {
+            Some(f) if f.contains(need) => {}
+            _ => return false,
+        }
+        va = va.saturating_add(abi::PAGE_SIZE);
+    }
+    true
+}
+
 /// The RISC-V hardware surface.
 pub struct Riscv;
 
@@ -163,6 +198,14 @@ impl Arch for Riscv {
         frame_mut(f).regs[10] = v; // a0 = result
     }
 
+    fn frame_set_ret3(f: &mut UserFrame, v: u64) {
+        frame_mut(f).regs[13] = v; // a3
+    }
+
+    unsafe fn activate(token: u64) {
+        mmu::enable_paging(token);
+    }
+
     fn frame_set_ret2(f: &mut UserFrame, v: u64) {
         // a1 — part of the trap frame and restored by `resume`, so the user sees it on
         // return (their stub declares it as an output).
@@ -187,8 +230,12 @@ impl Arch for Riscv {
         interrupts::resume(frame(f) as *const TrapFrame)
     }
 
+    fn user_write_ok(uptr: u64, len: usize) -> bool {
+        user_range_mapped(uptr, len, true)
+    }
+
     unsafe fn copy_to_user(uptr: u64, bytes: &[u8]) -> bool {
-        if !Self::user_ptr_ok(uptr, bytes.len()) {
+        if !user_range_mapped(uptr, bytes.len(), true) {
             return false;
         }
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), uptr as *mut u8, bytes.len());
@@ -196,7 +243,7 @@ impl Arch for Riscv {
     }
 
     unsafe fn copy_from_user(uptr: u64, out: &mut [u8]) -> bool {
-        if !Self::user_ptr_ok(uptr, out.len()) {
+        if !user_range_mapped(uptr, out.len(), false) {
             return false;
         }
         core::ptr::copy_nonoverlapping(uptr as *const u8, out.as_mut_ptr(), out.len());

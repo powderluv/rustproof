@@ -63,6 +63,40 @@ impl Space for X86Space {
     }
 }
 
+/// Is `[uptr, uptr+len)` inside the user window AND actually mapped, with USER access and
+/// (when `need_write`) write permission, in the CURRENTLY ACTIVE address space?
+///
+/// A range check alone is not enough for a ring-0 copy on a user's behalf. An in-range but
+/// unmapped address would fault in the kernel — fatal, since the exception handler dumps
+/// and halts — and without this a write would also go through a page the loader mapped
+/// read-only (the kernel bypasses the R/W bit unless `CR0.WP` is set, which boot.s now
+/// does). Both are the caller's failure to report, not the kernel's to crash on.
+fn user_range_mapped(uptr: u64, len: usize, need_write: bool) -> bool {
+    if !X86::user_ptr_ok(uptr, len) {
+        return false;
+    }
+    if len == 0 {
+        return true;
+    }
+    let mut need = vspace::PageFlags::PRESENT | vspace::PageFlags::USER;
+    if need_write {
+        need = need | vspace::PageFlags::WRITABLE;
+    }
+    // SAFETY: reading CR3 is always valid; the active tree is identity-mapped low RAM.
+    let root = unsafe { cpu::read_cr3() } & 0x000f_ffff_ffff_f000;
+    let space = vspace::AddressSpace::new(PhysAddr(root), 0);
+    let mut va = uptr & !(abi::PAGE_SIZE - 1);
+    let end = uptr.saturating_add(len as u64);
+    while va < end {
+        match space.leaf_flags(VirtAddr(va)) {
+            Some(f) if f.contains(need) => {}
+            _ => return false,
+        }
+        va = va.saturating_add(abi::PAGE_SIZE);
+    }
+    true
+}
+
 /// The x86-64 hardware surface.
 pub struct X86;
 
@@ -146,6 +180,15 @@ impl Arch for X86 {
         frame_mut(f).rax = v;
     }
 
+    fn frame_set_ret3(f: &mut UserFrame, v: u64) {
+        // `r10` — the a3 argument register, part of the trap frame and restored by `resume`.
+        frame_mut(f).r10 = v;
+    }
+
+    unsafe fn activate(token: u64) {
+        cpu::write_cr3(token);
+    }
+
     fn frame_set_ret2(f: &mut UserFrame, v: u64) {
         // `rdx` — a caller-saved arg register, part of the trap frame and restored by
         // `resume`, so the user sees it on return (their stub declares it as an output).
@@ -172,8 +215,12 @@ impl Arch for X86 {
         syscall::resume(frame(f) as *const TrapFrame)
     }
 
+    fn user_write_ok(uptr: u64, len: usize) -> bool {
+        user_range_mapped(uptr, len, true)
+    }
+
     unsafe fn copy_to_user(uptr: u64, bytes: &[u8]) -> bool {
-        if !Self::user_ptr_ok(uptr, bytes.len()) {
+        if !user_range_mapped(uptr, bytes.len(), true) {
             return false;
         }
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), uptr as *mut u8, bytes.len());
@@ -181,7 +228,7 @@ impl Arch for X86 {
     }
 
     unsafe fn copy_from_user(uptr: u64, out: &mut [u8]) -> bool {
-        if !Self::user_ptr_ok(uptr, out.len()) {
+        if !user_range_mapped(uptr, out.len(), false) {
             return false;
         }
         core::ptr::copy_nonoverlapping(uptr as *const u8, out.as_mut_ptr(), out.len());

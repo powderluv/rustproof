@@ -113,6 +113,29 @@ unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     ret
 }
 
+/// Four-argument `syscall`. Args land in `rdi, rsi, rdx, r10` per the fixed convention.
+///
+/// # Safety
+/// Traps into the kernel; pointer args must be valid for the named syscall's access.
+#[inline]
+unsafe fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let ret: u64;
+    // SAFETY: see module note above.
+    core::arch::asm!(
+        "syscall",
+        in("rax") num,
+        in("rdi") a0,
+        in("rsi") a1,
+        in("rdx") a2,
+        in("r10") a3,
+        lateout("rax") ret,
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack),
+    );
+    ret
+}
+
 // ------------------------------------------------------------ typed host client
 
 /// Write `bytes` to the debug console (a0 = ptr, a1 = len). The typed entry point
@@ -392,8 +415,23 @@ fn tag(id: u64) {
 /// Send one `word` on the endpoint named by capability `cap` (needs `WRITE`; blocks until a
 /// receiver takes it). Returns `syserr::OK`, or `NO_CAP` if we lack the authority.
 fn send(cap: u64, word: u64) -> u64 {
-    // SAFETY: SEND passes two scalars and returns a status; no user memory is touched.
-    unsafe { syscall2(sysno::SEND, cap, word) }
+    // SAFETY: a word-only SEND (len 0) passes scalars only; no user memory is read.
+    unsafe { syscall4(sysno::SEND, cap, word, 0, 0) }
+}
+
+/// Send `word` plus a byte payload on `cap`. The kernel copies `bytes` out of our address
+/// space before returning, so the buffer may be reused immediately.
+fn send_bytes(cap: u64, word: u64, bytes: &[u8]) -> u64 {
+    // SAFETY: the pointer/len describe a live borrow for the duration of the call.
+    unsafe {
+        syscall4(
+            sysno::SEND,
+            cap,
+            word,
+            bytes.as_ptr() as u64,
+            bytes.len() as u64,
+        )
+    }
 }
 
 /// Receive one word on the endpoint named by capability `cap` (needs `READ`; blocks until a
@@ -405,23 +443,55 @@ fn send(cap: u64, word: u64) -> u64 {
 /// two-register split is what keeps a delivered word that happens to equal a [`syserr`]
 /// sentinel distinguishable from a real error.
 fn recv(cap: u64) -> (u64, u64) {
+    let (status, word, _) = recv_bytes(cap, &mut []);
+    (status, word)
+}
+
+/// Receive on `cap` into `buf`. Returns `(status, word, n)` where `n` is the number of
+/// payload bytes copied — the kernel truncates to our buffer, so `n` is what we may read.
+fn recv_bytes(cap: u64, buf: &mut [u8]) -> (u64, u64, usize) {
     let status: u64;
     let word: u64;
-    // SAFETY: as the other stubs — `syscall` traps to ring 0 and touches no user memory
-    // here. `rdx` is declared as an output because the kernel writes the payload there.
+    let n: u64;
+    // SAFETY: as the other stubs. `rdx` and `r10` are declared outputs because the kernel
+    // returns the word and the byte count there; `buf` is a live writable borrow.
     unsafe {
         core::arch::asm!(
             "syscall",
             in("rax") sysno::RECV,
-            in("rdi") cap,
+            in("rdi") cap,                                  // a0 = endpoint capability
+            in("rsi") buf.as_mut_ptr() as u64,              // a1 = payload buffer
+            inlateout("rdx") buf.len() as u64 => word,      // a2 = capacity in, word out
             lateout("rax") status,
-            lateout("rdx") word,
+            lateout("r10") n,                               // a3 register = bytes copied
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack),
         );
     }
-    (status, word)
+    (status, word, n as usize)
+}
+
+/// RECV with a RAW destination address, for the memory-safety regression tests below.
+fn recv_raw(cap: u64, dst: u64, max: u64) -> u64 {
+    let status: u64;
+    // SAFETY: as `recv_bytes`; `dst` is deliberately arbitrary here — the point is that the
+    // kernel must validate it rather than trusting us.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") sysno::RECV,
+            in("rdi") cap,
+            in("rsi") dst,
+            inlateout("rdx") max => _,
+            lateout("rax") status,
+            lateout("r10") _,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    status
 }
 
 /// Spawn a new process running this same image, presenting `cap` as spawn authority (an
@@ -509,12 +579,19 @@ fn producer() -> ! {
         dw!(b"\n");
         i = i.wrapping_add(1);
     }
-    // Fifth value: the NO_CAP error sentinel sent as ORDINARY DATA. The word domain is the
-    // whole u64, so this is a legal payload; the consumer must still see a successful
-    // receive. (Regression test: status and payload ride in separate registers.)
-    send(0, syserr::NO_CAP);
+    // Fifth message: the NO_CAP error sentinel sent as ORDINARY DATA (the word domain is
+    // the whole u64, so this is a legal payload and the consumer must still see a
+    // successful receive), carrying a BYTE PAYLOAD alongside it. The payload crosses
+    // address spaces — the consumer has no mapping of ours — so the kernel copies it.
+    send_bytes(0, syserr::NO_CAP, b"payload-across-address-spaces");
     tag(0);
-    dw!(b"sent NO_CAP-valued word as data\n");
+    dw!(b"sent NO_CAP-valued word + byte payload\n");
+    // A sixth message sent while the consumer is busy checking the fifth: we block holding
+    // the payload, so the receiver takes the OTHER copy path (out of a parked sender)
+    // rather than the deferred one. Both directions of the transfer get exercised.
+    send_bytes(0, 0xB, b"second-payload");
+    tag(0);
+    dw!(b"sent second payload (sender-parked path)\n");
     exit(0);
 }
 
@@ -552,12 +629,29 @@ fn consumer() -> ! {
         }
         i = i.wrapping_add(1);
     }
-    let (status, v) = recv(0);
+    let mut buf = [0u8; 64];
+    let (status, v, n) = recv_bytes(0, &mut buf);
     tag(1);
     if status == syserr::OK && v == syserr::NO_CAP {
         dw!(b"recv NO_CAP-valued word as DATA (status separate from payload)\n");
     } else {
         dw!(b"recv sentinel word MISREAD as error (bug)\n");
+    }
+    // The payload arrived through the kernel: we can read no memory of the sender's.
+    tag(1);
+    if n == 29 && &buf[..n] == b"payload-across-address-spaces" {
+        dw!(b"recv byte payload intact across address spaces (");
+        dbg_dec(n as u64);
+        dw!(b" bytes)\n");
+    } else {
+        dw!(b"recv byte payload WRONG (bug)\n");
+    }
+    let (status2, w2, n2) = recv_bytes(0, &mut buf);
+    tag(1);
+    if status2 == syserr::OK && w2 == 0xB && n2 == 14 && &buf[..n2] == b"second-payload" {
+        dw!(b"recv second payload intact (other copy path)\n");
+    } else {
+        dw!(b"recv second payload WRONG (bug)\n");
     }
     exit(1);
 }
@@ -640,6 +734,24 @@ fn compute(id: u64) -> ! {
         dw!(b"ipc: recv on unheld cap -> NO_CAP (no block)\n");
     } else {
         dw!(b"ipc: recv on unheld cap ALLOWED (bug)\n");
+    }
+
+    // Memory-safety regression tests. The kernel copies an IPC payload into a buffer WE
+    // name, so it must validate that buffer against the page tables — not merely against
+    // the address range. A destination that is mapped read-only (our own image text) must
+    // be refused rather than written through, and one that is in range but unmapped must
+    // be refused rather than faulting inside the kernel, which would kill the guest.
+    tag(id);
+    if recv_raw(0, 0x80_0000_0000, 16) == syserr::FAULT {
+        dw!(b"memsafe: RECV into read-only mapping refused (W^X honoured)\n");
+    } else {
+        dw!(b"memsafe: RECV into read-only mapping ALLOWED (bug)\n");
+    }
+    tag(id);
+    if recv_raw(0, 0x80_8000_0000, 16) == syserr::FAULT {
+        dw!(b"memsafe: RECV into unmapped address refused (no kernel fault)\n");
+    } else {
+        dw!(b"memsafe: RECV into unmapped address ALLOWED (bug)\n");
     }
 
     // Rights are checked on the REST of the host contract too, not just IPC: CapId(4) is an

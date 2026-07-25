@@ -47,10 +47,11 @@ enum ProcState {
     Free,
     /// Runnable — in the run queue.
     Ready,
-    /// Blocked in `SEND` on `ep`, holding the `word` until a receiver takes it.
-    BlockedSend { ep: u64, word: u64 },
-    /// Blocked in `RECV` on `ep`, waiting for a sender.
-    BlockedRecv { ep: u64 },
+    /// Blocked in `SEND` on `ep`, holding the `word` (and `len` payload bytes parked in
+    /// this process's `msg` buffer) until a receiver takes them.
+    BlockedSend { ep: u64, word: u64, len: usize },
+    /// Blocked in `RECV` on `ep`, having offered a `max`-byte buffer at user address `dst`.
+    BlockedRecv { ep: u64, dst: u64, max: usize },
 }
 
 /// Capability slots per process.
@@ -85,6 +86,16 @@ struct Process {
     /// so a spawn/exit cycle does not leak an address space. `frames[..nframes]` are live.
     frames: [abi::PhysAddr; MAX_PROC_FRAMES],
     nframes: usize,
+    /// Kernel-side IPC payload buffer. Serves as the outbox while this process is blocked
+    /// in `SEND`, and as the inbox for a payload delivered while it was blocked in `RECV`
+    /// (its address space is not active at that moment, so the copy out is deferred).
+    msg: [u8; abi::MAX_MSG_BYTES],
+    /// Bytes parked in `msg` by a blocked sender.
+    msg_len: usize,
+    /// A payload waiting to be copied into this process's own address space the next time
+    /// it is resumed: `pending_len` bytes of `msg` to user address `pending_dst`.
+    pending_dst: u64,
+    pending_len: usize,
     /// VRAM (DMA) frames the process currently holds via `ALLOC_VRAM`. `vram[..nvram]` are
     /// live; `nvram` is the process's VRAM usage (capped at the quota) and each is
     /// individually freeable via `FREE_VRAM`. Also reclaimed on exit.
@@ -104,6 +115,10 @@ impl Process {
         nframes: 0,
         vram: [abi::PhysAddr(0); VRAM_QUOTA_FRAMES],
         nvram: 0,
+        msg: [0; abi::MAX_MSG_BYTES],
+        msg_len: 0,
+        pending_dst: 0,
+        pending_len: 0,
     };
 }
 
@@ -258,16 +273,27 @@ unsafe fn revoke_delegations<A: Arch>(root_proc: usize, root_cap: usize) {
                     ProcState::BlockedSend { ep, .. } => {
                         !holds_endpoint(d.child, ep, abi::CapRights::WRITE)
                     }
-                    ProcState::BlockedRecv { ep } => {
+                    ProcState::BlockedRecv { ep, .. } => {
                         !holds_endpoint(d.child, ep, abi::CapRights::READ)
                     }
                     _ => false,
                 };
                 if stranded {
+                    // Write exactly the registers the blocked call returns. RECV returns
+                    // three (status, word, byte count) — leaving the third stale would hand
+                    // the woken process a garbage length beside an error status. SEND
+                    // returns only a status, and its stub declares the argument registers as
+                    // INPUTS, so writing them would clobber values the caller believes are
+                    // preserved across the trap.
+                    let was_recv = matches!(p.state, ProcState::BlockedRecv { .. });
                     let p = proc_at(d.child);
                     A::frame_set_ret(&mut p.frame, abi::syserr::NO_CAP);
-                    A::frame_set_ret2(&mut p.frame, 0);
+                    if was_recv {
+                        A::frame_set_ret2(&mut p.frame, 0);
+                        A::frame_set_ret3(&mut p.frame, 0);
+                    }
                     p.state = ProcState::Ready;
+                    p.pending_len = 0;
                     sched().add(abi::ThreadId(d.child));
                 }
             }
@@ -422,16 +448,17 @@ unsafe fn endpoint_of(proc: usize, cap: u64, needed: abi::CapRights) -> Option<u
 /// # Safety
 /// Single-CPU, non-reentrant: no other live borrow of the process table.
 unsafe fn find_blocked_recv(ep: u64) -> Option<usize> {
-    (0..MAX_PROCS).find(|&i| proc_at(i).state == ProcState::BlockedRecv { ep })
+    (0..MAX_PROCS)
+        .find(|&i| matches!(proc_at(i).state, ProcState::BlockedRecv { ep: e, .. } if e == ep))
 }
 
 /// The first process blocked sending on endpoint `ep`, with its pending word, if any.
 ///
 /// # Safety
 /// Single-CPU, non-reentrant: no other live borrow of the process table.
-unsafe fn find_blocked_send(ep: u64) -> Option<(usize, u64)> {
+unsafe fn find_blocked_send(ep: u64) -> Option<(usize, u64, usize)> {
     (0..MAX_PROCS).find_map(|i| match proc_at(i).state {
-        ProcState::BlockedSend { ep: e, word } if e == ep => Some((i, word)),
+        ProcState::BlockedSend { ep: e, word, len } if e == ep => Some((i, word, len)),
         _ => None,
     })
 }
@@ -528,6 +555,8 @@ unsafe fn load_process<A: Arch>(
             }
             s.role = role;
             s.id = id_arg;
+            s.msg_len = 0;
+            s.pending_len = 0;
             s.token = token;
             s.frame = A::frame_init(entry, A::USER_STACK_TOP, id_arg);
             s.frames = frames;
@@ -744,12 +773,39 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
         A::start_preemption();
         // Hand off to the scheduler: this resumes process `first` in user mode, and the
         // trap handlers (syscall + timer) drive every switch thereafter. Never returns.
-        let p = unsafe { proc_at(first) };
-        unsafe { A::resume(p.token, &p.frame) };
+        unsafe { resume_process::<A>(first) };
     }
 
     let _ = writeln!(con, "\nrustproof: BOOT OK (no user image)");
     A::exit(true)
+}
+
+/// Resume process `next`, first delivering any IPC payload that arrived while it was
+/// blocked. That copy has to happen HERE rather than at send time: the payload is written
+/// by whoever was running then, whose address space was active instead of this one's. So
+/// the sender leaves the bytes in the receiver's kernel buffer, and we switch to the
+/// receiver's space and copy them out just before returning to it. Never returns.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of `PROCS[next]`.
+unsafe fn resume_process<A: Arch>(next: usize) -> ! {
+    let p = proc_at(next);
+    let token = p.token;
+    if p.pending_len > 0 {
+        let n = p.pending_len;
+        let dst = p.pending_dst;
+        p.pending_len = 0;
+        // The kernel's own mappings (including `msg`) are shared into every space, so the
+        // buffer stays readable across the switch.
+        A::activate(token);
+        if !A::copy_to_user(dst, &p.msg[..n]) {
+            // The receiver's buffer went bad between the RECV and now: report the failure
+            // rather than resuming it with a success status and unwritten memory.
+            A::frame_set_ret(&mut p.frame, abi::syserr::FAULT);
+            A::frame_set_ret3(&mut p.frame, 0);
+        }
+    }
+    A::resume(token, &proc_at(next).frame)
 }
 
 /// The scheduler-aware trap handler — the arch entry stub calls this (via the
@@ -843,28 +899,57 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             // requires WRITE on that cap; the endpoint itself is the cap's object, so two
             // processes rendezvous only if their caps name the same endpoint.
             let word = A::frame_arg(&f, 1);
+            let uptr = A::frame_arg(&f, 2);
+            let len = A::frame_arg(&f, 3) as usize;
             match endpoint_of(cur, A::frame_arg(&f, 0), abi::CapRights::WRITE) {
                 // No such cap, wrong type, or no WRITE right: refuse without blocking.
                 None => A::frame_set_ret(&mut f, abi::syserr::NO_CAP),
+                // A payload the kernel buffer cannot hold is rejected outright rather than
+                // silently truncated: the sender would have no way to learn it was cut.
+                Some(_) if len > abi::MAX_MSG_BYTES => A::frame_set_ret(&mut f, abi::syserr::FAULT),
                 Some(ep) => match find_blocked_recv(ep) {
                     Some(r) => {
-                        // A receiver is waiting: hand it the word, wake it, return OK to us.
-                        // The receiver gets status + payload in SEPARATE registers (see the
-                        // RECV arm) so an arbitrary word can never be read as an error.
-                        A::frame_set_ret(&mut proc_at(r).frame, abi::syserr::OK);
-                        A::frame_set_ret2(&mut proc_at(r).frame, word);
-                        proc_at(r).state = ProcState::Ready;
-                        sched().add(abi::ThreadId(r));
-                        A::frame_set_ret(&mut f, abi::syserr::OK);
-                        // CURRENT unchanged: the sender resumes.
+                        // A receiver is waiting. Its address space is NOT active (ours is),
+                        // so the payload is copied into the receiver's kernel buffer now and
+                        // out into its user buffer when it is resumed. Truncate to the
+                        // buffer it offered — the sender cannot know its size.
+                        let (dst, max) = match proc_at(r).state {
+                            ProcState::BlockedRecv { dst, max, .. } => (dst, max),
+                            _ => (0, 0),
+                        };
+                        let n = len.min(max);
+                        if n > 0 && !A::copy_from_user(uptr, &mut proc_at(r).msg[..n]) {
+                            // Bad sender pointer: nothing is delivered and the receiver
+                            // stays blocked, so no rendezvous is consumed.
+                            A::frame_set_ret(&mut f, abi::syserr::FAULT);
+                        } else {
+                            let p = proc_at(r);
+                            p.pending_dst = dst;
+                            p.pending_len = n;
+                            // The receiver gets status, word and byte count in SEPARATE
+                            // registers so an arbitrary word can never be read as an error.
+                            A::frame_set_ret(&mut p.frame, abi::syserr::OK);
+                            A::frame_set_ret2(&mut p.frame, word);
+                            A::frame_set_ret3(&mut p.frame, n as u64);
+                            p.state = ProcState::Ready;
+                            sched().add(abi::ThreadId(r));
+                            A::frame_set_ret(&mut f, abi::syserr::OK);
+                            // CURRENT unchanged: the sender resumes.
+                        }
                     }
                     None => {
-                        // No receiver yet: block until one arrives (word rides in the state).
-                        proc_at(cur).state = ProcState::BlockedSend { ep, word };
-                        sched().remove(abi::ThreadId(cur));
-                        match sched().current() {
-                            Some(t) => CURRENT = t.0,
-                            None => nothing_runnable::<A>(),
+                        // No receiver yet: park the payload in our own kernel buffer (our
+                        // address space is active now, and will not be when it is taken).
+                        if len > 0 && !A::copy_from_user(uptr, &mut proc_at(cur).msg[..len]) {
+                            A::frame_set_ret(&mut f, abi::syserr::FAULT);
+                        } else {
+                            proc_at(cur).msg_len = len;
+                            proc_at(cur).state = ProcState::BlockedSend { ep, word, len };
+                            sched().remove(abi::ThreadId(cur));
+                            match sched().current() {
+                                Some(t) => CURRENT = t.0,
+                                None => nothing_runnable::<A>(),
+                            }
                         }
                     }
                 },
@@ -876,25 +961,50 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             // the SECOND one: the word is an unrestricted u64 chosen by the sender, so
             // sharing one register with the `syserr` sentinels would make a legitimately
             // received `NO_CAP`-valued word indistinguishable from a refusal.
+            let dst = A::frame_arg(&f, 1);
+            let max = (A::frame_arg(&f, 2) as usize).min(abi::MAX_MSG_BYTES);
+            // Vet the buffer we are offering NOW, while our address space is active and
+            // nothing has been consumed. Otherwise a bad buffer would only surface during
+            // the deferred copy — after a sender had already been told OK, losing its
+            // message with no way to report the loss to either side.
+            if max > 0 && !A::user_write_ok(dst, max) {
+                A::frame_set_ret(&mut f, abi::syserr::FAULT);
+                A::frame_set_ret2(&mut f, 0);
+                A::frame_set_ret3(&mut f, 0);
+                proc_at(cur).frame = f;
+                resume_process::<A>(cur)
+            }
             match endpoint_of(cur, A::frame_arg(&f, 0), abi::CapRights::READ) {
                 // No such cap, wrong type, or no READ right: refuse without blocking.
                 None => {
                     A::frame_set_ret(&mut f, abi::syserr::NO_CAP);
                     A::frame_set_ret2(&mut f, 0); // no payload on the error path
+                    A::frame_set_ret3(&mut f, 0);
                 }
                 Some(ep) => match find_blocked_send(ep) {
-                    Some((s, word)) => {
-                        // A sender waits: take its word, return it, wake the sender (OK).
-                        A::frame_set_ret(&mut f, abi::syserr::OK);
-                        A::frame_set_ret2(&mut f, word);
-                        A::frame_set_ret(&mut proc_at(s).frame, abi::syserr::OK);
-                        proc_at(s).state = ProcState::Ready;
-                        sched().add(abi::ThreadId(s));
-                        // CURRENT unchanged: the receiver resumes with the word.
+                    Some((s, word, len)) => {
+                        // A sender waits. OUR address space is active, so its parked payload
+                        // copies straight into our buffer — no deferral needed on this side.
+                        let n = len.min(max);
+                        if n > 0 && !A::copy_to_user(dst, &proc_at(s).msg[..n]) {
+                            // Our own pointer is bad: fail us, leave the sender blocked.
+                            A::frame_set_ret(&mut f, abi::syserr::FAULT);
+                            A::frame_set_ret2(&mut f, 0);
+                            A::frame_set_ret3(&mut f, 0);
+                        } else {
+                            A::frame_set_ret(&mut f, abi::syserr::OK);
+                            A::frame_set_ret2(&mut f, word);
+                            A::frame_set_ret3(&mut f, n as u64);
+                            A::frame_set_ret(&mut proc_at(s).frame, abi::syserr::OK);
+                            proc_at(s).msg_len = 0;
+                            proc_at(s).state = ProcState::Ready;
+                            sched().add(abi::ThreadId(s));
+                            // CURRENT unchanged: the receiver resumes with the message.
+                        }
                     }
                     None => {
-                        // No sender yet: block until one delivers.
-                        proc_at(cur).state = ProcState::BlockedRecv { ep };
+                        // No sender yet: block, recording the buffer we offered.
+                        proc_at(cur).state = ProcState::BlockedRecv { ep, dst, max };
                         sched().remove(abi::ThreadId(cur));
                         match sched().current() {
                             Some(t) => CURRENT = t.0,
@@ -1049,9 +1159,7 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
 
     // Persist `cur`'s (possibly result-updated) frame, then resume whoever is now current.
     proc_at(cur).frame = f;
-    let next = CURRENT;
-    let token = proc_at(next).token;
-    A::resume(token, &proc_at(next).frame)
+    resume_process::<A>(CURRENT)
 }
 
 /// The timer-IRQ handler — preempts the running process and round-robins to the next ready
@@ -1069,9 +1177,7 @@ pub unsafe fn preempt_trap<A: Arch>(frame: *mut u64) -> ! {
     A::end_of_interrupt();
     // Round-robin to the next ready process (the same one if it is alone).
     CURRENT = sched().next().map(|t| t.0).unwrap_or(cur);
-    let next = CURRENT;
-    let token = proc_at(next).token;
-    A::resume(token, &proc_at(next).frame)
+    resume_process::<A>(CURRENT)
 }
 
 /// The real `HostEnv`, backed by the running process's capability space + kernel state and

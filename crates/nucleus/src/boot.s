@@ -69,7 +69,7 @@ _start:
 
     /* CR0.PG | CR0.PE */
     movl %cr0, %eax
-    orl  $0x80000001, %eax
+    orl  $0x80010001, %eax          // PG | WP | PE — WP makes ring-0 stores honour R/W
     movl %eax, %cr0
 
     lgdt (gdt64_ptr)

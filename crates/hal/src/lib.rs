@@ -142,6 +142,20 @@ pub trait Arch {
     /// sentinels without the two becoming indistinguishable. User stubs for such calls must
     /// declare this register as an asm output.
     fn frame_set_ret2(f: &mut UserFrame, v: u64);
+    /// Set a THIRD return value, in yet another distinct register (the `a3` argument
+    /// register). Needed by `RECV`, which returns a status, an unrestricted payload word,
+    /// and a byte count that must not be confused with either.
+    fn frame_set_ret3(f: &mut UserFrame, v: u64);
+
+    /// Make `token`'s address space the active one WITHOUT resuming a process — so the
+    /// kernel can touch that space's user memory (e.g. deliver an IPC payload into a
+    /// receiver that is not the process currently running). The kernel's own mappings are
+    /// shared into every space, so kernel code and data stay reachable across the switch.
+    ///
+    /// # Safety
+    /// `token` must name a live space that shares the kernel mappings. The caller must not
+    /// rely on the previous space's user memory afterwards.
+    unsafe fn activate(token: u64);
 
     /// Enable preemptive scheduling: start a periodic timer interrupt that drives the
     /// scheduler (so a non-cooperating process is time-sliced). A no-op on arches where
@@ -171,4 +185,9 @@ pub trait Arch {
     unsafe fn copy_from_user(uptr: u64, out: &mut [u8]) -> bool;
     /// True if `[uptr, uptr+len)` lies within the user window.
     fn user_ptr_ok(uptr: u64, len: usize) -> bool;
+    /// True if `[uptr, uptr+len)` is not merely in range but actually MAPPED writable and
+    /// user-accessible in the currently active space — i.e. a [`copy_to_user`](Self::copy_to_user)
+    /// there would succeed. Lets a syscall vet a buffer up front instead of discovering the
+    /// problem during a copy it can no longer report cleanly.
+    fn user_write_ok(uptr: u64, len: usize) -> bool;
 }
