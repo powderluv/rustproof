@@ -2,7 +2,7 @@
 
 How Rustproof runs more than one isolated user process on one CPU, and how the
 same machinery reaches preemption. Arch-generic (written against `hal::Arch`);
-x86-64 lands first, RISC-V mirrors it, the timer is x86-only for now.
+x86-64 lands first and RISC-V mirrors it — both arches now preempt.
 
 ## The model: trap frames + a single kernel stack + one resume path
 
@@ -26,8 +26,8 @@ current process's page tables (still active — we have not switched yet), write
 `rax`, and resume the *same* process; `EXIT` removes the process and resumes the
 next, or — when the run queue drains — prints `rustproof: BOOT OK` and halts.
 
-A process is `{ token, frame: UserFrame, caps: CapSpace, active }` in a fixed
-`PROCS: [Process; N]` static (no heap). Each process has its **own** address
+A process is `{ token, frame: UserFrame, caps: CapSpace, role, id, state, +
+frame/VRAM ownership lists }` in a fixed `PROCS: [Process; N]` static (no heap). Each process has its **own** address
 space (own page-table root, kernel shared in via `share_kernel`) and its **own**
 capability space, so `map_bar`/`alloc_vram` are gated per process. First entry
 and later resume are identical: a fresh process just starts with a `frame`
@@ -82,11 +82,30 @@ slot (a monotonic counter), so a slot's current and former occupants can never b
 conflated. The demo spawns late, into a deliberately recycled slot, and asserts
 the child is still a worker.
 
-Honest scope on what remains: the role table is a static boot policy, and
-capabilities are only ever granted at load time — there is no delegation yet, so
-a parent cannot hand (or attenuate) one of its own caps to a child at `SPAWN`.
-`capabilities::derive` already provides the authority-monotonic primitive that
-needs; wiring it through `SPAWN` is the next step.
+Capabilities are no longer only grantable at load time: `SPAWN` takes an optional
+capability of the caller's to **delegate** to the child, plus the rights to hand
+over. The child receives `caller_rights ∩ requested` — the same intersection
+`CapSpace::derive` performs within one space, though delegation must `insert` a
+fresh root rather than `derive`, because `CapSlot.parent` is a slot index within
+*one* space and recording the parent's index in the child's space would corrupt
+`revoke_subtree`. A parent may attenuate but never amplify, and requesting more
+than it holds yields only what it holds. Asking to delegate a capability the
+caller does not hold refuses the whole spawn rather than quietly producing a
+child without it.
+
+A spawned process gets `Role::Child`, whose grant table is **empty**: it begins
+with no authority whatsoever, so everything it can do is exactly what its parent
+delegated. That makes "spawn cannot mint authority" true by construction rather
+than by an argument about who is allowed to spawn — and it is what makes the
+demo's positive case meaningful: a child with an empty role allocates through a
+delegated `Untyped`, which no role table could have given it. The negative case
+hands another child a `READ`-only `Untyped` *with full rights requested*; it is
+still refused.
+
+Honest scope on what remains: the role table is a static boot policy, delegation
+is one capability per spawn, and there is no revocation of a delegated capability
+after the fact (`CapSpace::revoke_subtree` exists within a space, but a delegated
+cap is a fresh root in the child's space, so it is not linked to the parent's).
 
 Load-bearing detail: an x86 interrupt/exception gate clears `IF`/`TF` but **not**
 `DF`, and `std` is unprivileged — so a ring-3 process can enter the kernel with
@@ -103,11 +122,12 @@ compute loop with `DF=1` as a standing regression test.
 | **x86-M1** ✅ | Cooperative multi-process: `YIELD` syscall, N processes each isolated (own AS + caps), round-robin, run to `EXIT`. Generic; x86 + RISC-V. | done |
 | **x86-M2** ✅ | Preemptive on x86: an 8259 PIC + 8254 PIT timer interrupt (IRQ0 → vector 0x20) drives the scheduler; a compute-bound process is time-sliced without cooperating. The timer ISR builds the identical `TrapFrame` and reuses `resume`. | done |
 | **riscv-timer** ✅ | Preemptive on RISC-V too: the Sstc `stimecmp` supervisor timer (`scause` int code 5) routes to the same generic `preempt_trap`. Both arches now time-slice. | done |
-| **x86-M3a** ✅ | Cross-address-space IPC: `SEND`/`RECV` synchronous 1-word rendezvous with process blocking (`ProcState` + run-queue add/remove), deadlock detection. Generic; x86 + RISC-V. | this change |
+| **x86-M3a** ✅ | Cross-address-space IPC: `SEND`/`RECV` synchronous 1-word rendezvous with process blocking (`ProcState` + run-queue add/remove), deadlock detection. Generic; x86 + RISC-V. | done |
 | **x86-M3b** ✅ | A real `SPAWN` syscall (Untyped-cap-gated): load the embedded image into a fresh process at runtime, with full frame reclamation on `EXIT` (a spawn/exit cycle leaks no address space). Generic; x86 + RISC-V. | done |
 | **vram-quota** ✅ | Per-process VRAM quota + `FREE_VRAM`: `ALLOC_VRAM` refuses past the quota (`VRAM_QUOTA_FRAMES`); `FREE_VRAM(phys)` frees an owned frame (ownership-checked — a process can only free its own), returning quota; VRAM tracked separately from AS frames, both reclaimed on exit. Generic; x86 + RISC-V. | done |
 | **ipc-caps** ✅ | IPC endpoints are capabilities, not raw integers: `SEND`/`RECV` take a `CapId`, require `CapType::Endpoint` with `WRITE`/`READ` respectively, and rendezvous on the cap's *object* — so two processes meet only when their caps name the same endpoint, and an unauthorized caller gets `NO_CAP` without blocking. Generic; x86 + RISC-V. | done |
 | **role-caps** ✅ | Per-role grants: each process is loaded with only its role's capability table (producer = send-only, consumer = receive-only, worker = device/memory but no shared-endpoint authority), so the policy is least-authority rather than uniform. Generic; x86 + RISC-V. | done |
+| **cap-delegation** ✅ | `SPAWN` can hand the child one of the caller's own capabilities, attenuated: the child gets `caller_rights ∩ requested`, so a parent may narrow but never widen authority, and delegating a cap it does not hold refuses the spawn. Generic; x86 + RISC-V. | done |
 
 ## Alternatives Considered
 

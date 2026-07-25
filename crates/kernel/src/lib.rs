@@ -177,6 +177,9 @@ enum Role {
     Consumer,
     /// Does device + memory work (and may spawn). No authority on the shared endpoint.
     Worker,
+    /// A `SPAWN`ed process. Its role grants NOTHING — everything it can do came from what
+    /// its parent chose to delegate, so spawning cannot mint authority by itself.
+    Child,
 }
 
 /// The BOOT policy: which role the `i`th initial process gets. Only sound for the initial
@@ -196,6 +199,7 @@ fn role_name(role: Role) -> &'static str {
         Role::Producer => "producer",
         Role::Consumer => "consumer",
         Role::Worker => "worker",
+        Role::Child => "child",
     }
 }
 
@@ -207,8 +211,14 @@ const NO_AUTHORITY: (abi::CapType, abi::CapRights, u64) =
 
 /// The capability set granted to each role, positionally: entry `i` becomes `CapId(i)`.
 ///
-/// PROOF(later): a process's reachable authority is exactly the caps its role's table
-/// names — nothing in the kernel adds to a `CapSpace` after `load_process` builds it.
+/// PROOF(later): immediately after `load_process`, a process's `CapSpace` holds exactly
+/// this role's table — entry `i` at `CapId(i)` — and nothing else. Exactly ONE kernel site
+/// adds to a `CapSpace` afterwards: the `SPAWN` delegation `insert` in [`syscall_trap`],
+/// which appends a capability whose rights are `parent_rights ∩ requested` and whose type
+/// and object are copied verbatim from a capability the parent already holds. So a
+/// process's authority is bounded by (its role's table) ∪ (an attenuation of its parent's
+/// authority) — and since [`Role::Child`]'s table is empty, a spawned process's authority
+/// is bounded by its parent's.
 fn grants_for(role: Role) -> &'static [(abi::CapType, abi::CapRights, u64)] {
     const MMIO_BASE: u64 = 0xE000_0000;
     match role {
@@ -234,6 +244,10 @@ fn grants_for(role: Role) -> &'static [(abi::CapType, abi::CapRights, u64)] {
             (abi::CapType::Untyped, abi::CapRights::READ, 0),
             (abi::CapType::Mmio, abi::CapRights::WRITE, MMIO_BASE),
         ],
+        // Nothing. A spawned process begins with no authority of its own; what it can do is
+        // exactly what its parent delegated (never more — the rights are intersected), so
+        // `SPAWN` cannot manufacture authority no matter who calls it.
+        Role::Child => &[],
     }
 }
 
@@ -716,10 +730,30 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             let authorized = proc_at(cur).caps.lookup(cap).is_some_and(|s| {
                 s.cap_type == abi::CapType::Untyped && s.rights.contains(abi::CapRights::WRITE)
             });
+            // Optional capability delegation: `a1` = one of the CALLER's capabilities to
+            // hand to the child (or NO_DELEGATE), `a2` = the rights to hand over.
+            // Authority-monotonic, exactly as `CapSpace::derive` is within one space: the
+            // child receives `caller_rights ∩ requested`, so a parent can attenuate but
+            // never amplify — asking for more than it holds yields only what it holds.
+            // The lookup copies the slot out, so no borrow of `PROCS[cur]` stays live.
+            let deleg_arg = A::frame_arg(&f, 1);
+            let want_deleg = deleg_arg != abi::sysno::NO_DELEGATE;
+            let requested = abi::CapRights((A::frame_arg(&f, 2) & 0b111) as u8);
+            let delegated: Option<(abi::CapType, abi::CapRights, u64)> = if want_deleg {
+                proc_at(cur)
+                    .caps
+                    .lookup(abi::CapId(deleg_arg as usize))
+                    .map(|s| (s.cap_type, s.rights.intersect(requested), s.object))
+            } else {
+                None
+            };
+            // Asking to delegate a capability you do not hold refuses the whole spawn,
+            // rather than silently producing a child without it.
+            let deleg_ok = !want_deleg || delegated.is_some();
             // Load the embedded image into a free slot, add it to the run queue, and return
             // the child's id (or u64::MAX on failure). The spawner keeps running (CURRENT
             // unchanged).
-            let free = if authorized {
+            let free = if authorized && deleg_ok {
                 (0..MAX_PROCS).find(|&i| proc_at(i).state == ProcState::Free)
             } else {
                 None
@@ -728,33 +762,43 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             let ktoken = *core::ptr::addr_of!(KTOKEN);
             let ret = match free {
                 Some(slot) => {
-                    // A spawned process is always a Worker, chosen HERE rather than derived
-                    // from the slot: slots are recycled, so `boot_role(slot)` would hand a
-                    // child the exited occupant's authority — e.g. spawning into the freed
-                    // producer's slot would grant WRITE on the shared endpoint, which no
-                    // Worker holds. Spawning must never mint authority the caller lacks, and
-                    // the `Untyped + WRITE` gate above means every spawner is a Worker.
+                    // A spawned process gets `Role::Child` — an EMPTY grant table — chosen
+                    // HERE rather than derived from the slot. Slots are recycled, so
+                    // `boot_role(slot)` would hand a child the exited occupant's authority
+                    // (spawning into the freed producer's slot would grant WRITE on the
+                    // shared endpoint). With an empty table, spawning mints no authority at
+                    // all by construction: the child holds exactly what was delegated,
+                    // which is an attenuation of what the caller already holds.
                     let child_id = {
                         let id = *core::ptr::addr_of!(NEXT_ID);
                         NEXT_ID = id.wrapping_add(1);
                         id
                     };
                     let loaded = match (*core::ptr::addr_of_mut!(FA)).as_mut() {
-                        Some(fa) => {
-                            load_process::<A>(slot, child_id, Role::Worker, fa, ktoken, elf)
-                        }
+                        Some(fa) => load_process::<A>(slot, child_id, Role::Child, fa, ktoken, elf),
                         None => false,
                     };
                     if loaded {
+                        // Hand over the (already attenuated) delegated capability. It lands
+                        // in the first free slot of the child's space, i.e. immediately
+                        // after its role's grants.
+                        if let Some((cap_type, rights, object)) = delegated {
+                            let _ = proc_at(slot).caps.insert(cap_type, rights, object);
+                        }
                         sched().add(abi::ThreadId(slot));
                         let mut con = Console::<A>::new();
                         let _ = writeln!(
                             con,
-                            "[kernel] proc {} spawned proc {} ({}, slot {})",
+                            "[kernel] proc {} spawned proc {} ({}, slot {}){}",
                             proc_at(cur).id,
                             child_id,
-                            role_name(Role::Worker),
-                            slot
+                            role_name(Role::Child),
+                            slot,
+                            if delegated.is_some() {
+                                " + delegated cap"
+                            } else {
+                                ""
+                            }
                         );
                         child_id
                     } else {

@@ -209,9 +209,20 @@ pub mod sysno {
     /// equal to a [`syserr`] sentinel indistinguishable from a real error. User stubs MUST
     /// declare the second register as an asm output.
     pub const RECV: u64 = 7;
-    /// Spawn a new process running the same embedded image. Returns the new process id, or
-    /// `u64::MAX` on failure (no free slot / out of memory).
+    /// Spawn a new process running the same embedded image.
+    ///
+    /// `a0` = an `Untyped` capability carrying `WRITE` (spawn authority). `a1` = a
+    /// capability of the CALLER's to delegate to the child, or [`NO_DELEGATE`] for none;
+    /// `a2` = the rights to hand over. Delegation is authority-monotonic: the child
+    /// receives `caller_rights ∩ a2`, so a parent may attenuate but never amplify —
+    /// requesting more than it holds yields only what it holds. A delegated capability
+    /// lands in the child's space immediately after its role's grants.
+    ///
+    /// Returns the new process id, or `u64::MAX` on failure (no authority, no free slot,
+    /// out of memory, or a request to delegate a capability the caller does not hold).
     pub const SPAWN: u64 = 8;
+    /// `a1` value for [`SPAWN`] meaning "delegate nothing".
+    pub const NO_DELEGATE: u64 = u64::MAX;
     /// Free a VRAM frame previously returned by `ALLOC_VRAM`: `a0` = its physical address.
     /// Returns `OK`, or `FAULT` if the caller does not own that frame.
     pub const FREE_VRAM: u64 = 9;

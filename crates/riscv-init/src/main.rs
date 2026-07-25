@@ -282,10 +282,18 @@ fn recv(cap: u64) -> (u64, u64) {
 }
 
 /// Spawn a new process running this same image, presenting `cap` as spawn authority (an
-/// Untyped capability carrying `WRITE`). Returns the new id, or `u64::MAX` on failure.
+/// Untyped capability carrying `WRITE`) and delegating nothing. Returns the new id, or
+/// `u64::MAX` on failure.
 fn spawn(cap: u64) -> u64 {
-    // SAFETY: SPAWN takes a cap id and returns a pid; no user memory is touched.
-    unsafe { syscall(sysno::SPAWN, cap, 0, 0, 0, 0) }
+    spawn_delegating(cap, sysno::NO_DELEGATE, 0)
+}
+
+/// Spawn, additionally handing the child our capability `deleg` with at most `rights`.
+/// The kernel intersects with what we actually hold, so this can attenuate but never
+/// amplify. Returns the new id, or `u64::MAX` on failure.
+fn spawn_delegating(cap: u64, deleg: u64, rights: u64) -> u64 {
+    // SAFETY: SPAWN takes three scalars and returns a pid; no user memory is touched.
+    unsafe { syscall(sysno::SPAWN, cap, deleg, rights, 0, 0) }
 }
 
 /// Allocate one VRAM frame via the Untyped cap; returns its physical address, or 0 on
@@ -316,7 +324,9 @@ pub extern "C" fn _start(id: u64) -> ! {
     match id {
         0 => producer(),
         1 => consumer(),
-        _ => compute(id),
+        2 => compute(id),
+        // Anything beyond the boot processes was SPAWNed: it holds no authority of its own.
+        _ => child(id),
     }
 }
 
@@ -409,7 +419,9 @@ fn compute(id: u64) -> ! {
     // Proc 2 dynamically spawns one child process (which runs this same compute path); the
     // child's `[proc N]` ticks then appear in the schedule, proving runtime process creation.
     if id == 2 {
-        let child = spawn(2);
+        // Delegate our Untyped cap (CapId(2), full rights). A child's role grants nothing,
+        // so this is the ONLY authority it will have — the positive half of the test.
+        let child = spawn_delegating(2, 2, 0b111);
         tag(id);
         debug_write(b"spawned child pid=");
         dbg_dec(child);
@@ -535,13 +547,67 @@ fn compute(id: u64) -> ! {
     // the slot index, this child would inherit the producer's send right on the shared
     // endpoint (and, running producer(), would block forever and deadlock the boot).
     if id == 2 {
-        let late = spawn(2);
+        // Also attempt an AMPLIFICATION: delegate CapId(4) — our Untyped cap that has
+        // READ but no WRITE — while requesting full rights. The child must receive only
+        // READ (intersection), so its delegated cap still cannot allocate.
+        let late = spawn_delegating(2, 4, 0b111);
         tag(id);
         debug_write(b"late spawn into a recycled slot -> pid ");
         dbg_dec(late);
         debug_write(b"\n");
     }
 
+    exit(id);
+}
+
+/// A SPAWNed process. Its role grants NOTHING, so every capability it holds was delegated
+/// by its parent — which makes this the honest test of delegation: authority that works
+/// here cannot have come from a role table. Proc 3 was delegated a full-rights `Untyped`
+/// (so it can allocate); proc 4 was delegated a READ-only one with full rights REQUESTED
+/// (so it must still be refused). Then it runs the preemptible compute loop and exits.
+fn child(id: u64) -> ! {
+    // No authority of its own: not on the shared endpoint, not over any device.
+    tag(id);
+    if send(0, 0xBEEF) == syserr::NO_CAP {
+        debug_write(b"child: no endpoint authority of its own\n");
+    } else {
+        debug_write(b"child: CAN send on the shared endpoint (bug)\n");
+    }
+    tag(id);
+    if map_bar(CapId(1), 0).is_err() {
+        debug_write(b"child: no device authority of its own\n");
+    } else {
+        debug_write(b"child: mapped a BAR (bug)\n");
+    }
+
+    // The delegated capability lands at CapId(0) — the first free slot of an empty table.
+    let deleg = alloc_vram(CapId(0), 4096);
+    tag(id);
+    if id == 3 {
+        if let Ok(r) = deleg {
+            free_vram(r.phys);
+            debug_write(b"deleg: delegated Untyped WORKS (authority no role granted it)\n");
+        } else {
+            debug_write(b"deleg: delegated Untyped REFUSED (bug)\n");
+        }
+    } else if deleg.is_err() {
+        debug_write(
+            b"deleg: parent asked ALL on its READ-only cap -> still refused (no amplification)\n",
+        );
+    } else {
+        debug_write(b"deleg: amplified a READ-only cap (bug)\n");
+    }
+
+    // Still preemptible, with DF deliberately set inside spin() (see `spin`).
+    let mut tick = 0u64;
+    while tick < 3 {
+        tag(id);
+        debug_write(b"tick ");
+        dbg_dec(tick);
+        debug_write(b"\n");
+        spin(5_000_000);
+        tick = tick.wrapping_add(1);
+    }
     exit(id);
 }
 
