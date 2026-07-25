@@ -185,6 +185,16 @@ everything I gave process X" (loop over your caps instead); and a process exitin
 does not revoke what it delegated — the children keep those capabilities until
 someone with the source capability revokes them.
 
+A CPU fault taken while USER code was running kills **that process**, not the
+machine: the arch handler checks the saved privilege level (x86 `CS` RPL 3,
+RISC-V `sstatus.SPP == 0`) and routes to `fault_trap`, which tears the process
+down exactly as `EXIT` would — frames and VRAM reclaimed, delegation edges
+spliced, slot freed — and resumes the next runnable one. A fault taken in the
+KERNEL stays fatal (dump + halt), because that means the nucleus itself is
+broken. Before this, any process could halt the whole guest with a wild pointer,
+which is the opposite of what an isolation kernel is for. The demo has a process
+dereference a null pointer on purpose and asserts the boot still completes.
+
 Load-bearing detail: an x86 interrupt/exception gate clears `IF`/`TF` but **not**
 `DF`, and `std` is unprivileged — so a ring-3 process can enter the kernel with
 `DF=1`. The Rust handler's `rep movs`-lowered copies (e.g. the trap-frame save)
@@ -208,6 +218,7 @@ compute loop with `DF=1` as a standing regression test.
 | **cap-delegation** ✅ | `SPAWN` can hand the child one of the caller's own capabilities, attenuated: the child gets `caller_rights ∩ requested`, so a parent may narrow but never widen authority, and delegating a cap it does not hold refuses the spawn. Generic; x86 + RISC-V. | done |
 | **cap-revocation** ✅ | `REVOKE(cap)` destroys every capability derived from one of the caller's own, transitively across spaces (kernel ledger) and within each space (`revoke_subtree`); the caller keeps its own. Generic; x86 + RISC-V. | done |
 | **ipc-payload** ✅ | IPC messages carry a byte payload across address spaces (per-process kernel buffer; deferred copy-out when the receiver blocked first), with the copied length returned in a third register. Generic; x86 + RISC-V. | done |
+| **fault-isolation** ✅ | A user-mode fault kills the faulting process (frames reclaimed, ledger spliced, slot freed) and the scheduler carries on; kernel faults stay fatal. Generic; x86 + RISC-V. | done |
 | **real-mapbar** ✅ | `MAP_BAR` installs a REAL page-table mapping of the window its `Mmio` capability names, instead of reporting a placeholder address: a holder can read and write that physical memory, a non-holder cannot name it, and the kernel bounds every request to the window it reserved. Generic; x86 + RISC-V. | done |
 
 ## Alternatives Considered

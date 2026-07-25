@@ -175,9 +175,25 @@ unsafe fn read_cr2() -> u64 {
     v
 }
 
-/// Called by `isr_common` with the assembled frame. Dumps state and halts the guest.
+/// Called by `isr_common` with the assembled frame. A fault taken in RING 3 kills just that
+/// process and the nucleus keeps running; a fault taken in the kernel dumps and halts,
+/// because that means the kernel itself is broken.
 extern "C" fn exception_dispatch(frame: *const ExceptionFrame) -> ! {
     let f = unsafe { &*frame };
+    // The CPU pushes the interrupted CS; its low two bits are the privilege level that was
+    // running, so RPL 3 means user code faulted — its failure, not the machine's.
+    if f.cs & 3 == 3 {
+        let name = vector_name(f.vector);
+        let addr = if f.vector == 14 {
+            // SAFETY: reading CR2 is always valid; it holds the faulting address for #PF.
+            unsafe { read_cr2() }
+        } else {
+            f.rip
+        };
+        // SAFETY: on the kernel fault stack with interrupts masked; the nucleus's CURRENT
+        // is the process that was running in ring 3.
+        unsafe { rustproof_fault_trap(name.as_ptr(), name.len(), addr) }
+    }
     kprintln!();
     kprintln!(
         "*** CPU EXCEPTION {} ({}) ***",
@@ -231,6 +247,9 @@ extern "C" {
     /// The scheduler-aware timer handler (provided by the nucleus). Receives the on-stack
     /// frame and never returns — it resumes some process via `syscall::resume`.
     fn rustproof_timer_trap(frame: *mut u64) -> !;
+    /// The nucleus's user-fault handler: kills the faulting process and resumes another.
+    /// The reason crosses as a (ptr, len) pair so no `str` crosses the FFI boundary.
+    fn rustproof_fault_trap(what: *const u8, what_len: usize, addr: u64) -> !;
 }
 
 /// Timer IRQ entry (vector [`pic::TIMER_VECTOR`]). On an interrupt from ring 3 the CPU has

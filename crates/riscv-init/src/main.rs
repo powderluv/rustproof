@@ -790,6 +790,14 @@ fn child(id: u64) -> ! {
         } else {
             debug_write(b"mmio: mapping survived revocation (bug)\n");
         }
+        // Deliberately fault. A wild pointer is OUR bug, not the machine's: the kernel must
+        // kill this process and keep running, and the boot must still reach BOOT OK. If a
+        // user fault halted the guest, this line would end the run right here.
+        tag(id);
+        debug_write(b"fault: dereferencing a wild pointer on purpose\n");
+        unsafe { core::ptr::write_volatile(0x1u64 as *mut u8, 0) };
+        tag(id);
+        debug_write(b"fault: SURVIVED a wild write (bug)\n");
         exit(id);
     }
 

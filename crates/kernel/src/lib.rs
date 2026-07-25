@@ -852,6 +852,95 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
     A::exit(true)
 }
 
+/// Tear a process down: reclaim every frame it holds, splice it out of the delegation
+/// ledger, free its slot and drop it from the run queue. Shared by `EXIT` and by the fault
+/// path, so a process killed for faulting releases exactly what a clean exit would.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table or the ledger.
+unsafe fn teardown_process(idx: usize) {
+    // Reclaim the process's frames (page tables + stack + ELF + any DMA frames) before
+    // freeing the slot, so a spawn/exit cycle does not leak an address space.
+    if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
+        use abi::FrameAllocator as _;
+        let p = proc_at(idx);
+        for i in 0..p.nframes {
+            fa.free_frame(p.frames[i]);
+        }
+        p.nframes = 0;
+        for i in 0..p.nvram {
+            fa.free_frame(p.vram[i]);
+        }
+        p.nvram = 0;
+    }
+    // Splice this process out of the delegation ledger. Its capability space is gone and
+    // its slot is about to be reused, so every edge naming it must go — but an edge INTO it
+    // is first re-parented onto its own source, or an ancestor's REVOKE would silently miss
+    // the grandchildren this process delegated onward and report success while they kept
+    // the capability.
+    let gone_id = proc_at(idx).id;
+    for i in 0..MAX_DELEGATIONS {
+        let inc = *deleg_at(i);
+        if !inc.live || inc.child != idx || inc.child_id != gone_id {
+            continue;
+        }
+        for j in 0..MAX_DELEGATIONS {
+            let out = deleg_at(j);
+            if out.live
+                && out.parent == idx
+                && out.parent_id == gone_id
+                && out.parent_cap == inc.child_cap
+            {
+                out.parent = inc.parent;
+                out.parent_id = inc.parent_id;
+                out.parent_cap = inc.parent_cap;
+            }
+        }
+        deleg_at(i).live = false;
+    }
+    // Anything still rooted here derives from a capability this process held in its own
+    // right, so no surviving process can revoke through it: drop those edges rather than
+    // leave them naming a slot someone else is about to occupy.
+    for i in 0..MAX_DELEGATIONS {
+        let d = deleg_at(i);
+        if d.live && d.parent == idx && d.parent_id == gone_id {
+            d.live = false;
+        }
+    }
+    proc_at(idx).state = ProcState::Free;
+    sched().remove(abi::ThreadId(idx));
+}
+
+/// A CPU fault taken while USER code was running: kill that process and carry on. Never
+/// returns.
+///
+/// A fault in ring 3 / U-mode is the process's failure, not the machine's — letting it halt
+/// the guest would hand every process a way to take the whole system down with one wild
+/// pointer, which is the opposite of the isolation this kernel exists to provide. A fault
+/// taken in the KERNEL is a different matter and stays fatal: the arch handler only routes
+/// here when the saved privilege level says user.
+///
+/// # Safety
+/// Called from an arch fault stub with interrupts masked; `CURRENT` must name the process
+/// that was running when the fault was taken.
+pub unsafe fn fault_trap<A: Arch>(what: &str, addr: u64) -> ! {
+    let cur = CURRENT;
+    let mut con = Console::<A>::new();
+    let _ = writeln!(
+        con,
+        "[kernel] proc {} killed: {} at {:#x}",
+        proc_at(cur).id,
+        what,
+        addr
+    );
+    teardown_process(cur);
+    match sched().current() {
+        Some(t) => CURRENT = t.0,
+        None => nothing_runnable::<A>(),
+    }
+    resume_process::<A>(CURRENT)
+}
+
 /// Resume process `next`, first delivering any IPC payload that arrived while it was
 /// blocked. That copy has to happen HERE rather than at send time: the payload is written
 /// by whoever was running then, whose address space was active instead of this one's. So
@@ -911,56 +1000,7 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                 proc_at(cur).id,
                 code
             );
-            // Reclaim the process's frames (page tables + stack + ELF + any DMA frames)
-            // before freeing the slot, so a spawn/exit cycle does not leak an address space.
-            if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
-                use abi::FrameAllocator as _;
-                let p = proc_at(cur);
-                for i in 0..p.nframes {
-                    fa.free_frame(p.frames[i]);
-                }
-                p.nframes = 0;
-                for i in 0..p.nvram {
-                    fa.free_frame(p.vram[i]);
-                }
-                p.nvram = 0;
-            }
-            // Splice this process out of the delegation ledger. Its capability space is
-            // gone and its slot is about to be reused, so every edge naming it must go —
-            // but an edge INTO it is first re-parented onto its own source, or an
-            // ancestor's REVOKE would silently miss the grandchildren this process
-            // delegated onward and report success while they kept the capability.
-            let gone_id = proc_at(cur).id;
-            for i in 0..MAX_DELEGATIONS {
-                let inc = *deleg_at(i);
-                if !inc.live || inc.child != cur || inc.child_id != gone_id {
-                    continue;
-                }
-                for j in 0..MAX_DELEGATIONS {
-                    let out = deleg_at(j);
-                    if out.live
-                        && out.parent == cur
-                        && out.parent_id == gone_id
-                        && out.parent_cap == inc.child_cap
-                    {
-                        out.parent = inc.parent;
-                        out.parent_id = inc.parent_id;
-                        out.parent_cap = inc.parent_cap;
-                    }
-                }
-                deleg_at(i).live = false;
-            }
-            // Anything still rooted here derives from a capability this process held in its
-            // own right, so no surviving process can revoke through it: drop those edges
-            // rather than leave them naming a slot someone else is about to occupy.
-            for i in 0..MAX_DELEGATIONS {
-                let d = deleg_at(i);
-                if d.live && d.parent == cur && d.parent_id == gone_id {
-                    d.live = false;
-                }
-            }
-            proc_at(cur).state = ProcState::Free;
-            sched().remove(abi::ThreadId(cur));
+            teardown_process(cur);
             match sched().current() {
                 Some(t) => CURRENT = t.0,
                 None => nothing_runnable::<A>(), // all exited (BOOT OK) or deadlocked

@@ -102,6 +102,9 @@ extern "C" {
     /// The nucleus's timer-preemption handler. Receives the on-stack frame and never
     /// returns — it re-arms the timer (via `Arch::end_of_interrupt`) and resumes a process.
     fn rustproof_timer_trap(frame: *mut u64) -> !;
+    /// The nucleus's user-fault handler: kills the faulting process and resumes another.
+    /// The reason crosses as a (ptr, len) pair so no `str` crosses the FFI boundary.
+    fn rustproof_fault_trap(what: *const u8, what_len: usize, addr: u64) -> !;
 }
 
 /// `scause` code for a supervisor timer interrupt (with the interrupt bit set).
@@ -150,6 +153,16 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame) -> ! {
     if is_interrupt && code == INTR_S_TIMER {
         // SAFETY: `frame` is the on-stack trap frame; the handler never returns.
         unsafe { rustproof_timer_trap(frame as *mut u64) }
+    }
+
+    // A trap from U-mode (sstatus.SPP == 0) is that process's failure: kill it and carry
+    // on. One taken in S-mode means the kernel is broken, and stays fatal.
+    if !is_interrupt && f.sstatus & csr::SSTATUS_SPP == 0 {
+        let name = exception_name(code);
+        let stval = unsafe { csr::read::<{ csr::STVAL }>() };
+        // SAFETY: on the kernel trap stack with interrupts masked; the nucleus's CURRENT is
+        // the process that was running in U-mode.
+        unsafe { rustproof_fault_trap(name.as_ptr(), name.len(), stval) }
     }
 
     fatal_dump(f, scause, is_interrupt, code);
