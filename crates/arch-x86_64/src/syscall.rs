@@ -173,6 +173,28 @@ unsafe extern "C" fn syscall_entry() {
     );
 }
 
+#[repr(C, align(16))]
+struct IdleStack([u8; 8 * 1024]);
+static mut IDLE_STACK: IdleStack = IdleStack([0; 8 * 1024]);
+
+/// Park with interrupts enabled until one arrives. `sti` takes effect after the NEXT
+/// instruction, so `sti; hlt` cannot miss an interrupt in the gap. Never returns: the timer
+/// handler picks what runs next.
+///
+/// # Safety
+/// Abandons the current kernel stack (see `Arch::idle`).
+pub unsafe fn idle() -> ! {
+    asm!(
+        "mov rsp, {stack}",
+        "2:",
+        "sti",
+        "hlt",
+        "jmp 2b",
+        stack = in(reg) core::ptr::addr_of!(IDLE_STACK) as u64 + 8 * 1024,
+        options(noreturn),
+    );
+}
+
 /// Restore the user register state in `frame` and return to ring 3 via `iretq`. Never
 /// returns. `cr3` must already point at the target process's address space (the caller
 /// loads it); `frame` and the code here are in the kernel mappings shared into every space.

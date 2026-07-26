@@ -218,6 +218,10 @@ impl Arch for X86 {
         }
     }
 
+    unsafe fn idle() -> ! {
+        syscall::idle()
+    }
+
     fn end_of_interrupt() {
         unsafe { pic::eoi_master() }
     }

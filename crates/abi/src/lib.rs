@@ -247,6 +247,10 @@ pub mod sysno {
     /// Non-blocking by design for now: a blocking wait needs the kernel to idle with
     /// interrupts enabled when nothing is runnable, which is a separate mechanism.
     pub const POLL_IRQ: u64 = 11;
+    /// Like [`POLL_IRQ`] but BLOCKS until at least one interrupt has arrived on the line
+    /// its capability names, then returns the count (never zero). `a0` = an `Irq`
+    /// capability (needs `READ`); `NO_CAP` if it is missing/wrong-typed/lacks `READ`.
+    pub const WAIT_IRQ: u64 = 12;
     /// Revoke every capability derived from `a0` (one of the caller's own capabilities) by
     /// delegation, transitively — the children it was handed to, the grandchildren they
     /// passed it on to, and anything derived from those within a holder's own space.

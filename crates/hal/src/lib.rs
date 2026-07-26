@@ -183,6 +183,19 @@ pub trait Arch {
     /// [`init_traps`](Self::init_traps), before the first process runs.
     fn start_preemption();
 
+    /// Park the CPU until an interrupt arrives, with interrupts ENABLED — the state to be
+    /// in when every process is waiting on one. Resets the stack pointer to a dedicated
+    /// idle stack first, because an interrupt taken while already in the kernel pushes onto
+    /// the current stack: without the reset, each tick would grow it without bound.
+    ///
+    /// Never returns: the interrupt handler decides what runs next (another process, or
+    /// this again).
+    ///
+    /// # Safety
+    /// Callers must have no live borrows of anything on the current kernel stack, since it
+    /// is abandoned.
+    unsafe fn idle() -> !;
+
     /// Acknowledge the current interrupt at the interrupt controller (end-of-interrupt),
     /// so the next timer tick can be delivered. Called from the timer handler before it
     /// resumes a process. A no-op where [`start_preemption`](Self::start_preemption) is.

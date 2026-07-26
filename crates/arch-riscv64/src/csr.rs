@@ -35,6 +35,9 @@ pub const SIE_STIE: u64 = 1 << 5;
 pub const SSTATUS_SPP: u64 = 1 << 8;
 /// `sstatus.SPIE` (bit 5): previous interrupt-enable, restored into SIE on `sret`.
 pub const SSTATUS_SPIE: u64 = 1 << 5;
+/// `sstatus.SIE` (bit 1): supervisor interrupt enable — set only when the kernel parks
+/// waiting for an interrupt; the handlers themselves stay non-reentrant.
+pub const SSTATUS_SIE: u64 = 1 << 1;
 /// `sstatus.SUM` (bit 18): permit S-mode loads/stores to U-mode (U=1) pages.
 pub const SSTATUS_SUM: u64 = 1 << 18;
 

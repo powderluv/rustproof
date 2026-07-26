@@ -231,6 +231,10 @@ impl Arch for Riscv {
         unsafe { timer::init() }
     }
 
+    unsafe fn idle() -> ! {
+        mmu::idle()
+    }
+
     fn end_of_interrupt() {
         // Ack + schedule the next tick (writing stimecmp forward clears the pending one).
         unsafe { timer::rearm() }

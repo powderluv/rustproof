@@ -9,3 +9,25 @@ pub unsafe fn enable_paging(satp: u64) {
     csr::write::<{ csr::SATP }>(satp);
     asm!("sfence.vma", options(nostack, preserves_flags));
 }
+
+#[repr(C, align(16))]
+struct IdleStack([u8; 8 * 1024]);
+static mut IDLE_STACK: IdleStack = IdleStack([0; 8 * 1024]);
+
+/// Park with supervisor interrupts enabled until one arrives (`wfi`). Never returns: the
+/// timer handler picks what runs next.
+///
+/// # Safety
+/// Abandons the current kernel stack (see `hal::Arch::idle`).
+pub unsafe fn idle() -> ! {
+    let sstatus = csr::read::<{ csr::SSTATUS }>() | csr::SSTATUS_SIE;
+    csr::write::<{ csr::SSTATUS }>(sstatus);
+    asm!(
+        "mv sp, {stack}",
+        "2:",
+        "wfi",
+        "j 2b",
+        stack = in(reg) core::ptr::addr_of!(IDLE_STACK) as u64 + 8 * 1024,
+        options(noreturn),
+    );
+}

@@ -156,10 +156,21 @@ for the line ITS capability names — a capability for one line can never read o
 clear another's, so a driver holding two devices can tell them apart and cannot
 lose one by polling the other. A process with no such capability cannot observe
 those interrupts at all, and revoking the capability drops the credits accrued
-under it, the same doctrine `MAP_BAR` mappings follow. `POLL_IRQ` is
-non-blocking for now: a blocking wait needs the kernel to idle with interrupts
-enabled when nothing is runnable, which interacts with both the deadlock
-detector and the timer handler's assumption that it only ever preempts user code.
+under it, the same doctrine `MAP_BAR` mappings follow. `WAIT_IRQ` is the blocking form: a process parks until its line fires, and the
+hardware wakes it with the count. That needed two things beyond the poll. The
+deadlock detector had to learn that a process waiting on an interrupt is *idle*,
+not deadlocked — the hardware will answer it — so instead of declaring failure
+the kernel parks the CPU with interrupts enabled (`Arch::idle`). And the timer
+handler had to stop assuming it always preempts user code: an interrupt taken
+during that park interrupted the KERNEL, so there is no user frame to save and
+`CURRENT` names nobody. `idle` also resets the stack pointer to a dedicated idle
+stack, because an interrupt taken while already in the kernel pushes onto the
+current stack — without that reset, each tick would grow it without bound.
+
+Honest scope: the kernel reports how many times it parked, and in the current
+demo that is **zero** — some process is always runnable, so the park is
+reachable by construction but not yet exercised. The counter is the standing
+check; it will read nonzero the moment a workload actually idles.
 
 With that, a driver process has all four things the host contract owes it:
 device registers (`MAP_BAR`), DMA memory (`ALLOC_VRAM`/`FREE_VRAM`), a way to

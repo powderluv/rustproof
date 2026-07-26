@@ -52,6 +52,10 @@ enum ProcState {
     BlockedSend { ep: u64, word: u64, len: usize },
     /// Blocked in `RECV` on `ep`, having offered a `max`-byte buffer at user address `dst`.
     BlockedRecv { ep: u64, dst: u64, max: usize },
+    /// Blocked in `WAIT_IRQ` for interrupts on `line`. Unlike the IPC blocks this one is
+    /// answered by the hardware, so a run queue that drains with such a process waiting is
+    /// idle, not deadlocked.
+    BlockedIrq { line: u64 },
 }
 
 /// Capability slots per process.
@@ -176,6 +180,14 @@ static mut NEXT_ID: u64 = NUM_PROCS as u64;
 /// something crashed is distinguishable from one where every process exited cleanly —
 /// otherwise both print the same success line and a crash reads as a clean boot.
 static mut KILLED: u64 = 0;
+
+/// True while the kernel is parked in `Arch::idle` with no process running. The timer
+/// handler needs it: an interrupt taken then interrupted the KERNEL, so there is no user
+/// frame to save and `CURRENT` names nobody.
+static mut IDLING: bool = false;
+/// How many times the kernel parked waiting for an interrupt. Reported at the end, so
+/// whether the idle path actually ran is observable rather than assumed.
+static mut PARKS: u64 = 0;
 
 /// The interrupt source the kernel currently delivers: the periodic timer. A real driver
 /// would hold an `Irq` capability for its device's line instead.
@@ -374,7 +386,7 @@ unsafe fn unmap_device_window<A: Arch>(proc: usize) {
 ///
 /// # Safety
 /// Single-CPU, non-reentrant: no other live borrow of the process table.
-unsafe fn credit_irq(irq: u64) {
+unsafe fn credit_irq<A: Arch>(irq: u64) {
     let line = irq as usize;
     if irq >= MAX_IRQ_LINES as u64 {
         return;
@@ -393,9 +405,18 @@ unsafe fn credit_irq(irq: u64) {
                 })
             })
         };
-        if holds {
-            let p = proc_at(i);
-            p.irq_pending[line] = p.irq_pending[line].saturating_add(1);
+        if !holds {
+            continue;
+        }
+        let p = proc_at(i);
+        p.irq_pending[line] = p.irq_pending[line].saturating_add(1);
+        // A process parked in WAIT_IRQ for this line is answered now.
+        if p.state == (ProcState::BlockedIrq { line: irq }) {
+            let n = p.irq_pending[line];
+            p.irq_pending[line] = 0;
+            A::frame_set_ret(&mut p.frame, n);
+            p.state = ProcState::Ready;
+            sched().add(abi::ThreadId(i));
         }
     }
 }
@@ -594,6 +615,16 @@ unsafe fn find_blocked_send(ep: u64) -> Option<(usize, u64, usize)> {
 /// Single-CPU, non-reentrant: no other live borrow of the process table.
 unsafe fn nothing_runnable<A: Arch>() -> ! {
     let mut con = Console::<A>::new();
+    // A process waiting on an interrupt is not deadlocked — the hardware will answer it.
+    // Park the CPU instead of declaring failure.
+    if (0..MAX_PROCS).any(|i| matches!(proc_at(i).state, ProcState::BlockedIrq { .. })) {
+        if !IDLING {
+            PARKS = PARKS.wrapping_add(1);
+        }
+        IDLING = true;
+        CURRENT = usize::MAX;
+        A::idle();
+    }
     let deadlocked = (0..MAX_PROCS).any(|i| {
         matches!(
             proc_at(i).state,
@@ -612,6 +643,8 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
     if let Some(fa) = (*core::ptr::addr_of!(FA)).as_ref() {
         let _ = writeln!(con, "[mm] {} frames free after all exits", fa.free_count());
     }
+    let parks = *core::ptr::addr_of!(PARKS);
+    let _ = writeln!(con, "[kernel] parked for an interrupt {} time(s)", parks);
     let killed = *core::ptr::addr_of!(KILLED);
     if killed > 0 {
         let _ = writeln!(con, "\nrustproof: BOOT OK ({} process(es) killed)", killed);
@@ -1343,6 +1376,41 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             };
             A::frame_set_ret(&mut f, ret);
         }
+        abi::sysno::WAIT_IRQ => {
+            // Blocking sibling of POLL_IRQ: same capability, but park until the line has
+            // fired at least once rather than returning zero.
+            let cap = abi::CapId(A::frame_arg(&f, 0) as usize);
+            let irq = proc_at(cur).caps.lookup(cap).and_then(|s| {
+                (s.cap_type == abi::CapType::Irq && s.rights.contains(abi::CapRights::READ))
+                    .then_some(s.object)
+            });
+            match irq {
+                None => A::frame_set_ret(&mut f, abi::syserr::NO_CAP),
+                Some(line) if line < MAX_IRQ_LINES as u64 => {
+                    let p = proc_at(cur);
+                    let n = p.irq_pending[line as usize];
+                    if n > 0 {
+                        p.irq_pending[line as usize] = 0;
+                        A::frame_set_ret(&mut f, n);
+                    } else {
+                        // Park. The frame we persist at the tail is what `credit_irq` will
+                        // write the count into when the line fires.
+                        p.state = ProcState::BlockedIrq { line };
+                        sched().remove(abi::ThreadId(cur));
+                        proc_at(cur).frame = f;
+                        match sched().current() {
+                            Some(t) => {
+                                CURRENT = t.0;
+                                resume_process::<A>(t.0)
+                            }
+                            None => nothing_runnable::<A>(),
+                        }
+                    }
+                }
+                // Authority for a line the kernel never credits: waiting would never end.
+                Some(_) => A::frame_set_ret(&mut f, 0),
+            }
+        }
         abi::sysno::POLL_IRQ => {
             // Collecting a device's interrupts is authority: it requires an `Irq`
             // capability for that source, exactly like every other host-contract op.
@@ -1419,12 +1487,27 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
 /// # Safety
 /// `frame` must point at `A::FRAME_WORDS` valid `u64`s (the on-stack timer trap frame).
 pub unsafe fn preempt_trap<A: Arch>(frame: *mut u64) -> ! {
+    if IDLING {
+        // This interrupt hit the kernel's idle park, not a process: there is no user state
+        // to save and nobody to preempt. Deliver it, then run whoever it woke — or park
+        // again if it woke nobody.
+        A::end_of_interrupt();
+        credit_irq::<A>(IRQ_TIMER);
+        match sched().current() {
+            Some(t) => {
+                IDLING = false;
+                CURRENT = t.0;
+                resume_process::<A>(t.0)
+            }
+            None => A::idle(),
+        }
+    }
     let cur = CURRENT;
     // Save the preempted process's full register state (it never cooperated).
     core::ptr::copy_nonoverlapping(frame, proc_at(cur).frame.0.as_mut_ptr(), A::FRAME_WORDS);
     A::end_of_interrupt();
     // Deliver the interrupt to whoever holds a capability for it, then reschedule.
-    credit_irq(IRQ_TIMER);
+    credit_irq::<A>(IRQ_TIMER);
     // Round-robin to the next ready process (the same one if it is alone).
     CURRENT = sched().next().map(|t| t.0).unwrap_or(cur);
     resume_process::<A>(CURRENT)

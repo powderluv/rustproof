@@ -307,6 +307,13 @@ fn recv_bytes(cap: u64, buf: &mut [u8]) -> (u64, u64, usize) {
     (status, word, n as usize)
 }
 
+/// Block until at least one interrupt has arrived on the line our `Irq` capability names,
+/// then return the count. `syserr::NO_CAP` if we hold no such capability.
+fn wait_irq(cap: u64) -> u64 {
+    // SAFETY: WAIT_IRQ takes a cap id and returns a count; no user memory is touched.
+    unsafe { syscall(sysno::WAIT_IRQ, cap, 0, 0, 0, 0) }
+}
+
 /// Collect device interrupts delivered to us since the last call, via an `Irq` capability.
 /// Returns the count, or `syserr::NO_CAP` if we hold no such capability.
 fn poll_irq(cap: u64) -> u64 {
@@ -523,22 +530,24 @@ fn compute(id: u64) -> ! {
     // for the timer line; poll until some arrive. A driver process would do exactly this
     // for its own device's line.
     let mut ticks = 0u64;
-    let mut tries = 0u64;
-    while ticks < 3 && tries < 200 {
+    let mut rounds = 0u64;
+    while ticks < 3 && rounds < 10 {
+        // BLOCK until the line fires. This is the path a real driver takes, and it puts
+        // the kernel in its idle park whenever no other process is runnable — so this also
+        // exercises taking an interrupt in the KERNEL rather than in user code.
         // Never fold the error sentinel into the count: losing the capability would
         // otherwise wrap the total past the threshold and PASS this test for the wrong
         // reason. Only a real, non-error count is accumulated.
-        let n = poll_irq(6);
-        if n == syserr::NO_CAP {
+        let n = wait_irq(6);
+        if n == syserr::NO_CAP || n == 0 {
             break;
         }
         ticks = ticks.wrapping_add(n);
-        spin(200_000);
-        tries = tries.wrapping_add(1);
+        rounds = rounds.wrapping_add(1);
     }
     tag(id);
     if ticks >= 3 {
-        debug_write(b"irq: received device interrupts through the capability (");
+        debug_write(b"irq: blocked and woke on real device interrupts (");
         dbg_dec(ticks);
         debug_write(b")\n");
     } else {
@@ -763,6 +772,18 @@ fn compute(id: u64) -> ! {
             }
             Err(_) => debug_write(b"revoke: revoking cost us our own cap (bug)\n"),
         }
+    }
+
+    // One last blocking wait, as our final act. By now the other processes have finished,
+    // so there is nothing else to run and the kernel must PARK until the line fires rather
+    // than declaring a deadlock — the idle path a driver-only system sits in most of the
+    // time. If it declared deadlock instead, the boot would fail here.
+    let _ = poll_irq(6); // drain first, so the wait below genuinely has to block
+    tag(id);
+    if wait_irq(6) > 0 {
+        debug_write(b"irq: blocked with no credits and hardware woke us\n");
+    } else {
+        debug_write(b"irq: final wait returned nothing (bug)\n");
     }
 
     exit(id);
