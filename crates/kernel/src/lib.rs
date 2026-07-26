@@ -86,6 +86,11 @@ struct Process {
     /// so a spawn/exit cycle does not leak an address space. `frames[..nframes]` are live.
     frames: [abi::PhysAddr; MAX_PROC_FRAMES],
     nframes: usize,
+    /// Device interrupts counted for this process, PER LINE, since it last collected them.
+    /// Only a process holding an `Irq` capability for a line is ever credited for it, and a
+    /// capability for one line must never read or clear another's — a driver holding two
+    /// devices has to be able to tell them apart, and must not lose one by polling the other.
+    irq_pending: [u64; MAX_IRQ_LINES],
     /// Kernel-side IPC payload buffer. Serves as the outbox while this process is blocked
     /// in `SEND`, and as the inbox for a payload delivered while it was blocked in `RECV`
     /// (its address space is not active at that moment, so the copy out is deferred).
@@ -115,6 +120,7 @@ impl Process {
         nframes: 0,
         vram: [abi::PhysAddr(0); VRAM_QUOTA_FRAMES],
         nvram: 0,
+        irq_pending: [0; MAX_IRQ_LINES],
         msg: [0; abi::MAX_MSG_BYTES],
         msg_len: 0,
         pending_dst: 0,
@@ -170,6 +176,15 @@ static mut NEXT_ID: u64 = NUM_PROCS as u64;
 /// something crashed is distinguishable from one where every process exited cleanly —
 /// otherwise both print the same success line and a crash reads as a clean boot.
 static mut KILLED: u64 = 0;
+
+/// The interrupt source the kernel currently delivers: the periodic timer. A real driver
+/// would hold an `Irq` capability for its device's line instead.
+const IRQ_TIMER: u64 = 0;
+
+/// Interrupt lines the kernel accounts for separately. A capability naming a line at or
+/// above this bound is honoured as authority but never credited, so it can never read or
+/// clear another line's count.
+const MAX_IRQ_LINES: usize = 8;
 
 /// Physical base of the stand-in "device" window every `Mmio` capability names. Reserved
 /// at boot from the frame allocator and filled with a signature, so a process that maps it
@@ -290,6 +305,13 @@ unsafe fn revoke_delegations<A: Arch>(root_proc: usize, root_cap: usize) {
                 if !holds_mmio(d.child) {
                     unmap_device_window::<A>(d.child);
                 }
+                // Same doctrine for interrupts: credits accrued under a capability are
+                // authority, so they die with it rather than staying readable.
+                for line in 0..MAX_IRQ_LINES {
+                    if !holds_irq(d.child, line as u64) {
+                        proc_at(d.child).irq_pending[line] = 0;
+                    }
+                }
                 let p = proc_at(d.child);
                 let stranded = match p.state {
                     ProcState::BlockedSend { ep, .. } => {
@@ -344,6 +366,53 @@ unsafe fn unmap_device_window<A: Arch>(proc: usize) {
     if proc == CURRENT {
         A::activate(token);
     }
+}
+
+/// Credit every process holding an `Irq` capability for `irq` with one interrupt. Only
+/// capability holders are credited, so interrupt delivery is authority like everything
+/// else: a process with no `Irq` capability cannot observe the device's interrupts at all.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table.
+unsafe fn credit_irq(irq: u64) {
+    let line = irq as usize;
+    if irq >= MAX_IRQ_LINES as u64 {
+        return;
+    }
+    for i in 0..MAX_PROCS {
+        if proc_at(i).state == ProcState::Free {
+            continue;
+        }
+        let holds = {
+            let caps = &proc_at(i).caps;
+            (0..CAP_SLOTS).any(|c| {
+                caps.lookup(abi::CapId(c)).is_some_and(|s| {
+                    s.cap_type == abi::CapType::Irq
+                        && s.object == irq
+                        && s.rights.contains(abi::CapRights::READ)
+                })
+            })
+        };
+        if holds {
+            let p = proc_at(i);
+            p.irq_pending[line] = p.irq_pending[line].saturating_add(1);
+        }
+    }
+}
+
+/// Does process `proc` still hold an `Irq` capability carrying `READ` for `line`?
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table.
+unsafe fn holds_irq(proc: usize, line: u64) -> bool {
+    let caps = &proc_at(proc).caps;
+    (0..CAP_SLOTS).any(|i| {
+        caps.lookup(abi::CapId(i)).is_some_and(|s| {
+            s.cap_type == abi::CapType::Irq
+                && s.object == line
+                && s.rights.contains(abi::CapRights::READ)
+        })
+    })
 }
 
 /// Does process `proc` still hold ANY `Mmio` capability carrying `READ` — i.e. any
@@ -470,6 +539,8 @@ fn grants_for(role: Role) -> &'static [(abi::CapType, abi::CapRights, u64)] {
             // READ cannot map a BAR.
             (abi::CapType::Untyped, abi::CapRights::READ, 0),
             (abi::CapType::Mmio, abi::CapRights::WRITE, MMIO_BASE),
+            // CapId(6): the timer interrupt line. A driver process would hold its device's.
+            (abi::CapType::Irq, abi::CapRights::READ, IRQ_TIMER),
         ],
         // Nothing. A spawned process begins with no authority of its own; what it can do is
         // exactly what its parent delegated (never more — the rights are intersected), so
@@ -620,6 +691,7 @@ unsafe fn load_process<A: Arch>(
             s.role = role;
             s.id = id_arg;
             s.msg_len = 0;
+            s.irq_pending = [0; MAX_IRQ_LINES];
             s.pending_len = 0;
             s.token = token;
             s.frame = A::frame_init(entry, A::USER_STACK_TOP, id_arg);
@@ -1271,6 +1343,29 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             };
             A::frame_set_ret(&mut f, ret);
         }
+        abi::sysno::POLL_IRQ => {
+            // Collecting a device's interrupts is authority: it requires an `Irq`
+            // capability for that source, exactly like every other host-contract op.
+            let cap = abi::CapId(A::frame_arg(&f, 0) as usize);
+            let irq = proc_at(cur).caps.lookup(cap).and_then(|s| {
+                (s.cap_type == abi::CapType::Irq && s.rights.contains(abi::CapRights::READ))
+                    .then_some(s.object)
+            });
+            match irq {
+                None => A::frame_set_ret(&mut f, abi::syserr::NO_CAP),
+                // The capability names WHICH line to collect: a capability for one line
+                // must never return or clear another's count.
+                Some(line) if line < MAX_IRQ_LINES as u64 => {
+                    let p = proc_at(cur);
+                    let n = p.irq_pending[line as usize];
+                    p.irq_pending[line as usize] = 0;
+                    A::frame_set_ret(&mut f, n);
+                }
+                // Real authority, but a line the kernel does not account for: no interrupts
+                // are ever credited to it, so it always reports none.
+                Some(_) => A::frame_set_ret(&mut f, 0),
+            }
+        }
         abi::sysno::REVOKE => {
             // Revoke everything derived from one of OUR capabilities. Holding it is the
             // authority to revoke its derivations — no separate right, and no way to
@@ -1328,6 +1423,8 @@ pub unsafe fn preempt_trap<A: Arch>(frame: *mut u64) -> ! {
     // Save the preempted process's full register state (it never cooperated).
     core::ptr::copy_nonoverlapping(frame, proc_at(cur).frame.0.as_mut_ptr(), A::FRAME_WORDS);
     A::end_of_interrupt();
+    // Deliver the interrupt to whoever holds a capability for it, then reschedule.
+    credit_irq(IRQ_TIMER);
     // Round-robin to the next ready process (the same one if it is alone).
     CURRENT = sched().next().map(|t| t.0).unwrap_or(cur);
     resume_process::<A>(CURRENT)

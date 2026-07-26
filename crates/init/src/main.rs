@@ -472,6 +472,13 @@ fn recv_bytes(cap: u64, buf: &mut [u8]) -> (u64, u64, usize) {
     (status, word, n as usize)
 }
 
+/// Collect device interrupts delivered to us since the last call, via an `Irq` capability.
+/// Returns the count, or `syserr::NO_CAP` if we hold no such capability.
+fn poll_irq(cap: u64) -> u64 {
+    // SAFETY: POLL_IRQ takes a cap id and returns a count; no user memory is touched.
+    unsafe { syscall1(sysno::POLL_IRQ, cap) }
+}
+
 /// Probe whether `va` is still MAPPED, without risking a fault: `DEBUG_WRITE` makes the
 /// kernel READ one byte from there through its permission-checked copy, so the status says
 /// whether the page is still present and user-readable. (It emits that byte to the console,
@@ -702,6 +709,39 @@ fn compute(id: u64) -> ! {
     let _ = get_info(); // any syscall: the return path is what NT would break
     dw!(b"flags: survived a syscall with RFLAGS.NT set\n");
 
+    // Device interrupts are delivered to CAPABILITY HOLDERS. The worker holds CapId(6)
+    // for the timer line; poll until some arrive. A driver process would do exactly this
+    // for its own device's line.
+    let mut ticks = 0u64;
+    let mut tries = 0u64;
+    while ticks < 3 && tries < 200 {
+        // Never fold the error sentinel into the count: losing the capability would
+        // otherwise wrap the total past the threshold and PASS this test for the wrong
+        // reason. Only a real, non-error count is accumulated.
+        let n = poll_irq(6);
+        if n == syserr::NO_CAP {
+            break;
+        }
+        ticks = ticks.wrapping_add(n);
+        spin(200_000);
+        tries = tries.wrapping_add(1);
+    }
+    tag(id);
+    if ticks >= 3 {
+        dw!(b"irq: received device interrupts through the capability (");
+        dbg_dec(ticks);
+        dw!(b")\n");
+    } else {
+        dw!(b"irq: no interrupts delivered (bug)\n");
+    }
+    // And an unheld line is invisible: CapId(9) names nothing we hold.
+    tag(id);
+    if poll_irq(9) == syserr::NO_CAP {
+        dw!(b"irq: polling an unheld line -> NO_CAP\n");
+    } else {
+        dw!(b"irq: polled a line we do not hold (bug)\n");
+    }
+
     tag(id);
     dw!(b"start (compute loop, no yields -- preemption only)\n");
     let mut tick = 0u64;
@@ -928,6 +968,12 @@ fn child(id: u64) -> ! {
         dw!(b"child: no endpoint authority of its own\n");
     } else {
         dw!(b"child: CAN send on the shared endpoint (bug)\n");
+    }
+    tag(id);
+    if poll_irq(6) == syserr::NO_CAP {
+        dw!(b"child: no interrupt authority of its own\n");
+    } else {
+        dw!(b"child: could poll an interrupt line (bug)\n");
     }
     tag(id);
     if map_bar(CapId(1), 0).is_err() {

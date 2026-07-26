@@ -149,6 +149,22 @@ that size; `RECV` returns the byte count actually copied, in a third register
 distinct from both the status and the word. The demo exercises both copy paths
 and checks the bytes arrive intact.
 
+Device **interrupts** are delivered as authority too. `CapType::Irq` names an
+interrupt line; on each interrupt the kernel credits every process holding a
+capability for that line, and `POLL_IRQ` returns and clears the caller's count
+for the line ITS capability names — a capability for one line can never read or
+clear another's, so a driver holding two devices can tell them apart and cannot
+lose one by polling the other. A process with no such capability cannot observe
+those interrupts at all, and revoking the capability drops the credits accrued
+under it, the same doctrine `MAP_BAR` mappings follow. `POLL_IRQ` is
+non-blocking for now: a blocking wait needs the kernel to idle with interrupts
+enabled when nothing is runnable, which interacts with both the deadlock
+detector and the timer handler's assumption that it only ever preempts user code.
+
+With that, a driver process has all four things the host contract owes it:
+device registers (`MAP_BAR`), DMA memory (`ALLOC_VRAM`/`FREE_VRAM`), a way to
+talk to clients (IPC), and its device's interrupts.
+
 Delegated capabilities can be **revoked**. `REVOKE(cap)` destroys everything
 derived from one of the caller's own capabilities — transitively: the children it
 was handed to, the grandchildren they passed it on to, and (via
@@ -235,6 +251,7 @@ compute loop with `DF=1` as a standing regression test.
 | **cap-delegation** ✅ | `SPAWN` can hand the child one of the caller's own capabilities, attenuated: the child gets `caller_rights ∩ requested`, so a parent may narrow but never widen authority, and delegating a cap it does not hold refuses the spawn. Generic; x86 + RISC-V. | done |
 | **cap-revocation** ✅ | `REVOKE(cap)` destroys every capability derived from one of the caller's own, transitively across spaces (kernel ledger) and within each space (`revoke_subtree`); the caller keeps its own. Generic; x86 + RISC-V. | done |
 | **ipc-payload** ✅ | IPC messages carry a byte payload across address spaces (per-process kernel buffer; deferred copy-out when the receiver blocked first), with the copied length returned in a third register. Generic; x86 + RISC-V. | done |
+| **irq-delivery** ✅ | Device interrupts delivered to user processes as capability-gated authority: `CapType::Irq` + `POLL_IRQ`, counted per line, invisible without the capability, dropped on revocation. Generic; x86 + RISC-V. | done |
 | **fault-isolation** ✅ | A user-mode fault kills the faulting process (frames reclaimed, ledger spliced, slot freed) and the scheduler carries on; kernel faults stay fatal. Generic; x86 + RISC-V. | done |
 | **real-mapbar** ✅ | `MAP_BAR` installs a REAL page-table mapping of the window its `Mmio` capability names, instead of reporting a placeholder address: a holder can read and write that physical memory, a non-holder cannot name it, and the kernel bounds every request to the window it reserved. Generic; x86 + RISC-V. | done |
 

@@ -112,6 +112,9 @@ pub enum CapType {
     IommuDomain,
     /// A device MMIO window.
     Mmio,
+    /// A device interrupt line. Holding it is the authority to observe that source's
+    /// interrupts; a process without it cannot see them at all.
+    Irq,
 }
 
 /// Access rights carried by a capability (monotonically non-increasing on derivation).
@@ -236,6 +239,14 @@ pub mod sysno {
     pub const SPAWN: u64 = 8;
     /// `a1` value for [`SPAWN`] meaning "delegate nothing".
     pub const NO_DELEGATE: u64 = u64::MAX;
+    /// Collect device interrupts that have arrived for the caller: `a0` = an `Irq`
+    /// capability (needs `READ`). Returns the number of interrupts counted since the last
+    /// call and resets that count, or `NO_CAP` without blocking if the capability is
+    /// missing, wrong-typed, or lacks `READ`.
+    ///
+    /// Non-blocking by design for now: a blocking wait needs the kernel to idle with
+    /// interrupts enabled when nothing is runnable, which is a separate mechanism.
+    pub const POLL_IRQ: u64 = 11;
     /// Revoke every capability derived from `a0` (one of the caller's own capabilities) by
     /// delegation, transitively — the children it was handed to, the grandchildren they
     /// passed it on to, and anything derived from those within a holder's own space.
