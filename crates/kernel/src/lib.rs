@@ -332,6 +332,11 @@ unsafe fn revoke_delegations<A: Arch>(root_proc: usize, root_cap: usize) {
                     ProcState::BlockedRecv { ep, .. } => {
                         !holds_endpoint(d.child, ep, abi::CapRights::READ)
                     }
+                    // Same doctrine for an interrupt wait, and here it is load-bearing: a
+                    // waiter that can no longer be credited is not merely stuck — it makes
+                    // `nothing_runnable` treat the machine as idle forever, so an
+                    // unprivileged process could hang the kernel and leak its slot.
+                    ProcState::BlockedIrq { line } => !holds_irq(d.child, line),
                     _ => false,
                 };
                 if stranded {
@@ -617,6 +622,22 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
     let mut con = Console::<A>::new();
     // A process waiting on an interrupt is not deadlocked — the hardware will answer it.
     // Park the CPU instead of declaring failure.
+    // Wake any interrupt waiter that has lost the authority to be credited: parking for
+    // one would be parking for an event that can never arrive.
+    for i in 0..MAX_PROCS {
+        if let ProcState::BlockedIrq { line } = proc_at(i).state {
+            if !holds_irq(i, line) {
+                let p = proc_at(i);
+                A::frame_set_ret(&mut p.frame, abi::syserr::NO_CAP);
+                p.state = ProcState::Ready;
+                sched().add(abi::ThreadId(i));
+            }
+        }
+    }
+    if let Some(t) = sched().current() {
+        CURRENT = t.0;
+        resume_process::<A>(t.0);
+    }
     if (0..MAX_PROCS).any(|i| matches!(proc_at(i).state, ProcState::BlockedIrq { .. })) {
         if !IDLING {
             PARKS = PARKS.wrapping_add(1);
@@ -1204,6 +1225,11 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                             proc_at(cur).msg_len = len;
                             proc_at(cur).state = ProcState::BlockedSend { ep, word, len };
                             sched().remove(abi::ThreadId(cur));
+                            // Persist BEFORE a call that may not return here: the handler
+                            // tail normally does this, but `nothing_runnable` can now PARK
+                            // instead of exiting, and this process must later resume on the
+                            // frame it blocked on rather than a stale one.
+                            proc_at(cur).frame = f;
                             match sched().current() {
                                 Some(t) => CURRENT = t.0,
                                 None => nothing_runnable::<A>(),
@@ -1264,6 +1290,8 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                         // No sender yet: block, recording the buffer we offered.
                         proc_at(cur).state = ProcState::BlockedRecv { ep, dst, max };
                         sched().remove(abi::ThreadId(cur));
+                        // See the SEND path: persist before a call that may not return.
+                        proc_at(cur).frame = f;
                         match sched().current() {
                             Some(t) => CURRENT = t.0,
                             None => nothing_runnable::<A>(),
