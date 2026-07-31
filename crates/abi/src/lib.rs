@@ -248,8 +248,14 @@ pub mod sysno {
     /// interrupts enabled when nothing is runnable, which is a separate mechanism.
     pub const POLL_IRQ: u64 = 11;
     /// Like [`POLL_IRQ`] but BLOCKS until at least one interrupt has arrived on the line
-    /// its capability names, then returns the count (never zero). `a0` = an `Irq`
-    /// capability (needs `READ`); `NO_CAP` if it is missing/wrong-typed/lacks `READ`.
+    /// its capability names, then returns the count. `a0` = an `Irq` capability (needs
+    /// `READ`); `NO_CAP` if it is missing/wrong-typed/lacks `READ`.
+    ///
+    /// Returns `0` — without blocking — for a capability naming a line the kernel does not
+    /// deliver. Blocking there would be an unwakeable sleep, and since the kernel treats a
+    /// process waiting on an interrupt as idle rather than deadlocked, one such waiter
+    /// would park the machine forever. A caller that must distinguish "none yet" from
+    /// "never" should treat `0` from a *blocking* wait as "this line is not delivered".
     pub const WAIT_IRQ: u64 = 12;
     /// Revoke every capability derived from `a0` (one of the caller's own capabilities) by
     /// delegation, transitively — the children it was handed to, the grandchildren they

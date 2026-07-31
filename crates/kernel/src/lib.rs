@@ -198,6 +198,30 @@ const IRQ_TIMER: u64 = 0;
 /// clear another line's count.
 const MAX_IRQ_LINES: usize = 8;
 
+/// The lines this kernel actually DELIVERS, as a bitmask over `0..MAX_IRQ_LINES`. This is
+/// the delivery half of interrupt authority: [`credit_irq`] is called for exactly these
+/// lines and no others.
+///
+/// A capability is permission to receive a line; it is not a promise that anything ever
+/// fires. `WAIT_IRQ` blocks, so the two halves have to agree — parking for a line nothing
+/// credits is an unwakeable sleep, and because a parked process makes [`nothing_runnable`]
+/// treat the machine as idle rather than deadlocked, ONE such process hangs the whole
+/// kernel. That is the same failure the revoked-capability fix closed, arriving by a
+/// different route, so rather than re-close it per mechanism this mask is the single place
+/// the two halves are tied together: grants are validated against it at boot, `WAIT_IRQ`
+/// refuses to park outside it, and the idle path refuses to wait on it.
+///
+/// Wiring a real device line means adding it here AND crediting it from the handler that
+/// takes it. Granting a line without doing both fails the boot check loudly instead of
+/// hanging the machine once someone waits on it.
+const DELIVERED_IRQ_LINES: u64 = 1 << IRQ_TIMER;
+
+/// Does the kernel deliver `line` at all? See [`DELIVERED_IRQ_LINES`].
+const fn delivers_irq(line: u64) -> bool {
+    // The bound is load-bearing, not defensive: it keeps the shift in range.
+    line < MAX_IRQ_LINES as u64 && DELIVERED_IRQ_LINES & (1 << line) != 0
+}
+
 /// Physical base of the stand-in "device" window every `Mmio` capability names. Reserved
 /// at boot from the frame allocator and filled with a signature, so a process that maps it
 /// through `MAP_BAR` can prove it really reached that physical memory — the same path a
@@ -336,7 +360,7 @@ unsafe fn revoke_delegations<A: Arch>(root_proc: usize, root_cap: usize) {
                     // waiter that can no longer be credited is not merely stuck — it makes
                     // `nothing_runnable` treat the machine as idle forever, so an
                     // unprivileged process could hang the kernel and leak its slot.
-                    ProcState::BlockedIrq { line } => !holds_irq(d.child, line),
+                    ProcState::BlockedIrq { line } => !creditable(d.child, line),
                     _ => false,
                 };
                 if stranded {
@@ -424,6 +448,19 @@ unsafe fn credit_irq<A: Arch>(irq: u64) {
             sched().add(abi::ThreadId(i));
         }
     }
+}
+
+/// Can a wait by `proc` on `line` ever be answered? It takes BOTH halves of interrupt
+/// authority: present permission (`holds_irq` — a revoked capability stops delivery, since
+/// [`credit_irq`] re-tests authority on every tick) and a line the kernel delivers at all
+/// ([`delivers_irq`]). With either half missing the wait is unwakeable, and a process left
+/// in that state parks the kernel forever, so this is the predicate every blocking and
+/// idling decision about interrupts must use — never `holds_irq` alone.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table.
+unsafe fn creditable(proc: usize, line: u64) -> bool {
+    delivers_irq(line) && holds_irq(proc, line)
 }
 
 /// Does process `proc` still hold an `Irq` capability carrying `READ` for `line`?
@@ -622,11 +659,12 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
     let mut con = Console::<A>::new();
     // A process waiting on an interrupt is not deadlocked — the hardware will answer it.
     // Park the CPU instead of declaring failure.
-    // Wake any interrupt waiter that has lost the authority to be credited: parking for
-    // one would be parking for an event that can never arrive.
+    // Wake any interrupt waiter that cannot be credited — no authority left, or a line
+    // nothing delivers: parking for one would be parking for an event that can never
+    // arrive, and the park is indistinguishable from a working machine.
     for i in 0..MAX_PROCS {
         if let ProcState::BlockedIrq { line } = proc_at(i).state {
-            if !holds_irq(i, line) {
+            if !creditable(i, line) {
                 let p = proc_at(i);
                 A::frame_set_ret(&mut p.frame, abi::syserr::NO_CAP);
                 p.state = ProcState::Ready;
@@ -701,6 +739,17 @@ unsafe fn load_process<A: Arch>(
     elf: &[u8],
 ) -> bool {
     use abi::FrameAllocator as _;
+    // Refuse the role before allocating anything. The boot sweep validates the tables from
+    // a hand-written list of roles; this validates whatever role is ACTUALLY loaded, so a
+    // role added later cannot slip past by being missing from that list. It has to come
+    // first: once the address space is built the frames are only tracked by `s.frames`,
+    // which a later bail-out would never write — an early return further down leaks them.
+    if grants_for(role)
+        .iter()
+        .any(|&(t, _, object)| t == abi::CapType::Irq && !delivers_irq(object))
+    {
+        return false;
+    }
     // Build the address space through a recorder so every allocated frame is tracked for
     // reclamation on exit. Kept in a local list until the build succeeds.
     let mut frames = [abi::PhysAddr(0); MAX_PROC_FRAMES];
@@ -823,6 +872,35 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
 
     A::init_traps();
     let _ = writeln!(con, "  traps installed");
+
+    // Tie interrupt AUTHORITY to interrupt DELIVERY at the only place authority is minted.
+    // The role tables are the sole origin of an `Irq` capability — `SPAWN` delegation copies
+    // a parent's type and object verbatim and can only narrow rights — so validating them
+    // here closes the invariant for every capability that can ever exist: no process can
+    // hold authority for a line the kernel does not deliver, and therefore no process can
+    // reach a `WAIT_IRQ` that never returns. Checked at boot rather than asserted in a
+    // comment, because the cost of getting it wrong is a hung machine, not a wrong answer.
+    for role in [Role::Producer, Role::Consumer, Role::Worker, Role::Child] {
+        for &(cap_type, _, object) in grants_for(role) {
+            if cap_type == abi::CapType::Irq && !delivers_irq(object) {
+                let _ = writeln!(
+                    con,
+                    "\n[irq] the {} grant table hands out line {}, which no handler credits\
+                     \n      (delivered mask {:#x}) — a process waiting on it would park the\
+                     \n      kernel forever. Deliver the line or drop the grant.",
+                    role_name(role),
+                    object,
+                    DELIVERED_IRQ_LINES
+                );
+                A::exit(false);
+            }
+        }
+    }
+    let _ = writeln!(
+        con,
+        "  irq delivery mask {:#x} — every granted line is credited",
+        DELIVERED_IRQ_LINES
+    );
 
     #[cfg(feature = "provoke-fault")]
     {
@@ -1414,7 +1492,7 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             });
             match irq {
                 None => A::frame_set_ret(&mut f, abi::syserr::NO_CAP),
-                Some(line) if line < MAX_IRQ_LINES as u64 => {
+                Some(line) if delivers_irq(line) => {
                     let p = proc_at(cur);
                     let n = p.irq_pending[line as usize];
                     if n > 0 {
@@ -1435,7 +1513,11 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                         }
                     }
                 }
-                // Authority for a line the kernel never credits: waiting would never end.
+                // Authority for a line the kernel never delivers (out of range, or simply
+                // not wired): waiting would never end, and a parked waiter would idle the
+                // kernel forever, so report "nothing pending" rather than block. The boot
+                // check makes this arm unreachable for a granted line — it is the second
+                // gate, not the first.
                 Some(_) => A::frame_set_ret(&mut f, 0),
             }
         }

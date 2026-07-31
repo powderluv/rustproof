@@ -780,7 +780,11 @@ fn compute(id: u64) -> ! {
     // time. If it declared deadlock instead, the boot would fail here.
     let _ = poll_irq(6); // drain first, so the wait below genuinely has to block
     tag(id);
-    if wait_irq(6) > 0 {
+    // `> 0` alone would pass on the error sentinel too (NO_CAP is u64::MAX - 1), printing
+    // success for a wait that never happened. An oracle that can pass for the wrong reason
+    // is worse than no oracle.
+    let n = wait_irq(6);
+    if n > 0 && n != syserr::NO_CAP {
         debug_write(b"irq: blocked with no credits and hardware woke us\n");
     } else {
         debug_write(b"irq: final wait returned nothing (bug)\n");

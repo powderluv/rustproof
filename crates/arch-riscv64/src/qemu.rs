@@ -8,8 +8,18 @@
 const SIFIVE_TEST: usize = 0x10_0000;
 /// Finisher command: pass / clean shutdown (QEMU process exit code 0).
 const FINISHER_PASS: u32 = 0x5555;
-/// Finisher command: fail / error shutdown (QEMU process exits non-zero).
-const FINISHER_FAIL: u32 = 0x3333;
+/// Finisher command: fail / error shutdown -> QEMU process exit code 1.
+///
+/// The exit code is the HIGH half: `sifive_test` computes `(value >> 16) & 0xffff` and exits
+/// with it, so a bare `0x3333` asks QEMU to fail and then exits **zero** — indistinguishable
+/// from the clean shutdown `FINISHER_PASS` produces, i.e. a kernel that gave up looking
+/// successful to anything reading `$?`. Measured, not assumed: `0x3333` -> 0, `0x1_3333` -> 1.
+///
+/// x86 differs and cannot be made to match: its `isa-debug-exit` device computes
+/// `(code << 1) | 1`, so EVERY exit is odd — 33 on success, 35 on failure. There "0 means
+/// success" never holds. Hence the runner scripts decide PASS/FAIL from console output on
+/// both arches; this constant only stops the riscv status from actively lying.
+const FINISHER_FAIL: u32 = (1 << 16) | 0x3333;
 
 #[inline]
 fn finish(code: u32) {

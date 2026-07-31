@@ -167,6 +167,28 @@ during that park interrupted the KERNEL, so there is no user frame to save and
 stack, because an interrupt taken while already in the kernel pushes onto the
 current stack — without that reset, each tick would grow it without bound.
 
+Blocking made a second thing load-bearing that polling did not care about:
+**authority is only half of it**. A capability is permission to receive a line;
+it is not a promise that anything ever fires. A process parked on a line nothing
+delivers is asleep forever — and because the kernel reads "someone is waiting on
+an interrupt" as *idle* rather than deadlocked, one such process parks the whole
+machine, with no deadlock report and no failing exit. That is a hang an
+unprivileged process can cause, so the two halves have to be tied together, not
+merely documented next to each other.
+
+`DELIVERED_IRQ_LINES` is where they are tied. It is a bitmask of the lines the
+kernel actually credits, and it is consulted at three places: the grant boundary
+(a role whose table hands out an undelivered line is refused at boot, and again
+at load time, so a role added later cannot slip past a hand-written list),
+`WAIT_IRQ` (which returns 0 rather than parking outside the mask), and the idle
+path (which wakes a waiter it can never credit instead of parking for it). The
+same predicate — `creditable` = delivers **and** still holds the capability —
+now guards every blocking and idling decision about interrupts, because the
+revocation hang and the never-delivered hang are the same bug reached two ways.
+Wiring a real device line means adding it to the mask *and* crediting it from
+the handler; doing one without the other fails the boot check loudly instead of
+hanging the machine later.
+
 Honest scope: the kernel reports how many times it parked, and in the current
 demo that is **zero** — some process is always runnable, so the park is
 reachable by construction but not yet exercised. The counter is the standing
