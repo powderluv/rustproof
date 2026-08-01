@@ -189,10 +189,40 @@ Wiring a real device line means adding it to the mask *and* crediting it from
 the handler; doing one without the other fails the boot check loudly instead of
 hanging the machine later.
 
-Honest scope: the kernel reports how many times it parked, and in the current
-demo that is **zero** — some process is always runnable, so the park is
-reachable by construction but not yet exercised. The counter is the standing
-check; it will read nonzero the moment a workload actually idles.
+For a long time the kernel reported parking **zero** times: some process was
+always runnable, so the idle path was reachable by construction and never once
+executed. Reasoning about a path is not running it — two defects had already
+been found in this one by review alone — so the demo now contains the workload
+that actually idles a machine. The worker delegates its interrupt line to a
+**helper child**, attenuated to READ, whose entire job is to block on it. That
+is the shape a driver has, and it is also the only way to reach the park: once
+the other processes exit, the helper is blocked in the kernel with nothing
+runnable behind it, which is precisely what `Arch::idle` is for.
+
+The counter now reads in the low hundreds on both arches (x86 244, riscv 258 in
+the runs this text was written from — it is a duration in timer ticks, not a
+fixed number, so it moves). The helper doubles as the first test of *delegated*
+interrupt authority: no role table grants a child an `Irq` capability, so a
+child that can block on a line got that right from its parent and nowhere else.
+
+Adding it surfaced a separate problem worth recording, because it is the same
+shape as the one above. The demo's children self-replicate — each one delegates
+its capability onward — so the chain grows until the process table is full, *at
+any table size*. It was started early enough to take the recycled slots before
+the worker's own late spawn could, and that spawn is the only thing that creates
+the process exercising delegated-MMIO attenuation, revocation teardown, and the
+deliberate wild write. On RISC-V it lost that race every time: four assertions —
+including the only test that a ring-3 fault kills just the faulting process —
+never ran, and the boot still printed `BOOT OK`, because the demo printed the
+failed spawn's `u64::MAX` sentinel as if it were a pid. The chain now starts
+after that spawn, and a refused spawn is a `(bug)` line rather than a number.
+RISC-V had therefore never once executed its user-fault kill path; it does now.
+
+Two honest notes. The helper's loop is bounded by a tick count chosen to outlast
+the rest of the demo, not by observing that it is alone — a process cannot see
+the run queue, and giving it a way to would be authority it should not have. And
+the park exercised here is always ended by the periodic timer; a line that stays
+quiet for a long time is not yet covered.
 
 With that, a driver process has all four things the host contract owes it:
 device registers (`MAP_BAR`), DMA memory (`ALLOC_VRAM`/`FREE_VRAM`), a way to

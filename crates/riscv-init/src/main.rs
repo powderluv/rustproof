@@ -162,6 +162,13 @@ fn exit(code: u64) -> ! {
     }
 }
 
+/// How many times the interrupt helper blocks before giving up and exiting. It has to
+/// outlast every other process, because the kernel only parks once nothing else is
+/// runnable — a helper that finishes first would prove nothing. Each iteration costs one
+/// timer period, so this is a duration in ticks, not a workload -- the Sstc timer runs at ~400 Hz, so this is ~3 s, chosen to
+/// outlast the rest of the demo with margin rather than to hit a particular count.
+const IRQ_HELPER_WAITS: u64 = 300;
+
 /// Busy-compute for ~`iters` iterations without making any syscall, so only the supervisor
 /// timer interrupt can interleave this process with its siblings. `core::hint::black_box`
 /// keeps the loop from being optimized away.
@@ -518,13 +525,23 @@ fn compute(id: u64) -> ! {
     // Proc 2 dynamically spawns one child process (which runs this same compute path); the
     // child's `[proc N]` ticks then appear in the schedule, proving runtime process creation.
     if id == 2 {
-        // Delegate our Untyped cap (CapId(2), full rights). A child's role grants nothing,
-        // so this is the ONLY authority it will have — the positive half of the test.
-        let child = spawn_delegating(2, 2, 0b111);
+        // Hand our INTERRUPT line to a helper, attenuated to READ. This is the shape a
+        // driver actually has -- a process whose whole job is to block on its device --
+        // and it is the only thing here that makes the machine go IDLE: once everyone
+        // else has exited, the helper is blocked in the kernel with nothing runnable
+        // behind it, the exact state `Arch::idle` exists for and that no earlier version
+        // of this demo ever reached. Spawned before the other children take the process
+        // slots, and CHECKED: a refused spawn would silently cost us the only coverage
+        // the idle path has, which is how it went unexercised for this long.
+        let helper = spawn_delegating(2, 6, 0b001);
         tag(id);
-        debug_write(b"spawned child pid=");
-        dbg_dec(child);
-        debug_write(b"\n");
+        if helper == u64::MAX {
+            debug_write(b"irq: could NOT spawn the interrupt helper (bug)\n");
+        } else {
+            debug_write(b"irq: spawned an interrupt helper -> pid ");
+            dbg_dec(helper);
+            debug_write(b"\n");
+        }
     }
     // Device interrupts are delivered to CAPABILITY HOLDERS. The worker holds CapId(6)
     // for the timer line; poll until some arrive. A driver process would do exactly this
@@ -737,8 +754,31 @@ fn compute(id: u64) -> ! {
         // attenuate the access it grants, or delegation would widen authority.
         let late = spawn_delegating(2, 1, 0b001);
         tag(id);
-        debug_write(b"late spawn into a recycled slot -> pid ");
-        dbg_dec(late);
+        // CHECKED, like the helper spawn: this is the only process that ever exercises the
+        // delegated-MMIO branch of `child()` -- the read-only window, the revocation
+        // teardown, AND the deliberate wild write that proves a ring-3 fault kills only the
+        // faulting process. Printing the u64::MAX sentinel as a pid, as this used to, meant
+        // a boot that silently tested four fewer things still said BOOT OK. On riscv it did
+        // exactly that.
+        if late == u64::MAX {
+            debug_write(b"late spawn into a recycled slot REFUSED -- no free process slot (bug)\n");
+        } else {
+            debug_write(b"late spawn into a recycled slot -> pid ");
+            dbg_dec(late);
+            debug_write(b"\n");
+        }
+
+        // The chain starts HERE, not at the top of this function. Each child re-runs this
+        // path and delegates onward, so it self-replicates until the process table is full
+        // -- at any table size. Started earlier it took the recycled producer/consumer
+        // slots before the spawn above could, which is what starved that spawn on riscv;
+        // raising MAX_PROCS does not help, because the chain simply grows to fill it.
+        // Delegate our Untyped cap (CapId(2), full rights). A child's role grants nothing,
+        // so this is the ONLY authority it will have — the positive half of the test.
+        let child = spawn_delegating(2, 2, 0b111);
+        tag(id);
+        debug_write(b"spawned child pid=");
+        dbg_dec(child);
         debug_write(b"\n");
     }
 
@@ -817,6 +857,32 @@ fn child(id: u64) -> ! {
         debug_write(b"child: no device authority of its own\n");
     } else {
         debug_write(b"child: mapped a BAR (bug)\n");
+    }
+
+    // Were we handed an INTERRUPT line? Then we are the driver's helper. No role table
+    // grants a child interrupt authority, so it working at all is the delegation test;
+    // and blocking on it repeatedly is what drives the kernel into its idle park.
+    if poll_irq(0) != syserr::NO_CAP {
+        tag(id);
+        debug_write(b"deleg: delegated Irq WORKS (authority no role granted us)\n");
+        let mut woke = 0u64;
+        let mut i = 0u64;
+        while i < IRQ_HELPER_WAITS {
+            let n = wait_irq(0);
+            // NO_CAP means the kernel woke us because our authority went away; 0 means it
+            // refused to park at all. Either ends the loop -- spinning on an error would
+            // burn the CPU and, worse, report success below for a wait that never blocked.
+            if n == 0 || n == syserr::NO_CAP {
+                break;
+            }
+            woke = woke.wrapping_add(1);
+            i = i.wrapping_add(1);
+        }
+        tag(id);
+        debug_write(b"irq: helper woke ");
+        dbg_dec(woke);
+        debug_write(b" time(s) on a delegated line\n");
+        exit(id);
     }
 
     // What did our parent delegate? A device capability takes the mapping path.
