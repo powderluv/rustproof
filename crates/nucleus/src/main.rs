@@ -46,6 +46,14 @@ extern "C" fn rustproof_timer_trap(frame: *mut u64) -> ! {
     unsafe { kernel::preempt_trap::<CurrentArch>(frame) }
 }
 
+/// The console IRQ stub (arch-x86_64, vector 0x24) tail-calls this symbol with the same
+/// frame layout the timer uses. Credits the console's logical line and never returns.
+#[no_mangle]
+extern "C" fn rustproof_device_trap(frame: *mut u64) -> ! {
+    // SAFETY: `frame` is the on-kernel-stack IRQ trap frame the arch stub built.
+    unsafe { kernel::device_trap::<CurrentArch>(frame) }
+}
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     arch_x86_64::kprintln!("nucleus PANIC: {}", info);

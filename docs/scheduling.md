@@ -218,11 +218,47 @@ failed spawn's `u64::MAX` sentinel as if it were a pid. The chain now starts
 after that spawn, and a refused spawn is a `(bug)` line rather than a number.
 RISC-V had therefore never once executed its user-fault kill path; it does now.
 
-Two honest notes. The helper's loop is bounded by a tick count chosen to outlast
-the rest of the demo, not by observing that it is alone — a process cannot see
-the run queue, and giving it a way to would be authority it should not have. And
-the park exercised here is always ended by the periodic timer; a line that stays
-quiet for a long time is not yet covered.
+There is now a **second** interrupt line, and it changes what the earlier claims
+are worth. The kernel numbers lines itself — 0 the timer, 1 the console — and
+each arch maps its own hardware onto them (x86 IRQ0/IRQ4 through the 8259,
+riscv the Sstc timer and PLIC source 10), so a capability names the same thing
+on both and the role tables stay arch-neutral. Until it existed, "a capability
+for one line can never read or clear another's" was true only because there was
+no other line; the demo now holds both as separate capabilities and checks that
+the timer's count accrues while the console's stays at zero.
+
+The console is also the kernel's only *quiet* source. The timer fires whether or
+not anything happened, so a process blocked on it always wakes by itself, and
+every park up to now was ended by the clock merely re-parking us. A process
+blocked on the console cannot be woken by the kernel at all: the timer fires
+throughout and cannot credit that line, so the machine parks until a byte
+actually arrives from outside. The demo ends on exactly that wait, and the
+harness supplies the byte. Withhold it and the guest stays parked and the run
+times out — the success line is reachable only by a real device interrupt.
+
+Getting the evidence right took two corrections worth recording, because both
+were cases of a test proving less than it appeared to. First, *when* the byte is
+sent cannot be a delay. Sent too early it is consumed by the per-line check
+above, which reads and clears the console count, leaving nothing to wake the
+final wait: a correct kernel then reports a false leak and hangs. Sent while
+other processes are still runnable it is taken on the device handler's ordinary
+path, waking nobody from a park — the run passes having never exercised the one
+new path. So the harness waits for two *observations* instead: the process
+announcing it is blocked, and the interrupt helper finishing. Silence alone is
+not enough, because the helper spends seconds blocking and waking on the timer
+while printing nothing, so a quiet log there means busy, not parked.
+
+Second, the guest cannot testify to this. Its success line is satisfied by any
+console credit, park or no park, so the kernel counts the parks a device
+actually ended and prints that separately from the park count; the runner fails
+the boot if it is zero. That counter immediately paid for itself: with the
+timing-based harness, x86 ended a park and **riscv did not** — the byte landed
+while its helper still ran — and nothing else in the run distinguished the two.
+
+One honest note remains. The helper's loop is bounded by a tick count chosen to
+outlast the rest of the demo, not by observing that it is alone — a process
+cannot see the run queue, and giving it a way to would be authority it should
+not have.
 
 With that, a driver process has all four things the host contract owes it:
 device registers (`MAP_BAR`), DMA memory (`ALLOC_VRAM`/`FREE_VRAM`), a way to

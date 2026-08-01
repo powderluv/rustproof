@@ -20,6 +20,32 @@ impl Serial {
         outb(COM1 + 4, 0x03); // RTS/DSR set
     }
 
+    /// Enable the "received data available" interrupt (IER bit 0), so a byte arriving on
+    /// the console raises IRQ4. This is the nucleus's stand-in for a real device's
+    /// interrupt: unlike the timer it fires only when something actually happens, which is
+    /// what a driver waiting on its hardware is really doing.
+    ///
+    /// # Safety
+    /// Touches COM1's UART registers; call once during boot.
+    pub unsafe fn enable_rx_interrupt() {
+        outb(COM1 + 1, 0x01);
+    }
+
+    /// Read and discard every byte the UART has buffered.
+    ///
+    /// Draining is not optional: the 16550 keeps its receive interrupt asserted until the
+    /// receive buffer is empty, so an unread byte re-raises IRQ4 forever and the machine
+    /// livelocks in the handler. We only care that input ARRIVED, not what it was.
+    ///
+    /// # Safety
+    /// Touches COM1's UART registers; call from the IRQ4 handler.
+    pub unsafe fn drain_rx() {
+        // Line Status Register bit 0 = data ready.
+        while inb(COM1 + 5) & 0x01 != 0 {
+            let _ = inb(COM1);
+        }
+    }
+
     #[inline]
     fn transmit_empty() -> bool {
         unsafe { inb(COM1 + 5) & 0x20 != 0 }

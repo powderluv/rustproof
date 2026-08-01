@@ -16,6 +16,21 @@ const PIT_HZ: u32 = 1_193_182;
 /// The IDT vector IRQ0 (the timer) is remapped to.
 pub const TIMER_VECTOR: usize = 0x20;
 
+/// The IDT vector IRQ4 (COM1 receive) is remapped to — the console device's interrupt.
+pub const CONSOLE_VECTOR: usize = 0x24;
+
+/// The IDT vector IRQ7 is remapped to: where the 8259 reports a SPURIOUS interrupt.
+pub const SPURIOUS_VECTOR: usize = 0x27;
+
+/// Unmask IRQ4 (COM1) on the master PIC, leaving the timer unmasked too.
+///
+/// # Safety
+/// Touches the PIC's mask register; call after [`remap_and_mask`].
+pub unsafe fn unmask_console() {
+    // Clear bit 0 (timer) and bit 4 (COM1); everything else stays masked.
+    outb(PIC1_DATA, !(1 << 0) & !(1 << 4));
+}
+
 /// Remap the master/slave PICs to vectors 0x20..0x2F (clear of the CPU exception vectors
 /// 0..31), then mask every IRQ except the timer (IRQ0 on the master).
 pub unsafe fn remap_and_mask() {

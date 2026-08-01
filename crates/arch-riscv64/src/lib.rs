@@ -11,6 +11,7 @@ pub mod boot;
 pub mod csr;
 pub mod interrupts;
 pub mod mmu;
+pub mod plic;
 pub mod qemu;
 pub mod serial;
 pub mod timer;

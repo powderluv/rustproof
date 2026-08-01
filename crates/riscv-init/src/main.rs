@@ -830,6 +830,37 @@ fn compute(id: u64) -> ! {
         debug_write(b"irq: final wait returned nothing (bug)\n");
     }
 
+    // TWO lines, held as two separate capabilities, is what makes the per-line claims
+    // testable at all: with only the timer, "a capability for one line can never read or
+    // clear another's" was true purely because there was no other line. The timer has been
+    // firing throughout; the console has not fired at all. So CapId(7) must read ZERO while
+    // CapId(6) reads a real count, and neither may drain the other.
+    let ticks = poll_irq(6);
+    let bytes = poll_irq(7);
+    tag(id);
+    if ticks > 0 && ticks != syserr::NO_CAP && bytes == 0 {
+        debug_write(b"irq: two lines stay separate (timer counted, console still quiet)\n");
+    } else if bytes == syserr::NO_CAP {
+        debug_write(b"irq: no authority for the console line (bug)\n");
+    } else {
+        debug_write(b"irq: one line's count leaked into the other (bug)\n");
+    }
+
+    // Now block on the CONSOLE line. Nothing the kernel does can end this wait: the timer
+    // fires throughout and cannot credit it, so the kernel parks, wakes on each tick with
+    // nobody to run, and parks again -- until a byte actually arrives from outside. Every
+    // park until now was ended by the clock; this one is ended by a device, which is the
+    // thing a driver waiting on its hardware is really doing.
+    tag(id);
+    debug_write(b"irq: blocking on the console line -- only real input can wake us\n");
+    let c = wait_irq(7);
+    tag(id);
+    if c > 0 && c != syserr::NO_CAP {
+        debug_write(b"irq: woke on a REAL device interrupt, not the clock\n");
+    } else {
+        debug_write(b"irq: console wait returned nothing (bug)\n");
+    }
+
     exit(id);
 }
 

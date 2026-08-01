@@ -105,10 +105,16 @@ extern "C" {
     /// The nucleus's user-fault handler: kills the faulting process and resumes another.
     /// The reason crosses as a (ptr, len) pair so no `str` crosses the FFI boundary.
     fn rustproof_fault_trap(what: *const u8, what_len: usize, addr: u64) -> !;
+    /// The nucleus's DEVICE interrupt handler (the console, via the PLIC). Same frame
+    /// layout and never-returns contract as the timer; it credits a different line.
+    fn rustproof_device_trap(frame: *mut u64) -> !;
 }
 
 /// `scause` code for a supervisor timer interrupt (with the interrupt bit set).
 const INTR_S_TIMER: u64 = 5;
+
+/// `scause` code for a supervisor EXTERNAL interrupt (the PLIC), with the interrupt bit set.
+const INTR_S_EXTERNAL: u64 = 9;
 
 fn exception_name(code: u64) -> &'static str {
     match code {
@@ -153,6 +159,15 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame) -> ! {
     if is_interrupt && code == INTR_S_TIMER {
         // SAFETY: `frame` is the on-stack trap frame; the handler never returns.
         unsafe { rustproof_timer_trap(frame as *mut u64) }
+    }
+
+    // Supervisor external interrupt: a device (the console UART, via the PLIC). Same
+    // contract as the timer — `sepc` is not advanced, the handler never returns — but it
+    // credits a different logical line, and it is the one interrupt that can end an idle
+    // park for a real reason rather than just re-parking us.
+    if is_interrupt && code == INTR_S_EXTERNAL {
+        // SAFETY: `frame` is the on-stack trap frame; the handler never returns.
+        unsafe { rustproof_device_trap(frame as *mut u64) }
     }
 
     // A trap from U-mode (sstatus.SPP == 0) is that process's failure: kill it and carry

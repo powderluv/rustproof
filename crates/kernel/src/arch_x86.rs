@@ -222,6 +222,28 @@ impl Arch for X86 {
         syscall::idle()
     }
 
+    fn start_console_irq() {
+        // COM1 receive -> IRQ4 -> vector 0x24 -> the device stub. The UART's interrupt is
+        // enabled last: the gate and the mask must be in place before the line can assert.
+        unsafe {
+            interrupts::set_gate(pic::CONSOLE_VECTOR, interrupts::console_handler_addr());
+            // A second unmasked line is what makes a spurious IRQ7 reachable; give it a
+            // gate before enabling the source, or the first one kills the guest.
+            interrupts::set_gate(pic::SPURIOUS_VECTOR, interrupts::spurious_handler_addr());
+            pic::unmask_console();
+            Serial::enable_rx_interrupt();
+        }
+    }
+
+    fn console_irq_ack() {
+        // Drain first, EOI second: EOI only clears the controller's latch, and a byte still
+        // sitting in the UART would immediately re-assert IRQ4.
+        unsafe {
+            Serial::drain_rx();
+            pic::eoi_master();
+        }
+    }
+
     fn end_of_interrupt() {
         unsafe { pic::eoi_master() }
     }

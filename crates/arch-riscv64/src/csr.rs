@@ -31,6 +31,9 @@ pub const STIMECMP: u32 = 0x14D;
 /// `sie.STIE` (bit 5): enable the supervisor timer interrupt source.
 pub const SIE_STIE: u64 = 1 << 5;
 
+/// `sie.SEIE` — supervisor EXTERNAL interrupt enable (the PLIC's line into this hart).
+pub const SIE_SEIE: u64 = 1 << 9;
+
 /// `sstatus.SPP` (bit 8): previous privilege — 0 returns to U-mode on `sret`.
 pub const SSTATUS_SPP: u64 = 1 << 8;
 /// `sstatus.SPIE` (bit 5): previous interrupt-enable, restored into SIE on `sret`.

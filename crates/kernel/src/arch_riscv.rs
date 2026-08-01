@@ -1,7 +1,7 @@
 //! RISC-V (rv64) implementation of the `hal` traits.
 use abi::{FrameAllocator, MemoryKind, MemoryRegion, PhysAddr, VirtAddr};
 use arch_riscv64::interrupts::{self, TrapFrame};
-use arch_riscv64::{csr, mmu, qemu, serial::Uart, timer};
+use arch_riscv64::{csr, mmu, plic, qemu, serial::Uart, timer};
 use hal::{Arch, Perms, Space, UserFrame};
 use vspace_riscv::{PageFlags, PageTable, Pte};
 
@@ -233,6 +233,28 @@ impl Arch for Riscv {
 
     unsafe fn idle() -> ! {
         mmu::idle()
+    }
+
+    fn start_console_irq() {
+        // UART0 -> PLIC source 10 -> this hart's S-mode context -> scause 9. The CSR enable
+        // comes last, so the route is complete before the line can assert.
+        unsafe {
+            plic::enable_source(plic::UART0_SOURCE);
+            Uart::enable_rx_interrupt();
+            let sie = csr::read::<{ csr::SIE }>();
+            csr::write::<{ csr::SIE }>(sie | csr::SIE_SEIE);
+        }
+    }
+
+    fn console_irq_ack() {
+        // Claim, drain, complete. Draining between the two is what stops the source
+        // re-asserting the moment we complete it: the PLIC re-arms a source that is still
+        // pending at the device.
+        unsafe {
+            let source = plic::claim();
+            Uart::drain_rx();
+            plic::complete(source);
+        }
     }
 
     fn end_of_interrupt() {

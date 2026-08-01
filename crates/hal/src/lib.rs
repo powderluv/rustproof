@@ -183,6 +183,21 @@ pub trait Arch {
     /// [`init_traps`](Self::init_traps), before the first process runs.
     fn start_preemption();
 
+    /// Enable the CONSOLE device's receive interrupt and route it to the nucleus's device
+    /// handler. Called once at boot, after [`start_preemption`](Self::start_preemption).
+    ///
+    /// This is the kernel's second interrupt source and its only *quiet* one: the timer
+    /// fires whether or not anything happened, so a process blocked on it always wakes on
+    /// its own. A console byte arrives only when something really happens, which is what a
+    /// driver waiting on its device is doing — and it is the only way the idle park is ever
+    /// ended by something other than the clock.
+    fn start_console_irq();
+
+    /// Acknowledge a console interrupt: DRAIN the device, then end-of-interrupt at the
+    /// controller. Draining is not optional — a UART holds its interrupt asserted until its
+    /// receive buffer is empty, so an unread byte re-raises the line forever.
+    fn console_irq_ack();
+
     /// Park the CPU until an interrupt arrives, with interrupts ENABLED — the state to be
     /// in when every process is waiting on one. Resets the stack pointer to a dedicated
     /// idle stack first, because an interrupt taken while already in the kernel pushes onto

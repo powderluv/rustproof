@@ -188,10 +188,26 @@ static mut IDLING: bool = false;
 /// How many times the kernel parked waiting for an interrupt. Reported at the end, so
 /// whether the idle path actually ran is observable rather than assumed.
 static mut PARKS: u64 = 0;
+/// How many times a DEVICE interrupt ended a park — woke a process from a machine that had
+/// nothing to run. Counted separately from [`PARKS`] because the timer re-parks us without
+/// waking anyone, so a nonzero park count says nothing about whether a device ever did the
+/// waking. This is the only direct evidence for that property; without it the demo's
+/// success line is also printed by a console byte that arrives while other processes are
+/// still runnable, which ends no park at all.
+static mut DEVICE_WAKES: u64 = 0;
 
-/// The interrupt source the kernel currently delivers: the periodic timer. A real driver
-/// would hold an `Irq` capability for its device's line instead.
+/// Logical interrupt lines. These are the kernel's OWN numbering, not any controller's:
+/// each arch maps its hardware source onto them (x86 IRQ0/IRQ4 through the 8259, riscv the
+/// Sstc timer and PLIC source 10), so a capability names the same thing on both and the
+/// role tables stay arch-neutral.
+///
+/// The periodic timer. It fires whether or not anything happened, so a process blocked on
+/// it always wakes by itself.
 const IRQ_TIMER: u64 = 0;
+/// The console device (a UART receiving a byte). The QUIET line: it fires only when
+/// something really happens, which is what a driver waiting on its hardware is doing, and
+/// it is the only source that can end an idle park for a reason other than the clock.
+const IRQ_CONSOLE: u64 = 1;
 
 /// Interrupt lines the kernel accounts for separately. A capability naming a line at or
 /// above this bound is honoured as authority but never credited, so it can never read or
@@ -214,7 +230,7 @@ const MAX_IRQ_LINES: usize = 8;
 /// Wiring a real device line means adding it here AND crediting it from the handler that
 /// takes it. Granting a line without doing both fails the boot check loudly instead of
 /// hanging the machine once someone waits on it.
-const DELIVERED_IRQ_LINES: u64 = 1 << IRQ_TIMER;
+const DELIVERED_IRQ_LINES: u64 = (1 << IRQ_TIMER) | (1 << IRQ_CONSOLE);
 
 /// Does the kernel deliver `line` at all? See [`DELIVERED_IRQ_LINES`].
 const fn delivers_irq(line: u64) -> bool {
@@ -604,6 +620,11 @@ fn grants_for(role: Role) -> &'static [(abi::CapType, abi::CapRights, u64)] {
             (abi::CapType::Mmio, abi::CapRights::WRITE, MMIO_BASE),
             // CapId(6): the timer interrupt line. A driver process would hold its device's.
             (abi::CapType::Irq, abi::CapRights::READ, IRQ_TIMER),
+            // CapId(7): the CONSOLE line. Two lines, held separately, is what makes the
+            // per-line claims testable rather than vacuous: with a single line, "a
+            // capability for one line can never read or clear another's" is true only
+            // because there is no other line.
+            (abi::CapType::Irq, abi::CapRights::READ, IRQ_CONSOLE),
         ],
         // Nothing. A spawned process begins with no authority of its own; what it can do is
         // exactly what its parent delegated (never more — the rights are intersected), so
@@ -704,6 +725,8 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
     }
     let parks = *core::ptr::addr_of!(PARKS);
     let _ = writeln!(con, "[kernel] parked for an interrupt {} time(s)", parks);
+    let woke = *core::ptr::addr_of!(DEVICE_WAKES);
+    let _ = writeln!(con, "[kernel] a device ended the park {} time(s)", woke);
     let killed = *core::ptr::addr_of!(KILLED);
     if killed > 0 {
         let _ = writeln!(con, "\nrustproof: BOOT OK ({} process(es) killed)", killed);
@@ -1057,6 +1080,9 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
         // Turn on preemption (a periodic timer) where the arch supports it; otherwise
         // scheduling stays cooperative (YIELD-driven). Ticks only arrive in user mode.
         A::start_preemption();
+        // The console's line, the kernel's only quiet interrupt source. After preemption,
+        // so the device stub is installed on a fully-initialised controller.
+        A::start_console_irq();
         // Hand off to the scheduler: this resumes process `first` in user mode, and the
         // trap handlers (syscall + timer) drive every switch thereafter. Never returns.
         unsafe { resume_process::<A>(first) };
@@ -1619,6 +1645,48 @@ pub unsafe fn preempt_trap<A: Arch>(frame: *mut u64) -> ! {
     // Deliver the interrupt to whoever holds a capability for it, then reschedule.
     credit_irq::<A>(IRQ_TIMER);
     // Round-robin to the next ready process (the same one if it is alone).
+    CURRENT = sched().next().map(|t| t.0).unwrap_or(cur);
+    resume_process::<A>(CURRENT)
+}
+
+/// The DEVICE-IRQ handler — the console's line. The timer's twin ([`preempt_trap`]), and
+/// deliberately shaped like it, but crediting [`IRQ_CONSOLE`] instead: a process holding a
+/// capability for the console is credited, and one holding only the timer's is not.
+///
+/// The interesting case is the first branch. This is the only interrupt that can end an
+/// idle park for a real reason — the timer merely re-parks us — so a device waking a
+/// machine that had nothing to run goes through here.
+///
+/// # Safety
+/// `frame` must point at `A::FRAME_WORDS` valid `u64`s (the on-stack IRQ trap frame).
+pub unsafe fn device_trap<A: Arch>(frame: *mut u64) -> ! {
+    if IDLING {
+        // The device woke the PARKED kernel: no user state to save, nobody to preempt.
+        A::console_irq_ack();
+        credit_irq::<A>(IRQ_CONSOLE);
+        match sched().current() {
+            Some(t) => {
+                IDLING = false;
+                DEVICE_WAKES = DEVICE_WAKES.wrapping_add(1);
+                CURRENT = t.0;
+                resume_process::<A>(t.0)
+            }
+            // Nobody holds the console line, or the holder is not blocked on it: park again
+            // rather than falling through to the preemption path, which would save a user
+            // frame that does not exist.
+            None => A::idle(),
+        }
+    }
+    let cur = CURRENT;
+    core::ptr::copy_nonoverlapping(frame, proc_at(cur).frame.0.as_mut_ptr(), A::FRAME_WORDS);
+    A::console_irq_ack();
+    credit_irq::<A>(IRQ_CONSOLE);
+    // A device interrupt is not a scheduling quantum: keep running the process it
+    // interrupted unless it is no longer runnable, so console traffic cannot be used to
+    // steal time from it. (`next()` is the timer's job.)
+    if sched().contains(abi::ThreadId(cur)) {
+        resume_process::<A>(cur)
+    }
     CURRENT = sched().next().map(|t| t.0).unwrap_or(cur);
     resume_process::<A>(CURRENT)
 }

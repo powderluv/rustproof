@@ -255,15 +255,25 @@ extern "C" {
     /// The nucleus's user-fault handler: kills the faulting process and resumes another.
     /// The reason crosses as a (ptr, len) pair so no `str` crosses the FFI boundary.
     fn rustproof_fault_trap(what: *const u8, what_len: usize, addr: u64) -> !;
+    /// The nucleus's DEVICE interrupt handler (the console's IRQ4). Same frame layout and
+    /// same never-returns contract as the timer; it credits a different logical line.
+    fn rustproof_device_trap(frame: *mut u64) -> !;
 }
 
 /// Timer IRQ entry (vector [`pic::TIMER_VECTOR`]). On an interrupt from ring 3 the CPU has
 /// already pushed `rip/cs/rflags/rsp/ss`; we push the 15 GPRs in the SAME order the syscall
 /// stub uses, so the result is exactly a [`syscall::TrapFrame`]. It is handed to the
-/// scheduler, which never returns (it resumes a process via `syscall::resume`). Because the
-/// timer only fires in ring 3 (the kernel runs with interrupts masked), the CPU always
-/// switches to the TSS.rsp0 stack and pushes the full 5-word frame, so the 16-byte
-/// alignment for the call is exact without a manual fixup.
+/// scheduler, which never returns (it resumes a process via `syscall::resume`).
+///
+/// This used to say the timer only ever fires in ring 3, since the kernel runs with
+/// interrupts masked. That stopped being true when the idle park arrived: `Arch::idle`
+/// enables interrupts, so a tick now lands in RING 0 on the idle stack hundreds of times a
+/// boot, and the nucleus tells the two apart with its `IDLING` flag. The frame layout is
+/// identical either way, but for a stronger reason than the old one: in long mode the CPU
+/// pushes `rip/cs/rflags/rsp/ss` for EVERY interrupt — unlike 32-bit, `ss:rsp` is pushed
+/// even without a privilege change — and 16-byte-aligns `rsp` as part of delivery. So the
+/// 5-word frame and the alignment this stub's `call` needs hold whether we came from ring 3
+/// via `TSS.rsp0` or from the parked kernel on its own stack.
 #[unsafe(naked)]
 extern "C" fn timer_isr() {
     core::arch::naked_asm!(
@@ -292,6 +302,70 @@ extern "C" fn timer_isr() {
         "ud2",
         trap = sym rustproof_timer_trap,
     );
+}
+
+/// Console IRQ entry (vector [`pic::CONSOLE_VECTOR`], COM1 receive). Byte-for-byte the
+/// timer stub's twin — same `cld`, same 15 GPRs over the CPU frame, same never-returns
+/// contract — differing only in which nucleus entry point it calls, and therefore which
+/// logical interrupt line gets credited. Kept as a separate stub rather than one
+/// parameterised handler because a naked function cannot take arguments, and passing the
+/// vector on the stack would change the frame layout the scheduler depends on.
+///
+/// Like the timer, this can fire while the kernel is PARKED in `Arch::idle` — for this one
+/// that is the entire point, a device waking an idle machine — so it lands in ring 0 on the
+/// idle stack rather than in ring 3. See `timer_isr` for why the frame layout and stack
+/// alignment are the same in both cases; the nucleus tells them apart via `IDLING`.
+#[unsafe(naked)]
+extern "C" fn console_isr() {
+    core::arch::naked_asm!(
+        "cld", // see `timer_isr`: an interrupt gate does not clear DF, ring 3 can set it
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        "call {trap}",
+        "ud2",
+        trap = sym rustproof_device_trap,
+    );
+}
+
+/// Address of the console IRQ entry, for [`set_gate`].
+pub fn console_handler_addr() -> u64 {
+    console_isr as *const () as u64
+}
+
+/// Spurious-interrupt entry (vector [`pic::SPURIOUS_VECTOR`], IRQ7 on the master 8259).
+///
+/// The 8259 delivers IRQ7 when a line deasserts between the CPU's two interrupt-acknowledge
+/// cycles — it has no real requester to report, so it reports the lowest-priority one. We
+/// never unmask IRQ7, so any delivery here is spurious by construction: return immediately
+/// and, deliberately, do NOT send an end-of-interrupt. A spurious interrupt sets no
+/// in-service bit, so EOI-ing it would clear some *other* interrupt's, silently losing it.
+///
+/// Reachable only since a second line was unmasked. Before that, vector 0x27 had no gate at
+/// all (`STUBS` covers the 32 exception vectors), so its present bit was clear and a
+/// spurious IRQ would have raised #GP and taken the fatal path — a hard guest death from a
+/// condition the hardware considers routine.
+#[unsafe(naked)]
+extern "C" fn spurious_isr() {
+    core::arch::naked_asm!("iretq");
+}
+
+/// Address of the spurious-interrupt entry, for [`set_gate`].
+pub fn spurious_handler_addr() -> u64 {
+    spurious_isr as *const () as u64
 }
 
 /// Install a handler at `vector` (used for the timer IRQ after the base exception vectors
