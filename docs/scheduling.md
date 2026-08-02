@@ -373,3 +373,60 @@ compute loop with `DF=1` as a standing regression test.
 - **Heap-allocated process table / green threads.** Rejected: no allocator in the
   nucleus by design; a fixed `[Process; N]` static is enough and keeps the state
   auditable.
+
+
+## Shared memory: regions
+
+A driver operates on its clients' buffers, so processes have to be able to share
+memory without copying. `CapType::Region` is that capability, and it is the first
+one in this kernel whose object is owned by a **process** rather than by the
+kernel. Every earlier object — an endpoint number, the boot-reserved device
+window, the DMA pool, an interrupt line — outlived every process, which is why
+nothing ever revalidated a capability's object after `SPAWN` copied it verbatim.
+A region can be destroyed while a capability still names it.
+
+So the object is a **monotonic region id**, resolved in a kernel table, never a
+physical address and never a table index, and never reused. That single choice is
+the safety argument: a capability that outlives its region resolves to nothing,
+where an address or an index would resolve to whatever occupies that address or
+slot next. Region frames live in the region and in no process list — `teardown`
+frees a process's `frames` and `vram` unconditionally, with no refcount anywhere,
+so a frame in both places would be freed under a borrower still mapped to it.
+
+Sharing needed no new transfer mechanism. `SPAWN` delegation already attenuates
+rights, records a ledger edge and revokes transitively, so a region capability
+rides it unchanged; revocation then unmaps the window, the same doctrine device
+mappings already followed. The borrower pulls the mapping into its own space at
+an address the **kernel** picks, so no user-supplied address ever reaches the
+mapping path and none has to be validated.
+
+### What the review changed
+
+The kernel came out of review nearly intact; the *tests* did not. Neither run
+script grepped for the `(bug)` lines the demo prints on a failed assertion, so
+all 47 assertions per demo were comments rather than gates — demonstrated by
+making `MAP_REGION` ignore capability rights, a real amplification, and watching
+it pass green. That check exists now, and the region assertions were rewritten
+until breaking the kernel actually breaks the run:
+
+| break the kernel like this | the run now |
+|---|---|
+| `MAP_REGION` ignores capability rights | FAIL — a READ-only loan gave a WRITABLE window |
+| revocation stops unmapping the region | FAIL — kept the window after revocation |
+| `teardown` stops destroying owned regions | FAIL — `[mm] LEAK: 128989 -> 128985` |
+| region frames are not scrubbed on destroy | still passes — see below |
+
+Two lessons stuck. A test must not choose *which* assertions to run by probing
+the property under test: the borrower originally decided whether it held a
+read-only or a writable loan by trying to write, so a kernel that ignored rights
+simply ran the other branch and reported nothing. It now discriminates on region
+size, which the property cannot influence. And fresh memory proves nothing about
+zeroing, because early-boot frames are zero anyway — the assertion now poisons a
+region, destroys it, and requires the *next* region to come back clean.
+
+The last row is honest rather than solved. Scrubbing frames when a region is
+destroyed and zeroing a new process's stack pages are two defences over the same
+observable, so removing either alone is masked by the other and no single-mutation
+test isolates it. Both are cheap and both stay. Doing it in one place —
+zeroing in the allocator on release — would make the invariant testable, and is
+the obvious next move.

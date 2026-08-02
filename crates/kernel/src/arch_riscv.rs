@@ -92,7 +92,11 @@ fn user_range_mapped(uptr: u64, len: usize, need_write: bool) -> bool {
     if len == 0 {
         return true;
     }
-    let mut need = PageFlags::V | PageFlags::U;
+    // `R` is demanded as well as `V|U`, mirroring the x86 twin's `PRESENT | USER`. Every
+    // leaf this kernel installs happens to carry `R` today (see `map_page`), so omitting it
+    // was vacuously safe — but the two arches asserting different things about the same
+    // check is how a one-arch hole gets in, which has happened here before.
+    let mut need = PageFlags::V | PageFlags::R | PageFlags::U;
     if need_write {
         need = need | PageFlags::W;
     }
@@ -123,6 +127,11 @@ impl Arch for Riscv {
     const USER_STACK_TOP: u64 = 0x1_4000_0000; // 5 GiB
     const USER_STACK_PAGES: u64 = 16;
     const USER_MMIO_BASE: u64 = 0x1_2000_0000; // 4.5 GiB
+
+    // Above the stack top and far below `USER_LIMIT`: the share window is the only mapping
+    // whose address the KERNEL chooses, so it must not be able to land on the image, the
+    // device window or the stack. Checked at boot, not trusted from this comment.
+    const USER_SHARE_BASE: u64 = 0x1_5000_0000; // 5.25 GiB
 
     fn console_write(bytes: &[u8]) {
         for &b in bytes {

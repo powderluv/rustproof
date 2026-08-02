@@ -122,6 +122,13 @@ pub trait Arch {
     /// between the loaded image and the stack, so it collides with neither.
     const USER_MMIO_BASE: u64;
 
+    /// Base of the per-process window where SHARED REGIONS are mapped. Must sit strictly
+    /// inside `[USER_BASE, USER_LIMIT)` and clear of the stack and the device window —
+    /// checked at boot rather than asserted here, because a collision would turn every
+    /// region mapping into an unexplained failure. (The loaded image is not part of that
+    /// check: its extent comes from the ELF rather than a constant.)
+    const USER_SHARE_BASE: u64;
+
     /// Emit raw bytes to the debug console.
     fn console_write(bytes: &[u8]);
     /// Shut the guest down (`success` -> clean/zero exit).

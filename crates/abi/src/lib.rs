@@ -112,6 +112,18 @@ pub enum CapType {
     IommuDomain,
     /// A device MMIO window.
     Mmio,
+    /// A shareable memory region. Its `object` is a monotonic REGION ID — never a physical
+    /// address, never a table index, and never reused.
+    ///
+    /// That choice is the whole safety argument. `SPAWN` copies a capability's type and
+    /// object verbatim, and nothing revalidates an object afterwards, because until now
+    /// every object named something the KERNEL owns and that outlives every process (an
+    /// endpoint number, the boot-reserved device window, the DMA pool, an interrupt line).
+    /// A region is the first object owned by a process that can die, so a capability CAN
+    /// outlive what it names. With an id that is never reused, such a capability resolves
+    /// to nothing; with a physical address or a slot index it would resolve to whatever
+    /// occupies that address or slot NEXT — cross-process memory disclosure.
+    Region,
     /// A device interrupt line. Holding it is the authority to observe that source's
     /// interrupts; a process without it cannot see them at all.
     Irq,
@@ -257,6 +269,31 @@ pub mod sysno {
     /// would park the machine forever. A caller that must distinguish "none yet" from
     /// "never" should treat `0` from a *blocking* wait as "this line is not delivered".
     pub const WAIT_IRQ: u64 = 12;
+    /// Create a shareable memory region: `a0` = an `Untyped` capability (needs `WRITE`),
+    /// `a1` = pages (1..=`REGION_MAX_PAGES`). Returns the id of a freshly minted `Region`
+    /// capability in the caller's space, or `NO_CAP` / `NO_MEM`.
+    ///
+    /// The new capability carries the rights the `Untyped` one did, so authority to create
+    /// bounds authority over the result. The region's pages are ZEROED: they are the first
+    /// recycled memory in this kernel that another process can be given to READ.
+    pub const MAKE_REGION: u64 = 13;
+    /// Map a region into the CALLER's address space: `a0` = a `Region` capability (needs
+    /// `READ`). Returns the user address the KERNEL chose, or `NO_CAP` / `NO_MEM`.
+    ///
+    /// There is deliberately no address argument — the caller does not get to say where its
+    /// own mappings land, so no user-supplied address reaches the mapping path and none has
+    /// to be validated. Writable only if the capability carries `WRITE`: attenuating the
+    /// capability attenuates the access, exactly as for `MAP_BAR`.
+    pub const MAP_REGION: u64 = 14;
+    /// Drop the caller's mapping of a region: `a0` = a `Region` capability. `OK`, or
+    /// `NO_CAP` if the caller does not hold it. The capability survives; only the mapping
+    /// goes, so the caller can map it again.
+    pub const UNMAP_REGION: u64 = 15;
+    /// Destroy a region and return its pages: `a0` = a `Region` capability. Only its OWNER
+    /// may do this; a borrower gets `NO_CAP`. Unmaps the region from every process holding
+    /// it and invalidates every capability naming it, so no mapping and no authority
+    /// survives the memory.
+    pub const FREE_REGION: u64 = 16;
     /// Revoke every capability derived from `a0` (one of the caller's own capabilities) by
     /// delegation, transitively — the children it was handed to, the grandchildren they
     /// passed it on to, and anything derived from those within a holder's own space.

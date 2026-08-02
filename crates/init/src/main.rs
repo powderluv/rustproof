@@ -493,6 +493,31 @@ fn poll_irq(cap: u64) -> u64 {
     unsafe { syscall1(sysno::POLL_IRQ, cap) }
 }
 
+/// Create a shareable region of `pages` pages, paid for with `Untyped` capability `cap`.
+/// Returns the new `Region` capability's id, or a `syserr`.
+fn make_region(cap: u64, pages: u64) -> u64 {
+    // SAFETY: MAKE_REGION takes two scalars and returns a cap id; no user memory is touched.
+    unsafe { syscall2(sysno::MAKE_REGION, cap, pages) }
+}
+
+/// Map region capability `cap` into our own space. Returns the address the kernel chose.
+fn map_region(cap: u64) -> u64 {
+    // SAFETY: MAP_REGION takes a cap id and returns an address; no user memory is touched.
+    unsafe { syscall1(sysno::MAP_REGION, cap) }
+}
+
+/// Drop our mapping of region capability `cap` (the capability survives).
+fn unmap_region(cap: u64) -> u64 {
+    // SAFETY: UNMAP_REGION takes a cap id and returns a status.
+    unsafe { syscall1(sysno::UNMAP_REGION, cap) }
+}
+
+/// Destroy the region named by `cap`. Only its owner may do this.
+fn free_region(cap: u64) -> u64 {
+    // SAFETY: FREE_REGION takes a cap id and returns a status.
+    unsafe { syscall1(sysno::FREE_REGION, cap) }
+}
+
 /// Probe whether `va` is still MAPPED, without risking a fault: `DEBUG_WRITE` makes the
 /// kernel READ one byte from there through its permission-checked copy, so the status says
 /// whether the page is still present and user-readable. (It emits that byte to the console,
@@ -711,6 +736,138 @@ fn compute(id: u64) -> ! {
             dbg_dec(helper);
             dw!(b"\n");
         }
+
+        // ---- shared memory: the owner side -------------------------------------------
+        // A region is the first object here owned by a PROCESS rather than the kernel, so
+        // it is the first capability that can outlive what it names.
+        let rcap = make_region(2, 2);
+        tag(id);
+        if rcap == syserr::NO_CAP || rcap == syserr::NO_MEM {
+            dw!(b"share: could not create a region (bug)\n");
+        } else {
+            dw!(b"share: created a 2-page region\n");
+        }
+        let rva = map_region(rcap);
+        tag(id);
+        if rva != syserr::NO_CAP && rva != syserr::NO_MEM {
+            dw!(b"share: owner mapped it\n");
+            // Write a signature across EVERY page, not just the first: a kernel that mapped
+            // only page 0 of a multi-page region would otherwise look correct.
+            let sig = b"RUSTPROOF-SHARED";
+            let mut pg = 0u64;
+            while pg < 2 {
+                let mut i = 0usize;
+                while i < 16 {
+                    let at = (rva + pg * 4096) as *mut u8;
+                    unsafe { core::ptr::write_volatile(at.wrapping_add(i), sig[i]) };
+                    i += 1;
+                }
+                pg += 1;
+            }
+        } else {
+            dw!(b"share: owner could not map its own region (bug)\n");
+        }
+        // A second region, lent WRITABLE, used as a mailbox. It is how the borrower reports
+        // back: without it, breaking delegated mapping would silently DELETE the borrower's
+        // half of this test instead of failing it, which is exactly what review found.
+        let mbox = make_region(2, 1);
+        let mva = map_region(mbox);
+        if mva == syserr::NO_CAP || mva == syserr::NO_MEM {
+            tag(id);
+            dw!(b"share: could not map the mailbox (bug)\n");
+        }
+        let reader = spawn_delegating(2, rcap, 0b001); // READ only
+        let writer = spawn_delegating(2, mbox, 0b011); // READ|WRITE
+        tag(id);
+        if reader == u64::MAX || writer == u64::MAX {
+            dw!(b"share: could not spawn the borrowers (bug)\n");
+        } else {
+            dw!(b"share: lent one region READ-only and one READ-WRITE\n");
+        }
+        spin(60_000_000);
+        // Revoke the READ-only loan. This region is deliberately NEVER freed by us -- it is
+        // reclaimed by teardown at exit -- so the borrower's window can only disappear
+        // because of THIS revoke. Freeing it here would let a broken revoke pass, which is
+        // how the first version of this test fooled itself.
+        revoke(rcap);
+        spin(90_000_000);
+        // The borrower wrote through its WRITABLE loan, into memory we own and can read.
+        tag(id);
+        let mut tok = [0u8; 12];
+        let mut i = 0usize;
+        while i < 12 {
+            tok[i] = unsafe { core::ptr::read_volatile((mva as *const u8).wrapping_add(i)) };
+            i += 1;
+        }
+        if &tok == b"BORROWER-RAN" {
+            dw!(b"share: a WRITABLE loan let the borrower write memory we own\n");
+        } else {
+            dw!(b"share: the borrower never reported back (bug)\n");
+        }
+        // UNMAP_REGION, then map again: the window goes and comes back, contents intact.
+        tag(id);
+        let un = unmap_region(mbox);
+        if un == syserr::OK && mapped_probe(mva) != syserr::OK {
+            dw!(b"share: UNMAP_REGION dropped the window\n");
+        } else {
+            dw!(b"share: UNMAP_REGION left the window mapped (bug)\n");
+        }
+        tag(id);
+        let again = map_region(mbox);
+        if again == mva && unsafe { core::ptr::read_volatile(mva as *const u8) } == b'B' {
+            dw!(b"share: re-mapped it, same address, contents intact\n");
+        } else {
+            dw!(b"share: could not re-map a region we still hold (bug)\n");
+        }
+        // Scrub-on-destroy, tested against RECYCLED memory. Fresh frames are zero anyway on
+        // an early boot, so zeroing only a NEW region proves nothing: poison one, destroy
+        // it, and require the next region to come back clean.
+        let poison = make_region(2, 1);
+        let pva = map_region(poison);
+        if pva != syserr::NO_CAP && pva != syserr::NO_MEM {
+            let mut i = 0usize;
+            while i < 4096 {
+                unsafe { core::ptr::write_volatile((pva as *mut u8).wrapping_add(i), 0xAA) };
+                i += 1;
+            }
+        }
+        tag(id);
+        if free_region(poison) == syserr::OK {
+            dw!(b"share: owner destroyed a region\n");
+        } else {
+            dw!(b"share: owner could not destroy its own region (bug)\n");
+        }
+        // The capability went away WITH the region, so it no longer names anything. (The
+        // kernel also refuses an id that no longer resolves, but that branch is unreachable
+        // by construction -- destroying a region sweeps every capability naming it.)
+        tag(id);
+        if map_region(poison) == syserr::NO_CAP {
+            dw!(b"share: destroying a region took its capability with it\n");
+        } else {
+            dw!(b"share: stale region capability still maps (bug)\n");
+        }
+        let fresh = make_region(2, 1);
+        let fva = map_region(fresh);
+        tag(id);
+        if fva != syserr::NO_CAP && fva != syserr::NO_MEM {
+            let mut dirty = false;
+            let mut i = 0usize;
+            while i < 4096 {
+                if unsafe { core::ptr::read_volatile((fva as *const u8).wrapping_add(i)) } != 0 {
+                    dirty = true;
+                }
+                i += 1;
+            }
+            if dirty {
+                dw!(b"share: recycled region memory came back DIRTY (bug)\n");
+            } else {
+                dw!(b"share: recycled region memory comes back zeroed\n");
+            }
+        } else {
+            dw!(b"share: could not map a fresh region (bug)\n");
+        }
+        // `rcap`, `mbox` and `fresh` are deliberately left alive: teardown must reclaim
+        // them, and the frame-conservation check fails the boot if it does not.
     }
     // Hostile-flag regression, the sibling of the DF test in `spin`: ring 3 can set
     // RFLAGS.NT with `popfq`, and a leaked NT makes the kernel's OWN `iretq` raise #GP —
@@ -1076,6 +1233,89 @@ fn child(id: u64) -> ! {
         dw!(b"child: no device authority of its own\n");
     } else {
         dw!(b"child: mapped a BAR (bug)\n");
+    }
+
+    // Were we handed a shared REGION? Then we are a borrower. Which kind we are is decided
+    // by what our capability actually permits, not by anything we were told.
+    let rva = map_region(0);
+    if rva != syserr::NO_CAP && rva != syserr::NO_MEM {
+        // Which loan is this? Decided by the region's SIZE (the mailbox is one page, the
+        // lent region is two), NOT by probing what we are allowed to do with it. Choosing on
+        // writability would mean a kernel that ignored our capability's rights simply ran a
+        // different test and never reported the amplification -- which is precisely the
+        // failure review found in the first version of this file.
+        let two_pages = mapped_probe(rva + 4096) == syserr::OK;
+        if !two_pages {
+            // A WRITABLE loan: report back through it. The owner requires this token, so a
+            // regression in delegated mapping FAILS the run instead of quietly removing it.
+            let tok = b"BORROWER-RAN";
+            let mut i = 0usize;
+            while i < 12 {
+                unsafe { core::ptr::write_volatile((rva as *mut u8).wrapping_add(i), tok[i]) };
+                i += 1;
+            }
+            tag(id);
+            if unsafe { core::ptr::read_volatile(rva as *const u8) } == b'B' {
+                dw!(b"share: wrote back through a WRITABLE loan\n");
+            } else {
+                dw!(b"share: a WRITABLE loan would not take our write (bug)\n");
+            }
+            exit(id);
+        }
+        // A READ-only loan: now ASSERT the window is not writable. Probed through the
+        // kernel rather than by storing, so a correct kernel does not kill us for asking.
+        tag(id);
+        if recv_raw(9, rva, 16) == syserr::FAULT {
+            dw!(b"share: a READ-only loan gives a READ-ONLY window\n");
+        } else {
+            dw!(b"share: a READ-only loan gave a WRITABLE window (bug)\n");
+        }
+        // Read EVERY page: a kernel that mapped only the first would fail here.
+        let mut good = true;
+        let mut pg = 0u64;
+        while pg < 2 {
+            let mut i = 0usize;
+            while i < 16 {
+                let at = (rva + pg * 4096) as *const u8;
+                if unsafe { core::ptr::read_volatile(at.wrapping_add(i)) } != b"RUSTPROOF-SHARED"[i]
+                {
+                    good = false;
+                }
+                i += 1;
+            }
+            pg += 1;
+        }
+        tag(id);
+        if good {
+            dw!(b"share: read every page of the owner's bytes (no copy)\n");
+        } else {
+            dw!(b"share: delegated region has the WRONG contents (bug)\n");
+        }
+        tag(id);
+        if free_region(0) == syserr::NO_CAP {
+            dw!(b"share: a borrower cannot destroy the owner's region\n");
+        } else {
+            dw!(b"share: a borrower DESTROYED the owner's region (bug)\n");
+        }
+        // The owner revokes while we run, and never frees this region, so the window can
+        // only go away because the REVOKE tore it down.
+        let mut gone = false;
+        let mut k = 0u64;
+        while k < 90 {
+            if mapped_probe(rva) != syserr::OK {
+                gone = true;
+                break;
+            }
+            spin(2_000_000);
+            k = k.wrapping_add(1);
+        }
+        tag(id);
+        if gone {
+            dw!(b"share: REVOKE alone tore the window down\n");
+        } else {
+            dw!(b"share: kept the window after revocation (bug)\n");
+        }
+        exit(id);
     }
 
     // Were we handed an INTERRUPT line? Then we are the driver's helper. No role table

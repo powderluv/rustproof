@@ -93,6 +93,24 @@ echo "------------------------"
 echo "== qemu process exit code: $RC =="
 
 
+# The guest's assertions print a line ending in "(bug)" when they fail, and then the guest
+# keeps going and still reaches BOOT OK. Until this check existed, that made every one of
+# them a comment rather than a gate: a review demonstrated a REAL capability-rights
+# amplification (a READ-only loan mapped writable) printing one "(bug)" line and passing
+# green in CI on both arches. Any such line now fails the run.
+if echo "$OUT" | grep -q '(bug)'; then
+    echo "RESULT: FAIL — the guest reported a failed assertion:"
+    echo "$OUT" | grep '(bug)' | sed 's/^/    /'
+    exit 1
+fi
+
+# A frame leak makes the kernel exit early, so check it BEFORE anything else: otherwise the
+# first unrelated check to fail gets the blame and the real cause scrolls past.
+if echo "$OUT" | grep -q '\[mm\] LEAK:'; then
+    echo "RESULT: FAIL — $(echo "$OUT" | grep '\[mm\] LEAK:' | head -1)"
+    exit 1
+fi
+
 # The guest is supposed to have been woken from a PARK by the console device. A console byte
 # that arrives while something is still runnable also satisfies the guest's own success line
 # but ends no park, so check the kernel's counter instead of trusting the narrative.

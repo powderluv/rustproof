@@ -120,6 +120,11 @@ impl Arch for X86 {
     const USER_STACK_PAGES: u64 = 16;
     const USER_MMIO_BASE: u64 = 0x80_2000_0000;
 
+    // Above the stack top and far below `USER_LIMIT`: the share window is the only mapping
+    // whose address the KERNEL chooses, so it must not be able to land on the image, the
+    // device window or the stack. Checked at boot, not trusted from this comment.
+    const USER_SHARE_BASE: u64 = 0x80_5000_0000;
+
     fn console_write(bytes: &[u8]) {
         for &b in bytes {
             Serial::write_byte(b);

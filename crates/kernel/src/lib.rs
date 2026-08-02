@@ -69,6 +69,61 @@ const MAX_PROC_FRAMES: usize = 64;
 /// (`FREE_VRAM` returns quota). Also the capacity of the per-process VRAM tracking list.
 const VRAM_QUOTA_FRAMES: usize = 8;
 
+/// How many shareable memory regions can exist at once. Small and fixed, like every other
+/// table here; exhaustion is reported, never silently absorbed.
+const MAX_REGIONS: usize = 8;
+/// Largest region, in pages. Bounds both the frames one process can tie up and the size of
+/// the per-process share window below.
+const REGION_MAX_PAGES: u64 = 4;
+/// How many regions one process may have mapped at once. Each slot is a fixed span of the
+/// share window, so the kernel picks the address and the caller never supplies one.
+const SHARE_SLOTS: usize = 4;
+
+/// A shareable memory region: frames the kernel owns on behalf of a process, mappable into
+/// any process holding a `Region` capability that names it.
+///
+/// The frames live HERE and in no `Process` list. `teardown_process` frees `frames` and
+/// `vram` unconditionally, with no refcount anywhere in the kernel, so a region frame that
+/// also appeared in an owner's list would be freed while a borrower still had it mapped —
+/// and then handed to somebody else.
+#[derive(Clone, Copy)]
+struct Region {
+    /// False for a free table slot.
+    live: bool,
+    /// The region's identity, and the `object` of every capability naming it. Monotonic and
+    /// NEVER reused, so a capability that outlives its region resolves to nothing rather
+    /// than to whatever occupies this table slot next.
+    id: u64,
+    /// Identity (not slot) of the process that created it and may destroy it.
+    owner_id: u64,
+    frames: [abi::PhysAddr; REGION_MAX_PAGES as usize],
+    npages: u64,
+}
+
+impl Region {
+    const EMPTY: Region = Region {
+        live: false,
+        id: 0,
+        owner_id: 0,
+        frames: [abi::PhysAddr(0); REGION_MAX_PAGES as usize],
+        npages: 0,
+    };
+}
+
+static mut REGIONS: [Region; MAX_REGIONS] = [Region::EMPTY; MAX_REGIONS];
+/// Next region identity. Monotonic; `0` is reserved to mean "no region", so a zeroed
+/// `shares` slot is empty rather than a reference to region zero.
+static mut NEXT_REGION_ID: u64 = 1;
+
+/// Free frames at the moment userland started. Compared against the count at shutdown, and
+/// a mismatch FAILS the boot.
+///
+/// The count was printed for a long time and checked by nothing, so a leak passed. Regions
+/// are the first feature whose frames are owned by neither the allocator's process lists nor
+/// a single process's lifetime, which makes leaking exactly a region's worth of memory an
+/// easy mistake and an invisible one.
+static mut FREE_AT_START: usize = 0;
+
 /// One scheduled user process: its own address space (`token`), its last-saved user
 /// register state (`frame`), and its own capability space — the isolation boundary.
 struct Process {
@@ -110,6 +165,13 @@ struct Process {
     /// individually freeable via `FREE_VRAM`. Also reclaimed on exit.
     vram: [abi::PhysAddr; VRAM_QUOTA_FRAMES],
     nvram: usize,
+    /// Regions this process currently has MAPPED, by region id, one per share-window slot
+    /// (`0` = slot free). Slot index picks the virtual address, so the kernel chooses where
+    /// a mapping lands and no user-supplied address ever reaches the mapping path.
+    ///
+    /// This is also the kernel's only reverse index from a region to the spaces that map
+    /// it: destroying a region scans every process's `shares` to unmap it everywhere.
+    shares: [u64; SHARE_SLOTS],
 }
 
 impl Process {
@@ -124,6 +186,7 @@ impl Process {
         nframes: 0,
         vram: [abi::PhysAddr(0); VRAM_QUOTA_FRAMES],
         nvram: 0,
+        shares: [0; SHARE_SLOTS],
         irq_pending: [0; MAX_IRQ_LINES],
         msg: [0; abi::MAX_MSG_BYTES],
         msg_len: 0,
@@ -357,6 +420,15 @@ unsafe fn revoke_delegations<A: Arch>(root_proc: usize, root_cap: usize) {
                 if !holds_mmio(d.child) {
                     unmap_device_window::<A>(d.child);
                 }
+                // Same doctrine for a shared region: the mapping IS the authority the
+                // capability granted, so a holder that has lost the capability must lose the
+                // window too, or revocation would take the name and leave the access.
+                for slot in 0..SHARE_SLOTS {
+                    let id = proc_at(d.child).shares[slot];
+                    if id != 0 && !holds_region(d.child, id, abi::CapRights::READ) {
+                        unmap_region_from::<A>(d.child, id);
+                    }
+                }
                 // Same doctrine for interrupts: credits accrued under a capability are
                 // authority, so they die with it rather than staying readable.
                 for line in 0..MAX_IRQ_LINES {
@@ -477,6 +549,161 @@ unsafe fn credit_irq<A: Arch>(irq: u64) {
 /// Single-CPU, non-reentrant: no other live borrow of the process table.
 unsafe fn creditable(proc: usize, line: u64) -> bool {
     delivers_irq(line) && holds_irq(proc, line)
+}
+
+// ============================================================ shared memory regions
+
+/// The table slot holding region `id`, if it still exists.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the region table.
+unsafe fn region_slot(id: u64) -> Option<usize> {
+    if id == 0 {
+        return None;
+    }
+    (0..MAX_REGIONS).find(|&i| {
+        let r = &*core::ptr::addr_of!(REGIONS[i]);
+        r.live && r.id == id
+    })
+}
+
+/// Does `proc` hold a `Region` capability naming `id` and carrying `needed`?
+///
+/// Object-keyed AND rights-aware, modelled on [`holds_endpoint`] rather than [`holds_mmio`].
+/// `holds_mmio` asks only "any `Mmio` capability with `READ`", which is exact solely because
+/// there is exactly one device window; with many regions the same shape would fail in both
+/// directions — a holder of region A would appear to hold region B, and losing WRITE would
+/// look like losing the region entirely.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table.
+unsafe fn holds_region(proc: usize, id: u64, needed: abi::CapRights) -> bool {
+    let caps = &proc_at(proc).caps;
+    (0..CAP_SLOTS).any(|i| {
+        caps.lookup(abi::CapId(i)).is_some_and(|slot| {
+            slot.cap_type == abi::CapType::Region
+                && slot.object == id
+                && slot.rights.contains(needed)
+        })
+    })
+}
+
+/// The user address of share-window slot `slot`. Fixed per slot, so the kernel picks it.
+fn share_va<A: Arch>(slot: usize) -> u64 {
+    A::USER_SHARE_BASE + slot as u64 * REGION_MAX_PAGES * abi::PAGE_SIZE
+}
+
+/// Remove `proc`'s mapping of region `id`, if it has one. Returns true if something was
+/// unmapped.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table.
+unsafe fn unmap_region_from<A: Arch>(proc: usize, id: u64) -> bool {
+    let mut hit = false;
+    for slot in 0..SHARE_SLOTS {
+        if proc_at(proc).shares[slot] != id {
+            continue;
+        }
+        let token = proc_at(proc).token;
+        let mut space = A::Space::from_token(token);
+        let base = share_va::<A>(slot);
+        for i in 0..REGION_MAX_PAGES {
+            let _ = space.unmap_page(abi::VirtAddr(base + i * abi::PAGE_SIZE));
+        }
+        proc_at(proc).shares[slot] = 0;
+        hit = true;
+        // Only the ACTIVE space needs a paging-base reload; a space we are not running on is
+        // covered by the reload `resume_process` does when it is next scheduled. Calling it
+        // for a non-current process would switch us onto that process's tables mid-syscall.
+        if proc == CURRENT {
+            A::activate(token);
+        }
+    }
+    hit
+}
+
+/// Destroy the region in table slot `idx`: unmap it from every process that has it mapped,
+/// drop every capability naming it, and return its frames to the pool.
+///
+/// Order is load-bearing. Unmapping happens FIRST, while every holder's page tables still
+/// exist; the frames go back only once no space can reach them. The capability sweep is not
+/// strictly required for safety — a stale capability names an id that no longer resolves —
+/// but leaving one would let a process hold authority over memory that is gone, which is the
+/// state the "revocation tears down the authority" doctrine exists to prevent.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process or region tables.
+unsafe fn destroy_region<A: Arch>(idx: usize) {
+    let id = (*core::ptr::addr_of!(REGIONS[idx])).id;
+    if id == 0 {
+        return;
+    }
+    for p in 0..MAX_PROCS {
+        if proc_at(p).state == ProcState::Free {
+            continue;
+        }
+        unmap_region_from::<A>(p, id);
+        for c in 0..CAP_SLOTS {
+            let names_it = proc_at(p)
+                .caps
+                .lookup(abi::CapId(c))
+                .is_some_and(|slot| slot.cap_type == abi::CapType::Region && slot.object == id);
+            if names_it {
+                proc_at(p).caps.revoke_subtree(abi::CapId(c));
+                forget_cap_edges(p, c);
+            }
+        }
+    }
+    let r = &mut *core::ptr::addr_of_mut!(REGIONS[idx]);
+    if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
+        use abi::FrameAllocator as _;
+        for i in 0..r.npages as usize {
+            // SCRUB before releasing. `alloc_frame` scans from a cursor with no DMA
+            // exclusion, so these frames can come straight back as another process's
+            // USER_RW stack pages — shared data intact, readable with no capability at all.
+            // Zeroing at creation is not enough: it protects the region's own users, not
+            // whoever inherits the memory afterwards.
+            core::ptr::write_bytes(r.frames[i].as_u64() as *mut u8, 0, abi::PAGE_SIZE as usize);
+            fa.free_frame(r.frames[i]);
+        }
+    }
+    *r = Region::EMPTY;
+}
+
+/// Drop every delegation edge naming capability slot `cap` of process `proc`, at BOTH ends.
+///
+/// Regions are the first feature that empties a live capability slot at runtime outside
+/// `revoke_delegations`. An edge left naming a freed slot would later be walked as though it
+/// still described a delegation, and the slot may by then hold something else entirely.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the ledger or process table.
+unsafe fn forget_cap_edges(proc: usize, cap: usize) {
+    let pid = proc_at(proc).id;
+    for i in 0..MAX_DELEGATIONS {
+        let d = deleg_at(i);
+        if !d.live {
+            continue;
+        }
+        if (d.child == proc && d.child_id == pid && d.child_cap == cap)
+            || (d.parent == proc && d.parent_id == pid && d.parent_cap == cap)
+        {
+            d.live = false;
+        }
+    }
+}
+
+/// Destroy every region owned by process identity `owner_id`.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process or region tables.
+unsafe fn destroy_regions_owned_by<A: Arch>(owner_id: u64) {
+    for i in 0..MAX_REGIONS {
+        let r = &*core::ptr::addr_of!(REGIONS[i]);
+        if r.live && r.owner_id == owner_id {
+            destroy_region::<A>(i);
+        }
+    }
 }
 
 /// Does process `proc` still hold an `Irq` capability carrying `READ` for `line`?
@@ -721,7 +948,21 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
     // Report the free-frame count: with per-process reclamation on exit it should be back
     // near the pre-userland count (proving spawn/exit does not leak an address space).
     if let Some(fa) = (*core::ptr::addr_of!(FA)).as_ref() {
-        let _ = writeln!(con, "[mm] {} frames free after all exits", fa.free_count());
+        let now = fa.free_count();
+        let start = *core::ptr::addr_of!(FREE_AT_START);
+        let _ = writeln!(con, "[mm] {} frames free after all exits", now);
+        // Checked, not just reported. Every frame handed out after this point belongs to
+        // some process or region, and every one of those is destroyed by teardown, so the
+        // pool must come back exactly. Anything else is a leak (or a double free) and must
+        // fail the boot rather than scroll past in a log nobody greps.
+        if start != 0 && now != start {
+            let _ = writeln!(
+                con,
+                "[mm] LEAK: started userland with {} free, ended with {}",
+                start, now
+            );
+            A::exit(false);
+        }
     }
     let parks = *core::ptr::addr_of!(PARKS);
     let _ = writeln!(con, "[kernel] parked for an interrupt {} time(s)", parks);
@@ -789,6 +1030,11 @@ unsafe fn load_process<A: Arch>(
         for p in 1..=A::USER_STACK_PAGES {
             let va = abi::VirtAddr(A::USER_STACK_TOP - p * abi::PAGE_SIZE);
             let frame = rec.alloc_frame()?;
+            // Zero it: a recycled frame can carry a dead process's stack, or a destroyed
+            // region's shared bytes, and this page is about to be USER_RW in a process that
+            // needed no capability to read it. Scrubbing on release covers regions; this
+            // covers everything else that reaches user memory.
+            core::ptr::write_bytes(frame.as_u64() as *mut u8, 0, abi::PAGE_SIZE as usize);
             if !space.map_page(va, frame, Perms::USER_RW, &mut rec) {
                 return None;
             }
@@ -818,6 +1064,12 @@ unsafe fn load_process<A: Arch>(
             s.id = id_arg;
             s.msg_len = 0;
             s.irq_pending = [0; MAX_IRQ_LINES];
+            // Reset here, not only in teardown: `vram`/`nvram` are zeroed only inside
+            // teardown's `if let Some(fa)`, and a process landing in a recycled slot must
+            // never inherit the dead occupant's state. A stale `shares` entry would make
+            // this process appear to hold a mapping it does not have, and the next
+            // `destroy_region` would unmap a window it never mapped.
+            s.shares = [0; SHARE_SLOTS];
             s.pending_len = 0;
             s.token = token;
             s.frame = A::frame_init(entry, A::USER_STACK_TOP, id_arg);
@@ -924,6 +1176,41 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
         "  irq delivery mask {:#x} — every granted line is credited",
         DELIVERED_IRQ_LINES
     );
+
+    // The share window is the one mapping whose address the kernel picks, so its geometry is
+    // checked rather than commented. Not because a collision would corrupt silently — both
+    // arches' `map()` returns `AlreadyMapped` over a live leaf rather than overwriting it —
+    // but because it would turn every MAP_REGION into an unexplained NO_MEM the moment the
+    // window drifted onto the stack. The check names the cause at boot instead.
+    // It deliberately does NOT check the loaded image: the image's extent is a property of
+    // the ELF, not a constant, and the windows below are all far above where it links.
+    {
+        let share_end = A::USER_SHARE_BASE + SHARE_SLOTS as u64 * REGION_MAX_PAGES * abi::PAGE_SIZE;
+        let stack_low = A::USER_STACK_TOP - A::USER_STACK_PAGES * abi::PAGE_SIZE;
+        let mmio_end = A::USER_MMIO_BASE + DEVICE_PAGES * abi::PAGE_SIZE;
+        let ok = A::USER_SHARE_BASE >= A::USER_BASE
+            && share_end <= A::USER_LIMIT
+            && (share_end <= stack_low || A::USER_SHARE_BASE >= A::USER_STACK_TOP)
+            && (share_end <= A::USER_MMIO_BASE || A::USER_SHARE_BASE >= mmio_end);
+        if !ok {
+            let _ = writeln!(
+                con,
+                "\n[share] window {:#x}..{:#x} collides with the stack, the device window or \
+                 the user bounds — a region mapping could overwrite a process's stack.",
+                A::USER_SHARE_BASE,
+                share_end
+            );
+            A::exit(false);
+        }
+        let _ = writeln!(
+            con,
+            "  share window {:#x}..{:#x} ({} slots x {} pages)",
+            A::USER_SHARE_BASE,
+            share_end,
+            SHARE_SLOTS,
+            REGION_MAX_PAGES
+        );
+    }
 
     #[cfg(feature = "provoke-fault")]
     {
@@ -1058,6 +1345,11 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
             USER_ELF = user_elf;
             KTOKEN = ktoken;
         }
+        // Baseline BEFORE any process exists: everything allocated from here on belongs to a
+        // process or a region, and every one of those is destroyed by teardown, so the pool
+        // must return to exactly this number. Sampled after the loop it would include the
+        // boot processes' own frames and the check would be trivially wrong.
+        unsafe { FREE_AT_START = fa.free_count() };
         for i in 0..NUM_PROCS {
             // Each process gets its own address space (kernel shared in), stack, and its
             // ROLE's capabilities, plus an initial frame entering `_start` with its id in
@@ -1099,6 +1391,22 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
 /// # Safety
 /// Single-CPU, non-reentrant: no other live borrow of the process table or the ledger.
 unsafe fn teardown_process<A: Arch>(idx: usize) {
+    // FIRST, before anything below: destroy the regions this process OWNS. Order is
+    // load-bearing in both directions. It must precede the frame loop, which frees the page
+    // tables `destroy_region` has to walk to unmap every holder; and it must precede
+    // `state = Free`, because the holder sweep skips free slots and this process is usually
+    // one of the holders. Getting either wrong leaves a borrower mapped onto frames that go
+    // back to the pool — a cross-process use-after-free.
+    let dying_id = proc_at(idx).id;
+    destroy_regions_owned_by::<A>(dying_id);
+    // Then drop what this process had mapped of OTHER processes' regions. Those frames
+    // belong to their regions and must not be touched; only the mappings go.
+    for slot in 0..SHARE_SLOTS {
+        let id = proc_at(idx).shares[slot];
+        if id != 0 {
+            unmap_region_from::<A>(idx, id);
+        }
+    }
     // Reclaim the process's frames (page tables + stack + ELF + any DMA frames) before
     // freeing the slot, so a spawn/exit cycle does not leak an address space.
     if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
@@ -1547,6 +1855,66 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                 Some(_) => A::frame_set_ret(&mut f, 0),
             }
         }
+        abi::sysno::MAKE_REGION => {
+            // Creating a region is spending memory, so it takes the same authority
+            // allocating VRAM does: an `Untyped` capability carrying WRITE.
+            let cap = abi::CapId(A::frame_arg(&f, 0) as usize);
+            let pages = A::frame_arg(&f, 1);
+            let untyped = proc_at(cur).caps.lookup(cap).filter(|s| {
+                s.cap_type == abi::CapType::Untyped && s.rights.contains(abi::CapRights::WRITE)
+            });
+            let ret = match untyped {
+                None => abi::syserr::NO_CAP,
+                Some(u) if pages >= 1 && pages <= REGION_MAX_PAGES => {
+                    make_region::<A>(cur, pages, u.rights)
+                }
+                Some(_) => abi::syserr::NO_MEM,
+            };
+            A::frame_set_ret(&mut f, ret);
+        }
+        abi::sysno::MAP_REGION => {
+            // The BORROWER maps, into its own space, at an address the kernel picks.
+            let cap = abi::CapId(A::frame_arg(&f, 0) as usize);
+            let named = proc_at(cur).caps.lookup(cap).filter(|s| {
+                s.cap_type == abi::CapType::Region && s.rights.contains(abi::CapRights::READ)
+            });
+            let ret = match named {
+                None => abi::syserr::NO_CAP,
+                Some(slot) => map_region::<A>(cur, slot.object, slot.rights),
+            };
+            A::frame_set_ret(&mut f, ret);
+        }
+        abi::sysno::UNMAP_REGION => {
+            let cap = abi::CapId(A::frame_arg(&f, 0) as usize);
+            let named = proc_at(cur)
+                .caps
+                .lookup(cap)
+                .filter(|s| s.cap_type == abi::CapType::Region);
+            let ret = match named {
+                Some(slot) if unmap_region_from::<A>(cur, slot.object) => abi::syserr::OK,
+                _ => abi::syserr::NO_CAP,
+            };
+            A::frame_set_ret(&mut f, ret);
+        }
+        abi::sysno::FREE_REGION => {
+            // Only the OWNER may destroy a region, and ownership is by process IDENTITY —
+            // never by slot, which is recycled. A borrower must not be able to free memory
+            // it was merely lent.
+            let cap = abi::CapId(A::frame_arg(&f, 0) as usize);
+            let named = proc_at(cur)
+                .caps
+                .lookup(cap)
+                .filter(|s| s.cap_type == abi::CapType::Region);
+            let me = proc_at(cur).id;
+            let ret = match named.and_then(|s| region_slot(s.object)) {
+                Some(idx) if (*core::ptr::addr_of!(REGIONS[idx])).owner_id == me => {
+                    destroy_region::<A>(idx);
+                    abi::syserr::OK
+                }
+                _ => abi::syserr::NO_CAP,
+            };
+            A::frame_set_ret(&mut f, ret);
+        }
         abi::sysno::POLL_IRQ => {
             // Collecting a device's interrupts is authority: it requires an `Irq`
             // capability for that source, exactly like every other host-contract op.
@@ -1647,6 +2015,153 @@ pub unsafe fn preempt_trap<A: Arch>(frame: *mut u64) -> ! {
     // Round-robin to the next ready process (the same one if it is alone).
     CURRENT = sched().next().map(|t| t.0).unwrap_or(cur);
     resume_process::<A>(CURRENT)
+}
+
+/// Create a region of `pages` pages owned by process `owner`, and mint a capability for it
+/// in the owner's space with `rights`. Returns the new capability's id, or a `syserr`.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process or region tables.
+unsafe fn make_region<A: Arch>(owner: usize, pages: u64, rights: abi::CapRights) -> u64 {
+    use abi::FrameAllocator as _;
+    let Some(idx) = (0..MAX_REGIONS).find(|&i| !(*core::ptr::addr_of!(REGIONS[i])).live) else {
+        return abi::syserr::NO_MEM;
+    };
+    // An id that is never reused is the whole safety argument, so running out of ids is a
+    // refusal, not a wrap. Wrapping would re-issue an id some stale capability still names.
+    let Some(next) = NEXT_REGION_ID.checked_add(1) else {
+        return abi::syserr::NO_MEM;
+    };
+    let id = NEXT_REGION_ID;
+    let mut frames = [abi::PhysAddr(0); REGION_MAX_PAGES as usize];
+    let mut got = 0usize;
+    {
+        let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() else {
+            return abi::syserr::NO_MEM;
+        };
+        while (got as u64) < pages {
+            let Some(frame) = fa.alloc_dma_frame() else {
+                // Give back what we took: a partial region must leave no trace.
+                for i in 0..got {
+                    fa.free_frame(frames[i]);
+                }
+                return abi::syserr::NO_MEM;
+            };
+            // ZERO it. Region pages are the first recycled memory in this kernel that
+            // another process can be handed to READ; `ALLOC_VRAM` escapes this only because
+            // a VRAM frame is never mapped into anyone. Handing over a frame still holding a
+            // dead process's stack would be a disclosure with no syscall required.
+            core::ptr::write_bytes(frame.as_u64() as *mut u8, 0, abi::PAGE_SIZE as usize);
+            frames[got] = frame;
+            got += 1;
+        }
+    }
+    // Mint the capability BEFORE publishing the region, so a full capability space cannot
+    // leave a region nobody can name (a leak of exactly `pages` frames).
+    let Some(cap) = proc_at(owner).caps.insert(abi::CapType::Region, rights, id) else {
+        if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
+            for i in 0..got {
+                fa.free_frame(frames[i]);
+            }
+        }
+        return abi::syserr::NO_MEM;
+    };
+    NEXT_REGION_ID = next;
+    *(&mut *core::ptr::addr_of_mut!(REGIONS[idx])) = Region {
+        live: true,
+        id,
+        owner_id: proc_at(owner).id,
+        frames,
+        npages: pages,
+    };
+    cap.0 as u64
+}
+
+/// Map region `id` into process `proc`'s own address space, with permissions derived from
+/// `rights`. Returns the chosen user address, or a `syserr`.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process or region tables.
+unsafe fn map_region<A: Arch>(proc: usize, id: u64, rights: abi::CapRights) -> u64 {
+    let Some(idx) = region_slot(id) else {
+        // The capability outlived the region. This is exactly the case monotonic ids make
+        // safe: there is nothing to resolve to, rather than somebody else's memory.
+        return abi::syserr::NO_CAP;
+    };
+    // Re-mapping an already-mapped region reuses its slot, so permissions can be changed
+    // and a caller cannot consume all four slots with one region.
+    let slot = match (0..SHARE_SLOTS).find(|&i| proc_at(proc).shares[i] == id) {
+        Some(existing) => existing,
+        None => match (0..SHARE_SLOTS).find(|&i| proc_at(proc).shares[i] == 0) {
+            Some(free) => free,
+            None => return abi::syserr::NO_MEM,
+        },
+    };
+    let (npages, frames) = {
+        let r = &*core::ptr::addr_of!(REGIONS[idx]);
+        (r.npages, r.frames)
+    };
+    // The mapping carries exactly the authority the capability does: attenuating the
+    // capability on delegation has to attenuate the access it grants.
+    let perms = if rights.contains(abi::CapRights::WRITE) {
+        Perms::USER_RW
+    } else {
+        Perms::USER_RO
+    };
+    let base = share_va::<A>(slot);
+    let token = proc_at(proc).token;
+    {
+        // Drop any previous mapping of this slot first. `Space::map_page` returns
+        // `AlreadyMapped` over a live leaf rather than overwriting it, so without this a
+        // second MAP_REGION on a region we already hold fails with NO_MEM — and the
+        // permissions could never be changed, which is what re-mapping is for. `map_device`
+        // unmaps first for exactly this reason.
+        let mut space = A::Space::from_token(token);
+        for i in 0..REGION_MAX_PAGES {
+            let _ = space.unmap_page(abi::VirtAddr(base + i * abi::PAGE_SIZE));
+        }
+    }
+    // The borrows of the process slot are confined to this block. `proc_at` hands out a
+    // `&mut Process` derived from a static, so holding one across another is aliasing the
+    // compiler cannot see — this kernel has already shipped that bug once.
+    let mapped = {
+        let p = proc_at(proc);
+        let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() else {
+            return abi::syserr::NO_MEM;
+        };
+        let mut rec = RecordingAlloc {
+            inner: fa,
+            frames: &mut p.frames,
+            n: &mut p.nframes,
+        };
+        let mut space = A::Space::from_token(token);
+        let mut ok = true;
+        for i in 0..npages {
+            let va = abi::VirtAddr(base + i * abi::PAGE_SIZE);
+            if !space.map_page(va, frames[i as usize], perms, &mut rec) {
+                // Undo the pages we did install. `map_device` gets away without this only
+                // because it maps exactly one page; a multi-page map that fails halfway
+                // would leave a partial region mapped at an address the caller can read.
+                for j in 0..i {
+                    let _ = space.unmap_page(abi::VirtAddr(base + j * abi::PAGE_SIZE));
+                }
+                ok = false;
+                break;
+            }
+        }
+        ok
+    };
+    if !mapped {
+        if proc == CURRENT {
+            A::activate(token);
+        }
+        return abi::syserr::NO_MEM;
+    }
+    proc_at(proc).shares[slot] = id;
+    if proc == CURRENT {
+        A::activate(token);
+    }
+    base
 }
 
 /// The DEVICE-IRQ handler — the console's line. The timer's twin ([`preempt_trap`]), and
