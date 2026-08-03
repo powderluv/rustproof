@@ -16,7 +16,7 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all --check
       - name: Host unit tests (portable + paging crates)
-        run: cargo test -p abi -p mm -p vspace -p capabilities -p ipc -p sched -p loader -p hostcontract -p vspace-riscv -p loader-riscv
+        run: tools/host-tests.sh
       - name: Boot + ring-3 userland smoke
         run: tools/run-qemu.sh          # boots, loads init into ring 3, runs the host contract
       - name: Fault-dump smoke (forced #PF -> exception handler dumps cleanly)

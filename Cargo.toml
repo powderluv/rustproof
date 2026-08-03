@@ -6,6 +6,7 @@ resolver = "2"
 members = [
     "crates/nucleus-core",
     "crates/capabilities",
+    "crates/deleg",
     "crates/vspace",
     "crates/ipc",
     "crates/iommu-amdvi",

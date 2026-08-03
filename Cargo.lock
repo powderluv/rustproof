@@ -25,6 +25,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "deleg"
+version = "0.0.0"
+
+[[package]]
 name = "driver-host"
 version = "0.0.0"
 
@@ -72,6 +76,7 @@ dependencies = [
  "arch-riscv64",
  "arch-x86_64",
  "capabilities",
+ "deleg",
  "hal",
  "hostcontract",
  "ipc",
