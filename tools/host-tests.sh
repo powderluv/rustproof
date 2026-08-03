@@ -16,6 +16,7 @@ HOST_CRATES=(
     vspace-riscv
     capabilities
     deleg
+    runstate
     ipc
     sched
     loader

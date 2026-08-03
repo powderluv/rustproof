@@ -83,6 +83,7 @@ dependencies = [
  "loader",
  "loader-riscv",
  "mm",
+ "runstate",
  "sched",
  "vspace",
  "vspace-riscv",
@@ -144,6 +145,10 @@ dependencies = [
 
 [[package]]
 name = "run-vm"
+version = "0.0.0"
+
+[[package]]
+name = "runstate"
 version = "0.0.0"
 
 [[package]]

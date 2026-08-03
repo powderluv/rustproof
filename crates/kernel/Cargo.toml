@@ -11,6 +11,7 @@ hal = { path = "../hal" }
 mm = { path = "../mm" }
 capabilities = { path = "../capabilities" }
 deleg = { path = "../deleg" }
+runstate = { path = "../runstate" }
 ipc = { path = "../ipc" }
 sched = { path = "../sched" }
 hostcontract = { path = "../hostcontract" }

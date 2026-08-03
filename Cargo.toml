@@ -7,6 +7,7 @@ members = [
     "crates/nucleus-core",
     "crates/capabilities",
     "crates/deleg",
+    "crates/runstate",
     "crates/vspace",
     "crates/ipc",
     "crates/iommu-amdvi",

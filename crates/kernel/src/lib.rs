@@ -837,13 +837,37 @@ unsafe fn endpoint_of(proc: usize, cap: u64, needed: abi::CapRights) -> Option<u
     }
 }
 
+/// Project the process table onto the pure state vector `runstate` reasons about.
+///
+/// Everything the scheduling decision depends on and nothing else, so the decision itself
+/// can be checked exhaustively on the host instead of by whatever states one scripted boot
+/// happens to reach. Both of this kernel's confirmed hangs were single points in this space.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table.
+unsafe fn run_slots() -> [runstate::Slot; MAX_PROCS] {
+    let mut out = [runstate::Slot::FREE; MAX_PROCS];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let p = proc_at(i);
+        if p.state == ProcState::Free {
+            continue;
+        }
+        *slot = runstate::Slot::blocked(match p.state {
+            ProcState::BlockedSend { ep, .. } => runstate::Blocked::Send(ep),
+            ProcState::BlockedRecv { ep, .. } => runstate::Blocked::Recv(ep),
+            ProcState::BlockedIrq { line } => runstate::Blocked::Irq(line),
+            _ => runstate::Blocked::No,
+        });
+    }
+    out
+}
+
 /// The first process blocked receiving on endpoint `ep`, if any.
 ///
 /// # Safety
 /// Single-CPU, non-reentrant: no other live borrow of the process table.
 unsafe fn find_blocked_recv(ep: u64) -> Option<usize> {
-    (0..MAX_PROCS)
-        .find(|&i| matches!(proc_at(i).state, ProcState::BlockedRecv { ep: e, .. } if e == ep))
+    runstate::find_recv(&run_slots(), ep)
 }
 
 /// The first process blocked sending on endpoint `ep`, with its pending word, if any.
@@ -851,10 +875,11 @@ unsafe fn find_blocked_recv(ep: u64) -> Option<usize> {
 /// # Safety
 /// Single-CPU, non-reentrant: no other live borrow of the process table.
 unsafe fn find_blocked_send(ep: u64) -> Option<(usize, u64, usize)> {
-    (0..MAX_PROCS).find_map(|i| match proc_at(i).state {
-        ProcState::BlockedSend { ep: e, word, len } if e == ep => Some((i, word, len)),
+    let i = runstate::find_send(&run_slots(), ep)?;
+    match proc_at(i).state {
+        ProcState::BlockedSend { word, len, .. } => Some((i, word, len)),
         _ => None,
-    })
+    }
 }
 
 /// Called when the run queue is empty: either every process has exited (a clean finish —
@@ -870,21 +895,27 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
     // Wake any interrupt waiter that cannot be credited — no authority left, or a line
     // nothing delivers: parking for one would be parking for an event that can never
     // arrive, and the park is indistinguishable from a working machine.
-    for i in 0..MAX_PROCS {
-        if let ProcState::BlockedIrq { line } = proc_at(i).state {
-            if !creditable(i, line) {
-                let p = proc_at(i);
-                A::frame_set_ret(&mut p.frame, abi::syserr::NO_CAP);
-                p.state = ProcState::Ready;
-                sched().add(abi::ThreadId(i));
-            }
+    let cred = |i: usize, line: u64| creditable(i, line);
+    let mut wake = [false; MAX_PROCS];
+    for i in runstate::uncreditable(&run_slots(), &cred) {
+        wake[i] = true;
+    }
+    for (i, w) in wake.iter().enumerate() {
+        if *w {
+            let p = proc_at(i);
+            A::frame_set_ret(&mut p.frame, abi::syserr::NO_CAP);
+            p.state = ProcState::Ready;
+            sched().add(abi::ThreadId(i));
         }
     }
     if let Some(t) = sched().current() {
         CURRENT = t.0;
         resume_process::<A>(t.0);
     }
-    if (0..MAX_PROCS).any(|i| matches!(proc_at(i).state, ProcState::BlockedIrq { .. })) {
+    // Decided over the state AFTER the wakes above, by logic checked over every 3-slot state
+    // vector rather than over the handful a boot happens to produce.
+    let verdict = runstate::classify(&run_slots(), &cred);
+    if verdict == runstate::Next::Park {
         if !IDLING {
             PARKS = PARKS.wrapping_add(1);
         }
@@ -892,13 +923,7 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
         CURRENT = usize::MAX;
         A::idle();
     }
-    let deadlocked = (0..MAX_PROCS).any(|i| {
-        matches!(
-            proc_at(i).state,
-            ProcState::BlockedSend { .. } | ProcState::BlockedRecv { .. }
-        )
-    });
-    if deadlocked {
+    if verdict == runstate::Next::Deadlock {
         let _ = writeln!(
             con,
             "\n[kernel] deadlock: no runnable process (survivors blocked on IPC)"
