@@ -424,9 +424,27 @@ size, which the property cannot influence. And fresh memory proves nothing about
 zeroing, because early-boot frames are zero anyway — the assertion now poisons a
 region, destroys it, and requires the *next* region to come back clean.
 
-The last row is honest rather than solved. Scrubbing frames when a region is
-destroyed and zeroing a new process's stack pages are two defences over the same
-observable, so removing either alone is masked by the other and no single-mutation
-test isolates it. Both are cheap and both stay. Doing it in one place —
-zeroing in the allocator on release — would make the invariant testable, and is
-the obvious next move.
+That last row is fixed now, and how it got fixed is the more useful part.
+Scrubbing happened at three sites — region creation, region destruction, and
+stack mapping — so removing any one was masked by the others and no test could
+tell whether the kernel scrubbed at all. It now happens in one function,
+`zero_frame`, applied where a frame leaves the pool toward a process.
+
+One *function*, though, is not one *call site*, and review caught the difference.
+Deleting the whole body does fail the run, but deleting the single call in
+`RecordingAlloc::alloc_frame` — the one behind every process's stack — left both
+arches green while spawned processes read whole pages of an exited process's
+stack at ring 3 with no capability at all. That was the original disclosure,
+guarded by a line no assertion could reach. Every process now checks, before
+anything else, that the untouched pages below its own stack pointer are zero, and
+then paints them so a future leak is attributable rather than merely nonzero.
+Both mutations fail now, on both arches — which took adding the probe to *both*
+user programs, since x86 boots `crates/init` and riscv boots `crates/riscv-init`
+and a probe in one says nothing about the other.
+
+Scrubbing on *release* would read as the more natural choice and is not enough on
+its own: a frame that has never been allocated still holds whatever the firmware
+left in it. Zeroing on the way out covers both. `ALLOC_VRAM` goes through it too —
+nothing can read VRAM today, since it is handed out as a physical address and
+never mapped, but a driver's purpose is to point a DEVICE at it, and a device
+reading a dead process's memory is the same disclosure with an extra step.

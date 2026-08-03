@@ -424,10 +424,53 @@ fn free_vram(phys: u64) -> u64 {
 /// loop + the per-process host contract. Together they show IPC blocking and preemption
 /// coexisting. Never returns (each role exits via the EXIT syscall).
 ///
+/// Our stack pages must arrive ZEROED, and this is the only thing that checks it.
+///
+/// The kernel scrubs a frame on its way out of the allocator, in one function with three
+/// call sites. The region assertions cover one of them. THIS covers the one that matters
+/// most: the frames behind every process's stack. Review demonstrated the gap by removing
+/// that call site alone — spawned processes then read whole pages of an exited process's
+/// stack, at ring 3, with no capability of any kind, while both arches still reported PASS.
+///
+/// We look BELOW our own stack pointer, at pages this program has not touched, and then
+/// paint them so that whoever inherits these frames sees something attributable rather than
+/// merely nonzero. Two pages of headroom are left above the scanned span for our own use.
+fn check_fresh_stack(id: u64) {
+    let here = 0u64;
+    let sp_page = (&here as *const u64 as u64) & !(4096 - 1);
+    let top = sp_page - 4096; // exclusive: leave the page we are running on, plus one
+    let bottom = sp_page - 14 * 4096;
+    let mut dirty = 0u64;
+    let mut a = bottom;
+    while a < top {
+        // SAFETY: inside our own mapped stack, below the pointer we are running on.
+        if unsafe { core::ptr::read_volatile(a as *const u8) } != 0 {
+            dirty = dirty.wrapping_add(1);
+        }
+        a = a.wrapping_add(64);
+    }
+    tag(id);
+    if dirty == 0 {
+        debug_write(b"stack: our stack pages arrived zeroed\n");
+    } else {
+        debug_write(b"stack: our stack came back DIRTY -- another process's bytes (bug)\n");
+    }
+    // Paint, so a future leak of these frames is unmistakable rather than plausibly zero.
+    let mark = 0xE0u8 | (id as u8 & 0x0f);
+    let mut a = bottom;
+    while a < top {
+        // SAFETY: as above; this span is ours and unused.
+        unsafe { core::ptr::write_volatile(a as *mut u8, mark) };
+        a = a.wrapping_add(64);
+    }
+}
+
 /// Declared `extern "C"` / `#[no_mangle]` so the linker resolves `_start` (the
 /// `ENTRY` of `link.ld`); the `id` parameter reads the first-arg register.
 #[no_mangle]
 pub extern "C" fn _start(id: u64) -> ! {
+    // Before anything else, while the stack below us is still untouched.
+    check_fresh_stack(id);
     match id {
         0 => producer(),
         1 => consumer(),
@@ -653,11 +696,11 @@ fn compute(id: u64) -> ! {
         // Scrub-on-destroy, tested against RECYCLED memory. Fresh frames are zero anyway on
         // an early boot, so zeroing only a NEW region proves nothing: poison one, destroy
         // it, and require the next region to come back clean.
-        let poison = make_region(2, 1);
+        let poison = make_region(2, 3); // multi-page: a per-page scrub bug must show
         let pva = map_region(poison);
         if pva != syserr::NO_CAP && pva != syserr::NO_MEM {
             let mut i = 0usize;
-            while i < 4096 {
+            while i < 3 * 4096 {
                 unsafe { core::ptr::write_volatile((pva as *mut u8).wrapping_add(i), 0xAA) };
                 i += 1;
             }
@@ -677,13 +720,13 @@ fn compute(id: u64) -> ! {
         } else {
             debug_write(b"share: stale region capability still maps (bug)\n");
         }
-        let fresh = make_region(2, 1);
+        let fresh = make_region(2, 3);
         let fva = map_region(fresh);
         tag(id);
         if fva != syserr::NO_CAP && fva != syserr::NO_MEM {
             let mut dirty = false;
             let mut i = 0usize;
-            while i < 4096 {
+            while i < 3 * 4096 {
                 if unsafe { core::ptr::read_volatile((fva as *const u8).wrapping_add(i)) } != 0 {
                     dirty = true;
                 }

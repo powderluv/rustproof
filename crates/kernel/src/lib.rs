@@ -207,9 +207,31 @@ struct RecordingAlloc<'a> {
     n: &'a mut usize,
 }
 
+/// Zero a freshly allocated frame before anything can see its previous contents.
+///
+/// THE single place this kernel scrubs memory. Frames are recycled — `alloc_frame` scans
+/// with no DMA exclusion, so a destroyed region's pages come back as another process's
+/// stack, and a dead process's stack comes back as somebody's shared region. Scrubbing on
+/// RELEASE would work equally well but is not enough on its own, because a frame that has
+/// never been allocated still holds whatever the firmware left there.
+///
+/// One place, deliberately. The previous version zeroed at three sites — region creation,
+/// region destruction, and stack mapping — and the result was that removing any one of them
+/// was masked by the others, so no test could tell whether the kernel scrubbed at all.
+/// Delete the `write_bytes` below and the demo's recycled-memory assertion fails.
+///
+/// # Safety
+/// `frame` must be a live, identity-mapped physical frame owned by the caller.
+#[inline]
+unsafe fn zero_frame(frame: abi::PhysAddr) -> abi::PhysAddr {
+    core::ptr::write_bytes(frame.as_u64() as *mut u8, 0, abi::PAGE_SIZE as usize);
+    frame
+}
+
 impl abi::FrameAllocator for RecordingAlloc<'_> {
     fn alloc_frame(&mut self) -> Option<abi::PhysAddr> {
-        let p = self.inner.alloc_frame()?;
+        // SAFETY: the allocator returns a live frame in identity-mapped physical memory.
+        let p = unsafe { zero_frame(self.inner.alloc_frame()?) };
         if *self.n >= MAX_PROC_FRAMES {
             self.inner.free_frame(p);
             return None;
@@ -658,12 +680,6 @@ unsafe fn destroy_region<A: Arch>(idx: usize) {
     if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
         use abi::FrameAllocator as _;
         for i in 0..r.npages as usize {
-            // SCRUB before releasing. `alloc_frame` scans from a cursor with no DMA
-            // exclusion, so these frames can come straight back as another process's
-            // USER_RW stack pages — shared data intact, readable with no capability at all.
-            // Zeroing at creation is not enough: it protects the region's own users, not
-            // whoever inherits the memory afterwards.
-            core::ptr::write_bytes(r.frames[i].as_u64() as *mut u8, 0, abi::PAGE_SIZE as usize);
             fa.free_frame(r.frames[i]);
         }
     }
@@ -1030,11 +1046,6 @@ unsafe fn load_process<A: Arch>(
         for p in 1..=A::USER_STACK_PAGES {
             let va = abi::VirtAddr(A::USER_STACK_TOP - p * abi::PAGE_SIZE);
             let frame = rec.alloc_frame()?;
-            // Zero it: a recycled frame can carry a dead process's stack, or a destroyed
-            // region's shared bytes, and this page is about to be USER_RW in a process that
-            // needed no capability to read it. Scrubbing on release covers regions; this
-            // covers everything else that reaches user memory.
-            core::ptr::write_bytes(frame.as_u64() as *mut u8, 0, abi::PAGE_SIZE as usize);
             if !space.map_page(va, frame, Perms::USER_RW, &mut rec) {
                 return None;
             }
@@ -1326,7 +1337,12 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
         // prove it reached this exact physical memory.
         {
             use abi::FrameAllocator as _;
-            let first = fa.alloc_frame().expect("device window");
+            // SAFETY: the allocator just returned a live, identity-mapped frame.
+            let first = unsafe { zero_frame(fa.alloc_frame().expect("device window")) };
+            // Zeroed above before signing: a process maps this whole PAGE through MAP_BAR,
+            // and only the first 16 bytes are ours. The rest would otherwise be whatever the
+            // firmware left there — the same disclosure this kernel scrubs everywhere else,
+            // reached through a capability that legitimately grants the mapping.
             let sig = b"RUSTPROOF-DEVICE";
             // SAFETY: the frames were just allocated and are identity-mapped kernel memory.
             unsafe {
@@ -2040,18 +2056,13 @@ unsafe fn make_region<A: Arch>(owner: usize, pages: u64, rights: abi::CapRights)
             return abi::syserr::NO_MEM;
         };
         while (got as u64) < pages {
-            let Some(frame) = fa.alloc_dma_frame() else {
+            let Some(frame) = fa.alloc_dma_frame().map(|f| zero_frame(f)) else {
                 // Give back what we took: a partial region must leave no trace.
                 for i in 0..got {
                     fa.free_frame(frames[i]);
                 }
                 return abi::syserr::NO_MEM;
             };
-            // ZERO it. Region pages are the first recycled memory in this kernel that
-            // another process can be handed to READ; `ALLOC_VRAM` escapes this only because
-            // a VRAM frame is never mapped into anyone. Handing over a frame still holding a
-            // dead process's stack would be a disclosure with no syscall required.
-            core::ptr::write_bytes(frame.as_u64() as *mut u8, 0, abi::PAGE_SIZE as usize);
             frames[got] = frame;
             got += 1;
         }
@@ -2292,7 +2303,11 @@ impl<A: Arch> abi::HostEnv for KEnv<A> {
                 return None;
             }
             let fa = (*core::ptr::addr_of_mut!(FA)).as_mut()?;
-            let p = fa.alloc_dma_frame()?;
+            // Scrubbed like every other frame that leaves the pool for a process. Nothing
+            // can read VRAM today — it is handed out as a physical address and never mapped
+            // — but a driver's whole purpose is to point a DEVICE at it, and a device
+            // reading a dead process's memory is the same disclosure with an extra step.
+            let p = zero_frame(fa.alloc_dma_frame()?);
             let proc = proc_at(self.proc_idx);
             proc.vram[proc.nvram] = p;
             proc.nvram += 1;
