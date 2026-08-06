@@ -8,6 +8,7 @@ members = [
     "crates/capabilities",
     "crates/deleg",
     "crates/runstate",
+    "crates/regions",
     "crates/vspace",
     "crates/ipc",
     "crates/iommu-amdvi",

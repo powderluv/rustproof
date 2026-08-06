@@ -83,6 +83,7 @@ dependencies = [
  "loader",
  "loader-riscv",
  "mm",
+ "regions",
  "runstate",
  "sched",
  "vspace",
@@ -135,6 +136,10 @@ dependencies = [
  "arch-riscv64",
  "kernel",
 ]
+
+[[package]]
+name = "regions"
+version = "0.0.0"
 
 [[package]]
 name = "riscv-init"

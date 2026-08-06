@@ -17,6 +17,7 @@ HOST_CRATES=(
     capabilities
     deleg
     runstate
+    regions
     ipc
     sched
     loader

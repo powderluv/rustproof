@@ -599,6 +599,125 @@ unsafe fn unmap_region_from<A: Arch>(proc: usize, id: u64) -> bool {
     hit
 }
 
+/// Drop every delegation edge naming capability slot `cap` of process `proc`, at BOTH ends.
+///
+/// Regions are the first feature that empties a live capability slot at runtime outside
+/// `revoke_delegations`. An edge left naming a freed slot would later be walked as though it
+/// still described a delegation, and the slot may by then hold something else entirely.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the ledger or process table.
+unsafe fn forget_cap_edges(proc: usize, cap: usize) {
+    ledger().forget(endpoint_at(proc, cap));
+}
+
+/// Worst-case teardown plan: every share slot unmapped, plus one cap sweep and one release
+/// per region. Bounded, so the plan lives on the kernel stack.
+const PLAN_STEPS: usize = MAX_PROCS * SHARE_SLOTS + 2 * MAX_REGIONS + SHARE_SLOTS;
+
+/// Project the region table and every process's share slots onto the pure view the `regions`
+/// crate plans over.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process or region tables.
+unsafe fn region_view() -> (
+    [regions::Region; MAX_REGIONS],
+    [regions::Holder<SHARE_SLOTS>; MAX_PROCS],
+) {
+    let mut rs = [regions::Region::EMPTY; MAX_REGIONS];
+    for (i, out) in rs.iter_mut().enumerate() {
+        let r = &*core::ptr::addr_of!(REGIONS[i]);
+        if r.live {
+            *out = regions::Region::new(r.id, r.owner_id);
+        }
+    }
+    let mut hs = [regions::Holder::<SHARE_SLOTS>::FREE; MAX_PROCS];
+    for (i, out) in hs.iter_mut().enumerate() {
+        let p = proc_at(i);
+        if p.state != ProcState::Free {
+            *out = regions::Holder::new(p.id, p.shares);
+        }
+    }
+    (rs, hs)
+}
+
+/// Carry out a teardown plan, in order.
+///
+/// The order is the safety property, and it is the crate's to decide: every holder is
+/// unmapped before the frames are released. Doing it the other way returns memory to the pool
+/// while an address space still points at it, and this kernel hands recycled frames straight
+/// back out as another process's stack.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process or region tables.
+unsafe fn run_region_plan<A: Arch>(plan: &regions::Plan<PLAN_STEPS>) {
+    // A plan that did not fit is a refusal, not something to half-execute: a partial teardown
+    // is precisely how frames get released while a mapping survives.
+    if plan.truncated {
+        let mut con = Console::<A>::new();
+        let _ = writeln!(
+            con,
+            "[region] teardown plan did not fit — refusing to half-run it"
+        );
+        A::exit(false);
+    }
+    for step in plan.steps() {
+        match step {
+            regions::Step::Unmap { proc, slot, .. } => unmap_share_slot::<A>(proc, slot),
+            regions::Step::ForgetCaps { region } => {
+                for p in 0..MAX_PROCS {
+                    if proc_at(p).state == ProcState::Free {
+                        continue;
+                    }
+                    for c in 0..CAP_SLOTS {
+                        let names_it = proc_at(p).caps.lookup(abi::CapId(c)).is_some_and(|sl| {
+                            sl.cap_type == abi::CapType::Region && sl.object == region
+                        });
+                        if names_it {
+                            proc_at(p).caps.revoke_subtree(abi::CapId(c));
+                            forget_cap_edges(p, c);
+                        }
+                    }
+                }
+            }
+            regions::Step::Release { region } => {
+                if let Some(i) = region_slot(region) {
+                    let r = &mut *core::ptr::addr_of_mut!(REGIONS[i]);
+                    if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
+                        use abi::FrameAllocator as _;
+                        for k in 0..r.npages as usize {
+                            fa.free_frame(r.frames[k]);
+                        }
+                    }
+                    *r = Region::EMPTY;
+                }
+            }
+        }
+    }
+}
+
+/// Drop one share-window slot's mapping.
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table.
+unsafe fn unmap_share_slot<A: Arch>(proc: usize, slot: usize) {
+    if proc_at(proc).shares[slot] == 0 {
+        return;
+    }
+    let token = proc_at(proc).token;
+    let mut space = A::Space::from_token(token);
+    let base = share_va::<A>(slot);
+    for i in 0..REGION_MAX_PAGES {
+        let _ = space.unmap_page(abi::VirtAddr(base + i * abi::PAGE_SIZE));
+    }
+    proc_at(proc).shares[slot] = 0;
+    // Only the ACTIVE space needs a paging-base reload; another space is covered by the
+    // reload `resume_process` performs when it is next scheduled.
+    if proc == CURRENT {
+        A::activate(token);
+    }
+}
+
 /// Destroy the region in table slot `idx`: unmap it from every process that has it mapped,
 /// drop every capability naming it, and return its frames to the pool.
 ///
@@ -612,58 +731,15 @@ unsafe fn unmap_region_from<A: Arch>(proc: usize, id: u64) -> bool {
 /// Single-CPU, non-reentrant: no other live borrow of the process or region tables.
 unsafe fn destroy_region<A: Arch>(idx: usize) {
     let id = (*core::ptr::addr_of!(REGIONS[idx])).id;
-    if id == 0 {
-        return;
-    }
-    for p in 0..MAX_PROCS {
-        if proc_at(p).state == ProcState::Free {
-            continue;
-        }
-        unmap_region_from::<A>(p, id);
-        for c in 0..CAP_SLOTS {
-            let names_it = proc_at(p)
-                .caps
-                .lookup(abi::CapId(c))
-                .is_some_and(|slot| slot.cap_type == abi::CapType::Region && slot.object == id);
-            if names_it {
-                proc_at(p).caps.revoke_subtree(abi::CapId(c));
-                forget_cap_edges(p, c);
-            }
-        }
-    }
-    let r = &mut *core::ptr::addr_of_mut!(REGIONS[idx]);
-    if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
-        use abi::FrameAllocator as _;
-        for i in 0..r.npages as usize {
-            fa.free_frame(r.frames[i]);
-        }
-    }
-    *r = Region::EMPTY;
+    let (rs, hs) = region_view();
+    let plan: regions::Plan<PLAN_STEPS> = regions::destroy(&rs, &hs, id);
+    run_region_plan::<A>(&plan);
 }
 
-/// Drop every delegation edge naming capability slot `cap` of process `proc`, at BOTH ends.
-///
-/// Regions are the first feature that empties a live capability slot at runtime outside
-/// `revoke_delegations`. An edge left naming a freed slot would later be walked as though it
-/// still described a delegation, and the slot may by then hold something else entirely.
-///
-/// # Safety
-/// Single-CPU, non-reentrant: no other live borrow of the ledger or process table.
-unsafe fn forget_cap_edges(proc: usize, cap: usize) {
-    ledger().forget(endpoint_at(proc, cap));
-}
-
-/// Destroy every region owned by process identity `owner_id`.
-///
-/// # Safety
-/// Single-CPU, non-reentrant: no other live borrow of the process or region tables.
-unsafe fn destroy_regions_owned_by<A: Arch>(owner_id: u64) {
-    for i in 0..MAX_REGIONS {
-        let r = &*core::ptr::addr_of!(REGIONS[i]);
-        if r.live && r.owner_id == owner_id {
-            destroy_region::<A>(i);
-        }
-    }
+unsafe fn destroy_regions_owned_by<A: Arch>(proc: usize, owner_id: u64) {
+    let (rs, hs) = region_view();
+    let plan: regions::Plan<PLAN_STEPS> = regions::teardown(&rs, &hs, proc, owner_id);
+    run_region_plan::<A>(&plan);
 }
 
 /// Does process `proc` still hold an `Irq` capability carrying `READ` for `line`?
@@ -1383,15 +1459,10 @@ unsafe fn teardown_process<A: Arch>(idx: usize) {
     // one of the holders. Getting either wrong leaves a borrower mapped onto frames that go
     // back to the pool — a cross-process use-after-free.
     let dying_id = proc_at(idx).id;
-    destroy_regions_owned_by::<A>(dying_id);
-    // Then drop what this process had mapped of OTHER processes' regions. Those frames
-    // belong to their regions and must not be touched; only the mappings go.
-    for slot in 0..SHARE_SLOTS {
-        let id = proc_at(idx).shares[slot];
-        if id != 0 {
-            unmap_region_from::<A>(idx, id);
-        }
-    }
+    // One plan covers both halves — destroying the regions this process OWNS, and dropping
+    // its own mappings of everyone else's — in an order the `regions` crate is responsible
+    // for and checks over every configuration it can be handed.
+    destroy_regions_owned_by::<A>(idx, dying_id);
     // Reclaim the process's frames (page tables + stack + ELF + any DMA frames) before
     // freeing the slot, so a spawn/exit cycle does not leak an address space.
     if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
