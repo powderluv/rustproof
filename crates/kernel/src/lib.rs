@@ -68,13 +68,16 @@ const CAP_SLOTS: usize = 16;
 /// page tables + stack + ELF segments, ~25. VRAM frames are tracked + quota'd separately.
 const MAX_PROC_FRAMES: usize = 64;
 
-/// Per-process VRAM quota: the most `ALLOC_VRAM` frames a process may hold at once
-/// (`FREE_VRAM` returns quota). Also the capacity of the per-process VRAM tracking list.
-const VRAM_QUOTA_FRAMES: usize = 8;
-
 /// How many shareable memory regions can exist at once. Small and fixed, like every other
 /// table here; exhaustion is reported, never silently absorbed.
 const MAX_REGIONS: usize = 8;
+/// How many regions one process may own at once.
+///
+/// This is the bound `VRAM_QUOTA_FRAMES` used to provide. Folding DMA memory into regions
+/// would otherwise DELETE a limit: `make_region` had no per-owner cap, so one process could
+/// take every entry in the global table and deny the mechanism to everyone else. Checked
+/// BEFORE any frame is taken, the discipline the VRAM path had.
+const REGION_QUOTA: usize = 6;
 /// Largest region, in pages. Bounds both the frames one process can tie up and the size of
 /// the per-process share window below.
 const REGION_MAX_PAGES: u64 = 4;
@@ -86,9 +89,9 @@ const SHARE_SLOTS: usize = 4;
 /// any process holding a `Region` capability that names it.
 ///
 /// The frames live HERE and in no `Process` list. `teardown_process` frees `frames` and
-/// `vram` unconditionally, with no refcount anywhere in the kernel, so a region frame that
-/// also appeared in an owner's list would be freed while a borrower still had it mapped —
-/// and then handed to somebody else.
+/// frame list unconditionally, with no refcount anywhere in the kernel, so a region frame
+/// that also appeared in an owner's list would be freed while a borrower still had it
+/// mapped — and then handed to somebody else.
 #[derive(Clone, Copy)]
 struct Region {
     /// False for a free table slot.
@@ -163,11 +166,6 @@ struct Process {
     /// it is resumed: `pending_len` bytes of `msg` to user address `pending_dst`.
     pending_dst: u64,
     pending_len: usize,
-    /// VRAM (DMA) frames the process currently holds via `ALLOC_VRAM`. `vram[..nvram]` are
-    /// live; `nvram` is the process's VRAM usage (capped at the quota) and each is
-    /// individually freeable via `FREE_VRAM`. Also reclaimed on exit.
-    vram: [abi::PhysAddr; VRAM_QUOTA_FRAMES],
-    nvram: usize,
     /// Regions this process currently has MAPPED, by region id, one per share-window slot
     /// (`0` = slot free). Slot index picks the virtual address, so the kernel chooses where
     /// a mapping lands and no user-supplied address ever reaches the mapping path.
@@ -187,8 +185,6 @@ impl Process {
         state: ProcState::Free,
         frames: [abi::PhysAddr(0); MAX_PROC_FRAMES],
         nframes: 0,
-        vram: [abi::PhysAddr(0); VRAM_QUOTA_FRAMES],
-        nvram: 0,
         shares: [0; SHARE_SLOTS],
         irq_pending: [0; MAX_IRQ_LINES],
         msg: [0; abi::MAX_MSG_BYTES],
@@ -1125,8 +1121,7 @@ unsafe fn load_process<A: Arch>(
             s.id = id_arg;
             s.msg_len = 0;
             s.irq_pending = [0; MAX_IRQ_LINES];
-            // Reset here, not only in teardown: `vram`/`nvram` are zeroed only inside
-            // teardown's `if let Some(fa)`, and a process landing in a recycled slot must
+            // Reset here, not only in teardown: a process landing in a recycled slot must
             // never inherit the dead occupant's state. A stale `shares` entry would make
             // this process appear to hold a mapping it does not have, and the next
             // `destroy_region` would unmap a window it never mapped.
@@ -1498,10 +1493,6 @@ unsafe fn teardown_process<A: Arch>(idx: usize) {
             fa.free_frame(p.frames[i]);
         }
         p.nframes = 0;
-        for i in 0..p.nvram {
-            fa.free_frame(p.vram[i]);
-        }
-        p.nvram = 0;
     }
     // Splice this process out of the delegation ledger. Its capability space is gone and
     // its slot is about to be reused, so every edge naming it must go — but an edge INTO it
@@ -1769,7 +1760,7 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
         }
         abi::sysno::SPAWN => {
             // Creating a process is authority: require the caller to present an Untyped
-            // capability (`a0` = cap id), like ALLOC_VRAM. This bounds who can spawn.
+            // capability (`a0` = cap id), like MAKE_REGION. This bounds who can spawn.
             let cap = abi::CapId(A::frame_arg(&f, 0) as usize);
             // Type AND rights, per `docs/host-contract.md`: "rights ⊇ need" on every op.
             // A spawn consumes memory out of the untyped region — a mutation — so `WRITE`.
@@ -1952,10 +1943,12 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             // never by slot, which is recycled. A borrower must not be able to free memory
             // it was merely lent.
             let cap = abi::CapId(A::frame_arg(&f, 0) as usize);
-            let named = proc_at(cur)
-                .caps
-                .lookup(cap)
-                .filter(|s| s.cap_type == abi::CapType::Region);
+            // Destroying a region takes WRITE, not merely possession: a READ-only loan must
+            // not be able to destroy what it was lent, and ownership alone is not the whole
+            // gate (docs/host-contract.md). The owner-by-IDENTITY check below still stands.
+            let named = proc_at(cur).caps.lookup(cap).filter(|s| {
+                s.cap_type == abi::CapType::Region && s.rights.contains(abi::CapRights::WRITE)
+            });
             let me = proc_at(cur).id;
             let ret = match named.and_then(|s| region_slot(s.object)) {
                 Some(idx) if (*core::ptr::addr_of!(REGIONS[idx])).owner_id == me => {
@@ -2075,6 +2068,18 @@ pub unsafe fn preempt_trap<A: Arch>(frame: *mut u64) -> ! {
 /// Single-CPU, non-reentrant: no other live borrow of the process or region tables.
 unsafe fn make_region<A: Arch>(owner: usize, pages: u64, rights: abi::CapRights) -> u64 {
     use abi::FrameAllocator as _;
+    // Quota first, before a frame is taken or an id burned — a process at its limit must not
+    // be able to churn the monotonic counter or the pool on refused requests.
+    let owner_id = proc_at(owner).id;
+    let owned = (0..MAX_REGIONS)
+        .filter(|&i| {
+            let r = &*core::ptr::addr_of!(REGIONS[i]);
+            r.live && r.owner_id == owner_id
+        })
+        .count();
+    if owned >= REGION_QUOTA {
+        return abi::syserr::NO_MEM;
+    }
     let Some(idx) = (0..MAX_REGIONS).find(|&i| !(*core::ptr::addr_of!(REGIONS[i])).live) else {
         return abi::syserr::NO_MEM;
     };
@@ -2329,48 +2334,6 @@ impl<A: Arch> abi::HostEnv for KEnv<A> {
         }
     }
 
-    fn alloc_dma(&mut self) -> Option<abi::PhysAddr> {
-        // SAFETY: single-CPU, non-reentrant; FA and the process slot are disjoint statics.
-        unsafe {
-            // Enforce the per-process VRAM quota BEFORE allocating, so a process at quota
-            // never even takes a frame from the pool.
-            if proc_at(self.proc_idx).nvram >= VRAM_QUOTA_FRAMES {
-                return None;
-            }
-            let fa = (*core::ptr::addr_of_mut!(FA)).as_mut()?;
-            // Scrubbed like every other frame that leaves the pool for a process. Nothing
-            // can read VRAM today — it is handed out as a physical address and never mapped
-            // — but a driver's whole purpose is to point a DEVICE at it, and a device
-            // reading a dead process's memory is the same disclosure with an extra step.
-            let p = zero_frame(fa.alloc_dma_frame()?);
-            let proc = proc_at(self.proc_idx);
-            proc.vram[proc.nvram] = p;
-            proc.nvram += 1;
-            Some(p)
-        }
-    }
-    fn free_dma(&mut self, phys: u64) -> bool {
-        use abi::FrameAllocator as _;
-        // SAFETY: single-CPU, non-reentrant; FA and the process slot are disjoint statics.
-        unsafe {
-            let proc = proc_at(self.proc_idx);
-            // Ownership check: only free a frame this process holds (never another's).
-            let Some(i) = proc.vram[..proc.nvram]
-                .iter()
-                .position(|f| f.as_u64() == phys)
-            else {
-                return false;
-            };
-            let frame = proc.vram[i];
-            // Swap-remove from the VRAM list (order does not matter), then return to pool.
-            proc.nvram -= 1;
-            proc.vram[i] = proc.vram[proc.nvram];
-            if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
-                fa.free_frame(frame);
-            }
-            true
-        }
-    }
     fn write_user_bytes(&mut self, uptr: u64, bytes: &[u8]) -> bool {
         unsafe { A::copy_to_user(uptr, bytes) }
     }

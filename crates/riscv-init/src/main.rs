@@ -27,7 +27,7 @@
 //! the only pointers handed to the kernel are addresses of stack locals passed as
 //! syscall out-buffers, plus `&'static` bytes passed to DEBUG_WRITE.
 
-use abi::{syserr, sysno, AllocResp, CapId, GpuInfo, MapBarResp};
+use abi::{syserr, sysno, CapId, GpuInfo, MapBarResp};
 
 // ----------------------------------------------------------------- syscall stub
 //
@@ -39,7 +39,7 @@ use abi::{syserr, sysno, AllocResp, CapId, GpuInfo, MapBarResp};
 //
 // SAFETY (the stub): raw `ecall` traps into S-mode. We never mark `nomem`
 // because several syscalls read (DEBUG_WRITE) or write (GET_INFO / MAP_BAR /
-// ALLOC_VRAM) user memory through pointer args, so the compiler must treat
+// MAP_BAR) user memory through pointer args, so the compiler must treat
 // memory as live across the trap. `nostack` is sound: `ecall` touches no stack.
 
 /// Perform an `ecall` with up to five arguments. `num` goes in `a7`, `a0..a4`
@@ -116,28 +116,6 @@ fn map_bar(cap: CapId, bar: u64) -> Result<MapBarResp, u64> {
             cap.0 as u64,
             bar,
             &mut resp as *mut MapBarResp as u64,
-            0,
-            0,
-        )
-    };
-    if rc == syserr::OK {
-        Ok(resp)
-    } else {
-        Err(rc)
-    }
-}
-
-/// Allocate DMA-capable VRAM through an `Untyped` capability. a0 = cap id,
-/// a1 = byte size, a2 = `*mut AllocResp`. Maps a nonzero [`syserr`] code to `Err`.
-fn alloc_vram(cap: CapId, size: u64) -> Result<AllocResp, u64> {
-    let mut resp = AllocResp::default();
-    // SAFETY: `&mut resp` is a valid writable out-buffer for the call's duration.
-    let rc = unsafe {
-        syscall(
-            sysno::ALLOC_VRAM,
-            cap.0 as u64,
-            size,
-            &mut resp as *mut AllocResp as u64,
             0,
             0,
         )
@@ -403,21 +381,6 @@ fn revoke(cap: u64) -> u64 {
     unsafe { syscall(sysno::REVOKE, cap, 0, 0, 0, 0) }
 }
 
-/// Allocate one VRAM frame via the Untyped cap; returns its physical address, or 0 on
-/// failure (per-process quota reached or out of memory).
-fn alloc_vram_phys() -> u64 {
-    match alloc_vram(CapId(2), 4096) {
-        Ok(r) => r.phys,
-        Err(_) => 0,
-    }
-}
-
-/// Free a VRAM frame (by physical address). Returns `syserr::OK` (0) or a nonzero error.
-fn free_vram(phys: u64) -> u64 {
-    // SAFETY: FREE_VRAM takes a phys addr and returns a status; no user memory is touched.
-    unsafe { syscall(sysno::FREE_VRAM, phys, 0, 0, 0, 0) }
-}
-
 /// The ELF entry point (U-mode, fresh stack, id in the first-argument register). The demo
 /// is role-selected by `id`: proc 0 produces + `SEND`s five values, proc 1 `RECV`s + prints
 /// them (cross-address-space IPC rendezvous), and any other proc runs a preemptible compute
@@ -539,7 +502,7 @@ fn consumer() -> ! {
         debug_write(b"role: consumer CAN send (bug)\n");
     }
     tag(1);
-    if alloc_vram(CapId(2), 4096).is_err() {
+    if make_region(2, 1) == syserr::NO_CAP {
         debug_write(b"role: consumer holds no memory authority\n");
     } else {
         debug_write(b"role: consumer allocated VRAM (bug)\n");
@@ -897,10 +860,10 @@ fn compute(id: u64) -> ! {
     // Untyped cap without WRITE and CapId(5) an Mmio cap without READ — right type, wrong
     // rights, so every one of these must be refused.
     tag(id);
-    if alloc_vram(CapId(4), 4096).is_err() {
-        debug_write(b"caps: alloc_vram via WRITE-less Untyped -> NO_CAP\n");
+    if make_region(4, 1) == syserr::NO_CAP {
+        debug_write(b"caps: region via WRITE-less Untyped -> NO_CAP\n");
     } else {
-        debug_write(b"caps: alloc_vram via WRITE-less Untyped ALLOWED (bug)\n");
+        debug_write(b"caps: region via WRITE-less Untyped ALLOWED (bug)\n");
     }
     tag(id);
     if spawn(4) == u64::MAX {
@@ -915,31 +878,39 @@ fn compute(id: u64) -> ! {
         debug_write(b"caps: map_bar via READ-less Mmio ALLOWED (bug)\n");
     }
 
-    // VRAM quota + FREE_VRAM: allocate until the per-process quota is hit (the kernel
-    // refuses further allocations), then free one and re-allocate to show FREE_VRAM returns
-    // quota. Remaining frames are reclaimed by EXIT.
+    // Per-owner REGION quota, and the gates `hostcontract` used to check on the host before
+    // DMA memory became a region: a wrong-typed capability, a capability without WRITE, and
+    // the quota itself. Those live in `make_region` now, which is kernel code and not
+    // host-testable, so the coverage moved here rather than disappearing.
+    tag(id);
+    if make_region(0, 1) == syserr::NO_CAP {
+        debug_write(b"caps: region via an ENDPOINT capability -> NO_CAP\n");
+    } else {
+        debug_write(b"caps: region via an ENDPOINT capability ALLOWED (bug)\n");
+    }
     let mut n = 0u64;
-    let mut last = 0u64;
+    let mut last = syserr::NO_CAP;
     loop {
-        let p = alloc_vram_phys();
-        if p == 0 {
+        let c = make_region(2, 1);
+        if c == syserr::NO_CAP || c == syserr::NO_MEM {
             break;
         }
-        last = p;
+        last = c;
         n = n.wrapping_add(1);
     }
     tag(id);
-    debug_write(b"vram: hit quota at ");
+    debug_write(b"region: hit the per-owner quota at ");
     dbg_dec(n);
-    debug_write(b" frames\n");
-    if last != 0 {
-        free_vram(last);
-        let p = alloc_vram_phys();
+    debug_write(b" regions\n");
+    if last != syserr::NO_CAP {
+        // Freeing one returns quota, so the next request succeeds.
+        free_region(last);
+        let c = make_region(2, 1);
         tag(id);
-        if p != 0 {
-            debug_write(b"vram: freed 1, realloc OK\n");
+        if c != syserr::NO_CAP && c != syserr::NO_MEM {
+            debug_write(b"region: freed one, the next request is granted\n");
         } else {
-            debug_write(b"vram: freed 1, realloc FAILED\n");
+            debug_write(b"region: freeing one did not return quota (bug)\n");
         }
     }
 
@@ -997,20 +968,20 @@ fn compute(id: u64) -> ! {
             debug_write(b"revoke: refused (bug)\n");
         }
         // Our own capability is untouched: revoking grants does not disarm us. NOTE the
-        // error code matters here — we are at our VRAM quota from the loop above, so a
+        // error code matters here — we are at our region quota from the loop above, so a
         // refusal is expected; only NO_CAP would mean revocation destroyed our own cap.
         tag(id);
-        match alloc_vram(CapId(2), 4096) {
-            Ok(r) => {
-                free_vram(r.phys);
+        match make_region(2, 1) {
+            c if c != syserr::NO_CAP && c != syserr::NO_MEM => {
+                free_region(c);
                 debug_write(b"revoke: our own CapId(2) still works\n");
             }
-            Err(e) if e != syserr::NO_CAP => {
+            syserr::NO_MEM => {
                 debug_write(
                     b"revoke: our own CapId(2) survives (refused on quota, not authority)\n",
                 );
             }
-            Err(_) => debug_write(b"revoke: revoking cost us our own cap (bug)\n"),
+            _ => debug_write(b"revoke: revoking cost us our own cap (bug)\n"),
         }
     }
 
@@ -1115,6 +1086,16 @@ fn child(id: u64) -> ! {
             } else {
                 debug_write(b"share: a WRITABLE loan would not take our write (bug)\n");
             }
+            // Owner-identity, isolated. FREE_REGION now also demands WRITE, so the READ-only
+            // borrower below is refused by the RIGHTS gate and proves nothing about who owns
+            // the region. This borrower HAS write, so only the owner check can stop it —
+            // which is the property under test.
+            tag(id);
+            if free_region(0) == syserr::NO_CAP {
+                debug_write(b"share: a WRITABLE borrower still cannot destroy what it borrowed\n");
+            } else {
+                debug_write(b"share: a WRITABLE borrower DESTROYED a region it borrowed (bug)\n");
+            }
             exit(id);
         }
         // A READ-only loan: now ASSERT the window is not writable. Probed through the
@@ -1148,7 +1129,7 @@ fn child(id: u64) -> ! {
         }
         tag(id);
         if free_region(0) == syserr::NO_CAP {
-            debug_write(b"share: a borrower cannot destroy the owner's region\n");
+            debug_write(b"share: a READ-only borrower cannot destroy (refused on rights)\n");
         } else {
             debug_write(b"share: a borrower DESTROYED the owner's region (bug)\n");
         }
@@ -1255,12 +1236,14 @@ fn child(id: u64) -> ! {
     // Use the delegated capability, then pass it on once. Passing it on makes the
     // revocation test TRANSITIVE: the parent's REVOKE must reach not just us but the
     // grandchild we handed it to. Self-limiting — the spawn fails once slots run out.
-    let have = match alloc_vram(CapId(0), 4096) {
-        Ok(r) => {
-            free_vram(r.phys);
+    let have = {
+        let c = make_region(0, 1);
+        if c != syserr::NO_CAP && c != syserr::NO_MEM {
+            free_region(c);
             true
+        } else {
+            false
         }
-        Err(_) => false,
     };
     tag(id);
     if have {
@@ -1288,14 +1271,12 @@ fn child(id: u64) -> ! {
         let mut seen = false;
         let mut i = 0u64;
         while i < 60 {
-            match alloc_vram(CapId(0), 4096) {
-                Ok(r) => {
-                    free_vram(r.phys);
-                }
-                Err(_) => {
-                    seen = true;
-                    break;
-                }
+            let c = make_region(0, 1);
+            if c != syserr::NO_CAP && c != syserr::NO_MEM {
+                free_region(c);
+            } else {
+                seen = true;
+                break;
             }
             spin(2_000_000);
             i = i.wrapping_add(1);

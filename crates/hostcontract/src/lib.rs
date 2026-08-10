@@ -13,14 +13,11 @@
 //! decodes those registers and calls [`dispatch`]; `EXIT` is handled there (it never
 //! returns) so it only ever reaches us as an invalid selector.
 //!
-//! Maps to `docs/host-contract.md`: `GET_INFO`/`ALLOC_VRAM` are VERIFIED, `MAP_BAR` is
+//! Maps to `docs/host-contract.md`: `GET_INFO` is VERIFIED, `MAP_BAR` is
 //! VERIFIED* (the cap check is verified and gates a real mapping installed by the
 //! integrator; only the BAR geometry — the window size — is still fixed rather than probed).
 
-use abi::{
-    syserr, sysno, AllocResp, CapId, CapRights, CapType, GpuInfo, HostEnv, MapBarResp, PhysAddr,
-    PAGE_SIZE,
-};
+use abi::{syserr, sysno, CapId, CapRights, CapType, GpuInfo, HostEnv, MapBarResp, PAGE_SIZE};
 
 /// Bytes copied out of user memory per `read_user_bytes` call in `DEBUG_WRITE`.
 const DEBUG_CHUNK: usize = 256;
@@ -36,7 +33,7 @@ const STUB_BAR_PAGES: u64 = 1;
 ///
 /// TCB / SAFETY: `T` must be a `#[repr(C)]`, pointer-free, all-integer POD with no
 /// padding — which holds for the three host-contract response structs used below
-/// ([`GpuInfo`], [`MapBarResp`], [`AllocResp`]). The returned slice borrows `val`, so it
+/// ([`GpuInfo`], [`MapBarResp`]). The returned slice borrows `val`, so it
 /// cannot dangle, and we only ever *read* it (to copy into user memory), so no invalid
 /// or uninitialized bit pattern is ever observed.
 unsafe fn as_bytes<T>(val: &T) -> &[u8] {
@@ -50,8 +47,8 @@ unsafe fn as_bytes<T>(val: &T) -> &[u8] {
 ///
 // PROOF(later): no host-contract op succeeds (returns OK / grants authority) unless the
 // required capability was present with the required type — i.e. every non-`OK` path is
-// reachable only from a failing `env.cap_lookup`, a failing `env.alloc_dma`/`env.free_dma`,
-// or a bad user pointer, and no `OK` path skips the cap check for `MAP_BAR`/`ALLOC_VRAM`.
+// reachable only from a failing `env.cap_lookup`, a failing `env.map_device`, or a bad
+// user pointer, and no `OK` path skips the capability check for `MAP_BAR`.
 pub fn dispatch(
     env: &mut dyn HostEnv,
     num: u64,
@@ -68,10 +65,6 @@ pub fn dispatch(
         sysno::DEBUG_WRITE => sys_debug_write(env, a0, a1),
         sysno::GET_INFO => sys_get_info(env, a0),
         sysno::MAP_BAR => sys_map_bar(env, a0, a2),
-        sysno::ALLOC_VRAM => sys_alloc_vram(env, a0, a2),
-        sysno::FREE_VRAM => sys_free_vram(env, a0),
-        // EXIT is handled by the integrator before dispatch (it never returns); if it
-        // reaches us it is a misuse, so it falls through with every other selector.
         _ => syserr::BAD_SYSCALL,
     }
 }
@@ -152,48 +145,6 @@ fn sys_map_bar(env: &mut dyn HostEnv, cap_id: u64, resp_ptr: u64) -> u64 {
     }
 }
 
-/// `ALLOC_VRAM`: require an [`CapType::Untyped`] capability at `cap_id`, allocate one
-/// DMA frame, then write an [`AllocResp`] to user pointer `resp_ptr`.
-///
-/// VERIFIED per `docs/host-contract.md`: the cap gate + the frame grant are the verified
-/// decision; the returned frame comes from the integrator's DMA-capable allocator.
-fn sys_alloc_vram(env: &mut dyn HostEnv, cap_id: u64, resp_ptr: u64) -> u64 {
-    let cap = CapId(cap_id as usize);
-    match env.cap_lookup(cap) {
-        // Type AND rights, per `docs/host-contract.md`: "rights ⊇ need" on every op.
-        // Allocating carves memory out of the untyped region — a mutation — so `WRITE`.
-        Some((CapType::Untyped, rights, _obj)) if rights.contains(CapRights::WRITE) => {}
-        // Missing cap, wrong object type, or insufficient rights: no authority.
-        _ => return syserr::NO_CAP,
-    }
-    let frame: PhysAddr = match env.alloc_dma() {
-        Some(f) => f,
-        None => return syserr::NO_MEM,
-    };
-    let resp = AllocResp {
-        phys: frame.as_u64(),
-        size: PAGE_SIZE,
-    };
-    // SAFETY: `resp` is a live `#[repr(C)]` POD; see `as_bytes`.
-    let bytes = unsafe { as_bytes(&resp) };
-    if env.write_user_bytes(resp_ptr, bytes) {
-        syserr::OK
-    } else {
-        syserr::FAULT
-    }
-}
-
-/// `FREE_VRAM`: return a VRAM frame (physical address `a0`) to the pool. No capability is
-/// required — freeing is not an authority grant — but the caller may only free a frame it
-/// owns; `env.free_dma` enforces that, so `FAULT` means the frame is not the caller's.
-fn sys_free_vram(env: &mut dyn HostEnv, phys: u64) -> u64 {
-    if env.free_dma(phys) {
-        syserr::OK
-    } else {
-        syserr::FAULT
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,16 +202,6 @@ mod tests {
         fn cap_lookup(&self, cap: CapId) -> Option<(CapType, CapRights, u64)> {
             self.caps.iter().find(|(c, _)| *c == cap).map(|(_, v)| *v)
         }
-        fn alloc_dma(&mut self) -> Option<PhysAddr> {
-            if self.frames_left == 0 {
-                return None;
-            }
-            self.frames_left -= 1;
-            let p = self.next_frame;
-            self.next_frame += PAGE_SIZE;
-            self.held.push(p);
-            Some(PhysAddr(p))
-        }
         fn map_device(&mut self, phys: u64, pages: u64, writable: bool) -> Option<u64> {
             // Mock: hand back a deterministic VA derived from the request, and record what
             // was asked for — including the permission, which the tests assert on.
@@ -269,16 +210,6 @@ mod tests {
         }
         fn unmap_device(&mut self) {
             self.mapped.clear();
-        }
-        fn free_dma(&mut self, phys: u64) -> bool {
-            // Only a frame this env handed out (and still holds) can be freed.
-            match self.held.iter().position(|&p| p == phys) {
-                Some(i) => {
-                    self.held.swap_remove(i);
-                    true
-                }
-                None => false,
-            }
         }
         fn write_user_bytes(&mut self, uptr: u64, bytes: &[u8]) -> bool {
             if uptr < BASE_VA {
@@ -516,64 +447,6 @@ mod tests {
     }
 
     #[test]
-    fn alloc_vram_with_untyped_cap_advances_phys() {
-        let mut env = MockEnv::new(4096);
-        let cap = CapId(2);
-        env.caps.push((cap, (CapType::Untyped, CapRights::ALL, 0)));
-        env.frames_left = 4;
-        let first_frame = env.next_frame;
-
-        let ptr1 = env.va(0);
-        let r1 = dispatch(&mut env, sysno::ALLOC_VRAM, cap.0 as u64, 0, ptr1, 0, 0);
-        assert_eq!(r1, syserr::OK);
-        let a1: AllocResp = decode(env.peek(0, core::mem::size_of::<AllocResp>()));
-        assert_eq!(a1.phys, first_frame);
-        assert_eq!(a1.size, PAGE_SIZE);
-
-        let off2 = 64;
-        let ptr2 = env.va(off2);
-        let r2 = dispatch(&mut env, sysno::ALLOC_VRAM, cap.0 as u64, 0, ptr2, 0, 0);
-        assert_eq!(r2, syserr::OK);
-        let a2: AllocResp = decode(env.peek(off2, core::mem::size_of::<AllocResp>()));
-        // Second grant must be a distinct, advanced physical frame.
-        assert_eq!(a2.phys, first_frame + PAGE_SIZE);
-    }
-
-    #[test]
-    fn alloc_vram_without_cap_is_no_cap() {
-        let mut env = MockEnv::new(4096);
-        env.frames_left = 4; // frames available, but no capability
-        let ptr = env.va(0);
-        let r = dispatch(&mut env, sysno::ALLOC_VRAM, 42, 0, ptr, 0, 0);
-        assert_eq!(r, syserr::NO_CAP);
-    }
-
-    #[test]
-    fn alloc_vram_wrong_type_is_no_cap() {
-        let mut env = MockEnv::new(4096);
-        let cap = CapId(5);
-        env.caps.push((cap, (CapType::Mmio, CapRights::ALL, 0)));
-        env.frames_left = 4;
-        let ptr = env.va(0);
-        let r = dispatch(&mut env, sysno::ALLOC_VRAM, cap.0 as u64, 0, ptr, 0, 0);
-        assert_eq!(r, syserr::NO_CAP);
-    }
-
-    #[test]
-    fn alloc_vram_without_write_right_is_no_cap() {
-        // Right object type, insufficient rights: allocating mutates the untyped region.
-        let mut env = MockEnv::new(4096);
-        let cap = CapId(2);
-        env.caps.push((cap, (CapType::Untyped, CapRights::READ, 0)));
-        env.frames_left = 4;
-        let ptr = env.va(0);
-        let r = dispatch(&mut env, sysno::ALLOC_VRAM, cap.0 as u64, 0, ptr, 0, 0);
-        assert_eq!(r, syserr::NO_CAP);
-        // And nothing was allocated behind the refusal.
-        assert_eq!(env.frames_left, 4);
-    }
-
-    #[test]
     fn map_bar_without_read_right_is_no_cap() {
         // Right object type, insufficient rights: mapping a BAR exposes device registers.
         let mut env = MockEnv::new(4096);
@@ -583,52 +456,6 @@ mod tests {
         let ptr = env.va(0);
         let r = dispatch(&mut env, sysno::MAP_BAR, cap.0 as u64, 0, ptr, 0, 0);
         assert_eq!(r, syserr::NO_CAP);
-    }
-
-    #[test]
-    fn free_vram_frees_owned_frame_once() {
-        let mut env = MockEnv::new(4096);
-        let cap = CapId(2);
-        env.caps.push((cap, (CapType::Untyped, CapRights::ALL, 0)));
-        env.frames_left = 4;
-        let ptr = env.va(0);
-        assert_eq!(
-            dispatch(&mut env, sysno::ALLOC_VRAM, cap.0 as u64, 0, ptr, 0, 0),
-            syserr::OK
-        );
-        let a: AllocResp = decode(env.peek(0, core::mem::size_of::<AllocResp>()));
-
-        // Freeing the owned frame succeeds...
-        assert_eq!(
-            dispatch(&mut env, sysno::FREE_VRAM, a.phys, 0, 0, 0, 0),
-            syserr::OK
-        );
-        // ...and freeing it again fails: it is no longer owned (no double-free).
-        assert_eq!(
-            dispatch(&mut env, sysno::FREE_VRAM, a.phys, 0, 0, 0, 0),
-            syserr::FAULT
-        );
-    }
-
-    #[test]
-    fn free_vram_unowned_is_fault() {
-        let mut env = MockEnv::new(4096);
-        // A physical address this process never allocated cannot be freed (isolation).
-        assert_eq!(
-            dispatch(&mut env, sysno::FREE_VRAM, 0x1234_0000, 0, 0, 0, 0),
-            syserr::FAULT
-        );
-    }
-
-    #[test]
-    fn alloc_vram_out_of_frames_is_no_mem() {
-        let mut env = MockEnv::new(4096);
-        let cap = CapId(6);
-        env.caps.push((cap, (CapType::Untyped, CapRights::ALL, 0)));
-        env.frames_left = 0; // valid cap, but the DMA pool is empty
-        let ptr = env.va(0);
-        let r = dispatch(&mut env, sysno::ALLOC_VRAM, cap.0 as u64, 0, ptr, 0, 0);
-        assert_eq!(r, syserr::NO_MEM);
     }
 
     #[test]

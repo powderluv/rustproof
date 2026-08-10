@@ -209,8 +209,6 @@ pub mod sysno {
     pub const GET_INFO: u64 = 2;
     /// Host contract: `a0` = MMIO capability id, `a1` = BAR index, `a2` = `*mut MapBarResp`.
     pub const MAP_BAR: u64 = 3;
-    /// Host contract: `a0` = Untyped capability id, `a1` = byte size, `a2` = `*mut AllocResp`.
-    pub const ALLOC_VRAM: u64 = 4;
     /// Cooperatively yield the CPU to the next ready process. No args, no result.
     pub const YIELD: u64 = 5;
     /// Send to an endpoint (rendezvous): `a0` = an `Endpoint` capability (needs `WRITE`),
@@ -300,9 +298,6 @@ pub mod sysno {
     /// Returns `OK`, or `NO_CAP` if the caller does not hold `a0`. The caller keeps its own
     /// capability; only the derivations are destroyed.
     pub const REVOKE: u64 = 10;
-    /// Free a VRAM frame previously returned by `ALLOC_VRAM`: `a0` = its physical address.
-    /// Returns `OK`, or `FAULT` if the caller does not own that frame.
-    pub const FREE_VRAM: u64 = 9;
 }
 
 /// Syscall result codes returned in `rax`. `OK` is 0; errors are large sentinels so
@@ -333,14 +328,6 @@ pub struct MapBarResp {
     pub size: u64,
 }
 
-/// Response to `ALLOC_VRAM` (host contract): the physical frame + size granted.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-#[repr(C)]
-pub struct AllocResp {
-    pub phys: u64,
-    pub size: u64,
-}
-
 /// Kernel services the host-contract dispatcher needs, supplied by the integrator so the
 /// dispatch logic stays a pure, testable unit (mock in tests, real kernel state at runtime).
 pub trait HostEnv {
@@ -350,9 +337,6 @@ pub trait HostEnv {
     fn gpu_info(&self) -> GpuInfo;
     /// Look up a capability in the calling process's space: `(type, rights, object)`.
     fn cap_lookup(&self, cap: CapId) -> Option<(CapType, CapRights, u64)>;
-    /// Allocate one DMA-capable physical frame for `ALLOC_VRAM`, honoring the caller's
-    /// per-process VRAM quota. `None` if the quota is reached or memory is exhausted.
-    fn alloc_dma(&mut self) -> Option<PhysAddr>;
     /// Map `pages` 4 KiB pages of physical memory starting at `phys` into the calling
     /// process's address space, user-accessible and writable ONLY if `writable`, returning
     /// the user virtual address. The permission must come from the capability that
@@ -364,10 +348,6 @@ pub trait HostEnv {
     /// Remove the calling process's device mapping, if any. Used to undo a mapping whose
     /// response could not be delivered, and to tear down authority on revocation.
     fn unmap_device(&mut self);
-    /// Free a VRAM frame (at physical address `phys`) previously handed to the caller by
-    /// [`alloc_dma`](Self::alloc_dma). Returns `false` if the caller does not own it (so a
-    /// process can only free its own VRAM, never another's).
-    fn free_dma(&mut self, phys: u64) -> bool;
     /// Copy `bytes` into the caller's memory at user virtual address `uptr`.
     /// Returns false if the pointer is not a valid, writable user address.
     fn write_user_bytes(&mut self, uptr: u64, bytes: &[u8]) -> bool;
