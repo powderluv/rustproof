@@ -27,7 +27,10 @@ mod arch_riscv;
 pub use arch_riscv::Riscv as CurrentArch;
 
 // ---- kernel state (single CPU: plain statics) ----
-static mut BITMAP: [u64; 12288] = [0; 12288]; // one bit per 4 KiB frame
+/// Frame-bitmap capacity, in `u64` words: one bit per 4 KiB frame, so 12288 words covers
+/// 3 GiB of physical memory.
+const BITMAP_WORDS: usize = 12288;
+static mut BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
 static mut FA: Option<mm::BitmapAllocator> = None;
 static mut MAIN_CTX: sched::Context = sched::Context::new();
 static mut B_CTX: sched::Context = sched::Context::new();
@@ -209,11 +212,13 @@ struct RecordingAlloc<'a> {
 
 /// Zero a freshly allocated frame before anything can see its previous contents.
 ///
-/// THE single place this kernel scrubs memory. Frames are recycled — `alloc_frame` scans
-/// with no DMA exclusion, so a destroyed region's pages come back as another process's
-/// stack, and a dead process's stack comes back as somebody's shared region. Scrubbing on
-/// RELEASE would work equally well but is not enough on its own, because a frame that has
-/// never been allocated still holds whatever the firmware left there.
+/// THE single place this kernel scrubs memory. Frames are recycled within their own pool: a
+/// destroyed region's pages come back as another region, and a dead process's stack comes
+/// back as another process's stack or page table. (They no longer cross between the two —
+/// see the arena partition in `mm` — but that partition is an isolation boundary for DEVICE
+/// reach, not a substitute for scrubbing, and it says nothing about reuse within a pool.)
+/// Scrubbing on RELEASE would work equally well but is not enough on its own, because a
+/// frame that has never been allocated still holds whatever the firmware left there.
 ///
 /// One place, deliberately. The previous version zeroed at three sites — region creation,
 /// region destruction, and stack mapping — and the result was that removing any one of them
@@ -1286,10 +1291,31 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
     let n = A::memory_map(a0, a1, &mut regions);
     let regions = &regions[..n];
     let words = mm::BitmapAllocator::bitmap_words_needed(regions);
+    // Bound BEFORE the slice is built, not inside the allocator. `words` comes from the
+    // firmware memory map and is otherwise unbounded: `from_raw_parts_mut` past `BITMAP_WORDS`
+    // is already out of bounds, and `BitmapAllocator::new` then writes `u64::MAX` over EVERY
+    // word of whatever slice it was handed — straight through `.bss` — before its own
+    // capacity clamp, which only limits the frame COUNT, can matter. Not reachable at the
+    // memory sizes the runners use (riscv is at 10240/12288 with -m 512M), but raising `-m`
+    // to 2G would corrupt the kernel silently, so it fails loudly instead.
+    if words > BITMAP_WORDS {
+        let _ = writeln!(
+            con,
+            "\n[mm] memory map needs {} bitmap words, capacity is {} — refusing to boot",
+            words, BITMAP_WORDS
+        );
+        A::exit(false);
+    }
     let bitmap: &'static mut [u64] = unsafe {
         core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(BITMAP) as *mut u64, words)
     };
     let mut fa = mm::BitmapAllocator::new(regions, bitmap, A::reserve_below(), A::dma_top());
+    let _ = writeln!(
+        con,
+        "[mm] dma arena {:#x}..{:#x}, general pool above it",
+        A::reserve_below(),
+        A::dma_top()
+    );
     let _ = writeln!(
         con,
         "\n[mm] {} frames tracked, {} free",

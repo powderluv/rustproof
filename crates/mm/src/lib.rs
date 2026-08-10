@@ -31,6 +31,12 @@ pub struct BitmapAllocator {
     free: usize,
     /// Search hint: no free frame is known to exist below this frame index.
     cursor: usize,
+    /// First frame the GENERAL pool may hand out: everything below it belongs to the DMA
+    /// arena. `dma_top` and `reserve_below` stop being two independent limits and become a
+    /// PARTITION — `[reserve_below, dma_top)` is the arena, `[dma_top, ..)` is everything
+    /// else — so a frame that has been device-reachable never becomes a page table, and a
+    /// page table never becomes device-reachable.
+    general_floor: usize,
     /// Byte address ceiling of the DMA-capable pool (frame `f` is DMA-capable iff
     /// `(f << PAGE_SHIFT) < dma_top`).
     dma_top: u64,
@@ -67,11 +73,13 @@ impl BitmapAllocator {
             *word = u64::MAX;
         }
 
+        let general_floor = ((dma_top + PAGE_SIZE - 1) >> PAGE_SHIFT) as usize;
         let mut alloc = BitmapAllocator {
             bitmap,
             total,
             free: 0,
             cursor: 0,
+            general_floor,
             dma_top,
             reserve_below,
         };
@@ -144,7 +152,12 @@ impl BitmapAllocator {
     /// Allocate one free frame whose physical address is `< dma_top`, or `None` if the
     /// DMA pool is exhausted. Scans from frame 0 (the DMA pool is small and low).
     pub fn alloc_dma_frame(&mut self) -> Option<PhysAddr> {
-        let mut f = 0usize;
+        // Bounded at both ends. The low bound is belt-and-braces and CANNOT be observed
+        // through this API — frames below `reserve_below` are already marked USED at
+        // construction, so a scan from zero finds nothing there either. It is here to state
+        // the arena's extent rather than leave it holding incidentally; there is deliberately
+        // no test claiming to verify it, because such a test could not fail.
+        let mut f = (self.reserve_below >> PAGE_SHIFT) as usize;
         while f < self.total && ((f as u64) << PAGE_SHIFT) < self.dma_top {
             if !self.is_used(f) {
                 self.set_used(f);
@@ -219,7 +232,16 @@ impl BitmapAllocator {
 
 impl FrameAllocator for BitmapAllocator {
     fn alloc_frame(&mut self) -> Option<PhysAddr> {
-        let frame = self.first_free(self.cursor)?;
+        // ONE mechanism, deliberately. The floor is applied HERE, where a general frame is
+        // chosen — not also by starting the cursor high and not also by refusing to lower it
+        // on an arena free. Those three each enforce the partition independently, so with all
+        // three present no single one can be shown to matter: removing any of them left the
+        // whole suite green. The same masking hid whether this kernel scrubbed memory at all
+        // until the scrub sites were collapsed to one.
+        //
+        // The cursor is only a rescan hint, so letting an arena free pull it low costs
+        // nothing: `max` clamps where the scan actually starts.
+        let frame = self.first_free(self.cursor.max(self.general_floor))?;
         // PROOF(later): the returned frame was FREE (bit clear), lies within a Usable,
         // non-reserved region, and is now marked USED — so it is handed out to exactly
         // one caller and cannot be double-allocated until it is freed.
@@ -346,10 +368,19 @@ mod tests {
         let words = BitmapAllocator::bitmap_words_needed(&regions);
         let mut a = BitmapAllocator::new(&regions, leak_bitmap(words), RESERVE_BELOW, DMA_TOP);
 
-        // Frames 0..512 USED (reserve), so first free frame is 512 -> 2MiB.
+        // General allocation starts at the partition, not at the reserve floor: frames below
+        // `dma_top` belong to the DMA arena. The lowest free general frame is 16 MiB + one
+        // frame, since 16 MiB itself falls in the synthetic map's reserved hole.
         let first = a.alloc_frame().expect("has free frames");
-        assert_eq!(first, PhysAddr(2 * MIB));
+        assert!(
+            first.as_u64() >= DMA_TOP,
+            "general alloc dipped into the arena"
+        );
+        assert_eq!(first, PhysAddr(17 * MIB));
         assert!(first.is_page_aligned());
+        // The arena still hands out the low frames it owns.
+        let dma = a.alloc_dma_frame().expect("arena has free frames");
+        assert_eq!(dma, PhysAddr(2 * MIB));
     }
 
     #[test]
@@ -376,8 +407,13 @@ mod tests {
         let words = BitmapAllocator::bitmap_words_needed(&regions);
         let mut a = BitmapAllocator::new(&regions, leak_bitmap(words), RESERVE_BELOW, DMA_TOP);
 
+        // Draining BOTH pools must account for every free frame: the partition splits where a
+        // frame comes from, never how many there are.
         let expected = a.free_count();
         let mut got = 0;
+        while a.alloc_dma_frame().is_some() {
+            got += 1;
+        }
         while a.alloc_frame().is_some() {
             got += 1;
         }
@@ -394,6 +430,13 @@ mod tests {
 
         // Drain and confirm every handed-out frame is distinct.
         let mut seen = std::collections::BTreeSet::new();
+        while let Some(frame) = a.alloc_dma_frame() {
+            assert!(
+                seen.insert(frame.as_u64()),
+                "double-allocated {:#x}",
+                frame.as_u64()
+            );
+        }
         while let Some(frame) = a.alloc_frame() {
             assert!(
                 seen.insert(frame.as_u64()),
@@ -401,6 +444,7 @@ mod tests {
                 frame.as_u64()
             );
         }
+        // Same total as before the partition: 3584 arena frames plus 12032 general ones.
         assert_eq!(seen.len(), 3584 + 12032);
     }
 
@@ -473,23 +517,78 @@ mod tests {
     }
 
     #[test]
-    fn dma_and_general_share_one_pool() {
+    fn dma_and_general_are_disjoint() {
+        // The partition, in both directions. A frame that has been device-reachable must
+        // never become a page table, and a page table must never become device-reachable.
         let regions = synthetic_regions();
         let words = BitmapAllocator::bitmap_words_needed(&regions);
         let mut a = BitmapAllocator::new(&regions, leak_bitmap(words), RESERVE_BELOW, DMA_TOP);
 
-        // A DMA alloc must remove the frame from the general pool too (no double hand-out).
-        let dma = a.alloc_dma_frame().unwrap();
         let mut seen = std::collections::BTreeSet::new();
-        seen.insert(dma.as_u64());
-        while let Some(frame) = a.alloc_frame() {
+        let mut dma = Vec::new();
+        while let Some(f) = a.alloc_dma_frame() {
             assert!(
-                seen.insert(frame.as_u64()),
+                f.as_u64() >= RESERVE_BELOW,
+                "arena frame below the reserve floor"
+            );
+            assert!(f.as_u64() < DMA_TOP, "arena frame above dma_top");
+            assert!(
+                seen.insert(f.as_u64()),
                 "frame {:#x} handed out twice",
-                frame.as_u64()
+                f.as_u64()
+            );
+            dma.push(f);
+        }
+        let mut general = Vec::new();
+        while let Some(f) = a.alloc_frame() {
+            assert!(
+                f.as_u64() >= DMA_TOP,
+                "general allocation dipped into the arena"
+            );
+            assert!(
+                seen.insert(f.as_u64()),
+                "frame {:#x} handed out twice",
+                f.as_u64()
+            );
+            general.push(f);
+        }
+        assert!(
+            !dma.is_empty() && !general.is_empty(),
+            "both pools must be non-empty"
+        );
+        assert_eq!(a.free_count(), 0);
+        for f in dma.into_iter().chain(general) {
+            a.free_frame(f);
+        }
+    }
+
+    #[test]
+    fn general_never_returns_an_arena_frame_after_arena_churn() {
+        // The case the partition exists for, and the one a cursor-only implementation fails:
+        // free every arena frame, then require general allocation to stay above dma_top. A
+        // freed arena frame must not drag the general cursor down into the arena.
+        let regions = synthetic_regions();
+        let words = BitmapAllocator::bitmap_words_needed(&regions);
+        let mut a = BitmapAllocator::new(&regions, leak_bitmap(words), RESERVE_BELOW, DMA_TOP);
+
+        let mut taken = Vec::new();
+        for _ in 0..8 {
+            if let Some(f) = a.alloc_dma_frame() {
+                taken.push(f);
+            }
+        }
+        assert!(!taken.is_empty());
+        for f in taken {
+            a.free_frame(f);
+        }
+        for _ in 0..16 {
+            let f = a.alloc_frame().expect("general pool exhausted");
+            assert!(
+                f.as_u64() >= DMA_TOP,
+                "general allocation returned arena frame {:#x} after arena churn",
+                f.as_u64()
             );
         }
-        assert_eq!(a.free_count(), 0);
     }
 
     #[test]
@@ -501,8 +600,12 @@ mod tests {
 
         // r1 now free frames [256,4096) = 3840; r2 = 12032.
         assert_eq!(a.free_count(), 3840 + 12032);
-        let first = a.alloc_frame().unwrap();
+        // Those newly-freed low frames are ARENA frames — below `dma_top` — so the arena is
+        // where the effect of a zero reserve floor shows up. General allocation is unaffected
+        // by it, which is the partition working.
+        let first = a.alloc_dma_frame().unwrap();
         assert_eq!(first, PhysAddr(1 * MIB)); // frame 256
+        assert!(a.alloc_frame().unwrap().as_u64() >= DMA_TOP);
     }
 
     #[test]
@@ -526,8 +629,11 @@ mod tests {
         let words = BitmapAllocator::bitmap_words_needed(&regions);
         let mut a = BitmapAllocator::new(&regions, leak_bitmap(words), 0, DMA_TOP);
         assert_eq!(a.free_count(), 1);
-        let f = a.alloc_frame().unwrap();
-        assert_eq!(f, PhysAddr(1 * MIB + 4 * 1024));
+        // The one whole frame sits below `dma_top`, so it belongs to the arena; general
+        // allocation must not see it at all.
         assert!(a.alloc_frame().is_none());
+        let f = a.alloc_dma_frame().unwrap();
+        assert_eq!(f, PhysAddr(1 * MIB + 4 * 1024));
+        assert!(a.alloc_dma_frame().is_none());
     }
 }
