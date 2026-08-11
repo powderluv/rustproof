@@ -70,14 +70,19 @@ const MAX_PROC_FRAMES: usize = 64;
 
 /// How many shareable memory regions can exist at once. Small and fixed, like every other
 /// table here; exhaustion is reported, never silently absorbed.
-const MAX_REGIONS: usize = 8;
-/// How many regions one process may own at once.
+/// Global region table size. Kept comfortably ABOVE `REGION_QUOTA * (owners in the demo)` so
+/// that a process sitting at its per-owner quota never starves another process of the
+/// mechanism — without that headroom the two limits are indistinguishable, and a child whose
+/// `make_region` fails for want of a table slot reports it as lost authority.
+const MAX_REGIONS: usize = 12;
+/// How many regions one process may own at once — see [`abi::REGION_QUOTA`], which is where
+/// the number lives so a caller can reason about a refusal.
 ///
 /// This is the bound `VRAM_QUOTA_FRAMES` used to provide. Folding DMA memory into regions
 /// would otherwise DELETE a limit: `make_region` had no per-owner cap, so one process could
 /// take every entry in the global table and deny the mechanism to everyone else. Checked
 /// BEFORE any frame is taken, the discipline the VRAM path had.
-const REGION_QUOTA: usize = 6;
+const REGION_QUOTA: usize = abi::REGION_QUOTA;
 /// Largest region, in pages. Bounds both the frames one process can tie up and the size of
 /// the per-process share window below.
 const REGION_MAX_PAGES: u64 = 4;

@@ -163,6 +163,14 @@ pub struct CapId(pub usize);
 /// endpoints of a rendezvous copy through a kernel buffer of this size.
 pub const MAX_MSG_BYTES: usize = 128;
 
+/// How many regions one process may own at once.
+///
+/// Part of the contract rather than a kernel private: a caller cannot tell a per-owner quota
+/// refusal from a global-table-full refusal by the error code alone (both are `NO_MEM`), so
+/// without this number no test can demonstrate that the quota exists at all. Deleting the
+/// check used to leave every assertion green.
+pub const REGION_QUOTA: usize = 6;
+
 /// Identifier of a thread / scheduling context.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[repr(transparent)]

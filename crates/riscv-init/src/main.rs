@@ -27,7 +27,7 @@
 //! the only pointers handed to the kernel are addresses of stack locals passed as
 //! syscall out-buffers, plus `&'static` bytes passed to DEBUG_WRITE.
 
-use abi::{syserr, sysno, CapId, GpuInfo, MapBarResp};
+use abi::{syserr, sysno, CapId, GpuInfo, MapBarResp, REGION_QUOTA};
 
 // ----------------------------------------------------------------- syscall stub
 //
@@ -883,10 +883,15 @@ fn compute(id: u64) -> ! {
     // the quota itself. Those live in `make_region` now, which is kernel code and not
     // host-testable, so the coverage moved here rather than disappearing.
     tag(id);
-    if make_region(0, 1) == syserr::NO_CAP {
-        debug_write(b"caps: region via an ENDPOINT capability -> NO_CAP\n");
+    // CapId(1) is the DEVICE capability: wrong type for MAKE_REGION but carrying FULL
+    // rights, so only the TYPE half of the gate can refuse it. Probing with CapId(0)
+    // instead — an Endpoint with NO rights — proved nothing: both halves reject that, so
+    // deleting the type check left the assertion green while a worker could have minted
+    // DMA memory through its device capability.
+    if make_region(1, 1) == syserr::NO_CAP {
+        debug_write(b"caps: region via an MMIO capability with FULL rights -> NO_CAP\n");
     } else {
-        debug_write(b"caps: region via an ENDPOINT capability ALLOWED (bug)\n");
+        debug_write(b"caps: region via an MMIO capability ALLOWED (bug)\n");
     }
     let mut n = 0u64;
     let mut last = syserr::NO_CAP;
@@ -898,10 +903,25 @@ fn compute(id: u64) -> ! {
         last = c;
         n = n.wrapping_add(1);
     }
+    // The count is the assertion, not decoration. `make_region` answers NO_MEM for four
+    // different reasons — per-owner quota, global table full, arena empty, capability space
+    // full — so a loop that merely stops proves nothing about which limit bound it. We own
+    // exactly three regions here (the lent one, the mailbox, and the fresh one from the
+    // scrub check), so a per-owner quota must grant exactly the remainder. Deleting the
+    // quota makes this the table-full count instead, and the run fails.
+    let expected = (REGION_QUOTA - 3) as u64;
     tag(id);
-    debug_write(b"region: hit the per-owner quota at ");
-    dbg_dec(n);
-    debug_write(b" regions\n");
+    if n == expected {
+        debug_write(b"region: the per-owner quota granted exactly ");
+        dbg_dec(n);
+        debug_write(b" more\n");
+    } else {
+        debug_write(b"region: quota granted ");
+        dbg_dec(n);
+        debug_write(b" but the per-owner limit allows ");
+        dbg_dec(expected);
+        debug_write(b" (bug)\n");
+    }
     if last != syserr::NO_CAP {
         // Freeing one returns quota, so the next request succeeds.
         free_region(last);
@@ -1236,10 +1256,17 @@ fn child(id: u64) -> ! {
     // Use the delegated capability, then pass it on once. Passing it on makes the
     // revocation test TRANSITIVE: the parent's REVOKE must reach not just us but the
     // grandchild we handed it to. Self-limiting — the spawn fails once slots run out.
+    // NO_CAP means "no authority", which is what this test is about. NO_MEM means a
+    // resource ran out and the test could not run at all — reporting that as lost authority
+    // would print a confident, false line about delegation. Say so instead.
+    let probe = make_region(0, 1);
+    if probe == syserr::NO_MEM {
+        tag(id);
+        debug_write(b"deleg: could not test delegation -- out of regions (bug)\n");
+    }
     let have = {
-        let c = make_region(0, 1);
-        if c != syserr::NO_CAP && c != syserr::NO_MEM {
-            free_region(c);
+        if probe != syserr::NO_CAP && probe != syserr::NO_MEM {
+            free_region(probe);
             true
         } else {
             false
