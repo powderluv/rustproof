@@ -213,32 +213,6 @@ impl<const N: usize> Ledger<N> {
         }
     }
 
-    /// Is any live edge reachable from `root` by delegation? Pure query, changes nothing.
-    pub fn reaches_anything(&self, root: Endpoint) -> bool {
-        let mut seen = [Endpoint::new(usize::MAX, u64::MAX, usize::MAX); N];
-        let mut n = 0usize;
-        loop {
-            let mut progress = false;
-            for e in self.edges.iter() {
-                if !e.live {
-                    continue;
-                }
-                let from = e.parent == root || seen[..n].iter().any(|&s| s == e.parent);
-                if from && !seen[..n].iter().any(|&s| s == e.child) {
-                    if n < N {
-                        seen[n] = e.child;
-                        n += 1;
-                    }
-                    progress = true;
-                }
-            }
-            if !progress {
-                break;
-            }
-        }
-        n > 0
-    }
-
     /// Every live edge, as `(parent, child)`. For tests and invariant checks.
     pub fn live_edges(&self) -> impl Iterator<Item = (Endpoint, Endpoint)> + '_ {
         self.edges
@@ -395,14 +369,6 @@ mod tests {
             1,
             "forget must not drop another incarnation's edge"
         );
-    }
-
-    #[test]
-    fn reaches_anything_ignores_a_different_incarnation() {
-        let mut l: Ledger<8> = Ledger::new();
-        l.record(e(0, D, 0), e(2, C, 0));
-        assert!(!l.reaches_anything(e(0, A, 0)));
-        assert!(l.reaches_anything(e(0, D, 0)));
     }
 
     // ---------------------------------------------------------------- exhaustive checks

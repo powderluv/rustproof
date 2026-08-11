@@ -101,7 +101,19 @@ pub trait FrameAllocator {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CapType {
     Null,
-    /// Untyped physical memory that can be retyped into other objects.
+    /// Permission to ALLOCATE — not memory, and not an extent.
+    ///
+    /// Deliberately unlike seL4's untyped, whose name this borrows and whose contract it does
+    /// NOT have. An `Untyped` here carries no range: its `object` is unused and always zero,
+    /// it names no frames, and there is no watermark. Holding one with `WRITE` is permission
+    /// to do two things — allocate a region from the shared DMA arena (`MAKE_REGION`) and
+    /// create a process (`SPAWN`) — and nothing more.
+    ///
+    /// The distinction is load-bearing for revocation. Because an `Untyped` names nothing,
+    /// there is no naming relation for `REVOKE` to tear down: revoking it removes the ability
+    /// to acquire MORE, and does not reclaim what was already acquired. See [`sysno::REVOKE`].
+    /// The old wording here ("physical memory that can be retyped into other objects") is what
+    /// made that read as a defect rather than a design.
     Untyped,
     Frame,
     PageTable,
@@ -305,17 +317,23 @@ pub mod sysno {
     /// to. Returns `OK`, or `NO_CAP` if the caller does not hold `a0`. The caller keeps its
     /// own capability; only the delegations are destroyed.
     ///
-    /// "Derived" means DELEGATED and nothing else. Two things are deliberately outside it:
+    /// With each destroyed capability goes the authority that capability NAMED: a device
+    /// window is unmapped, a region mapping is torn down, interrupt credits are zeroed, a
+    /// parked rendezvous is ended. Capability spaces are FLAT, so there is no per-space
+    /// subtree to walk — "derived" means DELEGATED and nothing else.
     ///
-    /// * Capability spaces are FLAT — nothing is derived within a holder's own space, so
-    ///   there is no per-space subtree to walk.
-    /// * A `Region` minted from an `Untyped` via [`MAKE_REGION`] is NOT a delegation of that
-    ///   `Untyped` and is not recorded as one. Revoking the `Untyped` therefore leaves such
-    ///   regions alive: memory obtained through a capability outlives that capability's
-    ///   revocation. That is a known hole in the "revocation tears down the authority it
-    ///   granted" doctrine, described at the kernel's `make_region`. It is stated here
-    ///   rather than glossed, because a caller reasoning about REVOKE from this doc alone
-    ///   would otherwise conclude the memory is gone.
+    /// Revoking an [`CapType::Untyped`] additionally removes the ability to ACQUIRE MORE: the
+    /// holder can no longer `MAKE_REGION` or `SPAWN`, both refused immediately by a live
+    /// capability lookup. It does NOT reclaim what was already acquired. Regions already
+    /// minted stay alive, owned by their minter; processes already spawned keep running. Both
+    /// return only when their holder terminates.
+    ///
+    /// That is a decision, not an oversight, and the two halves are why: `MAKE_REGION` and
+    /// `SPAWN` are gated on the SAME capability with the SAME right. Reclaiming regions on
+    /// revocation while spawned processes — which retain strictly more authority, their own
+    /// address spaces and capabilities included — kept running would give this kernel two
+    /// different answers to one question. An `Untyped` names no extent, so there is nothing
+    /// for a reclamation to be scoped BY. See docs/nucleus-design.md §1.2.
     pub const REVOKE: u64 = 10;
 }
 

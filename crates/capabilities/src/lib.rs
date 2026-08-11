@@ -148,8 +148,10 @@ impl<const N: usize> CapSpace<N> {
     /// Cross-space delegation IS tracked transitively — by the `deleg` ledger, whose edges
     /// carry process IDENTITY rather than a bare slot index. That distinction is the one this
     /// codebase learned from a confirmed defect, and it is why a slot-index parent was the
-    /// wrong shape to keep. If intra-space derivation is ever wanted it will be a RETYPE with
-    /// range subsetting recorded as a `deleg` edge, not a parent pointer here.
+    /// wrong shape to keep. And intra-space derivation is not coming back as a `deleg` edge
+    /// either: `MAKE_REGION` mints a `Region` from an `Untyped` in one space, but an `Untyped`
+    /// names no extent, so that relation is depth-1, terminal, and carries no authority to
+    /// revoke through. See docs/nucleus-design.md §1.2.
     pub fn revoke(&mut self, cap: CapId) {
         if cap.0 >= N {
             return;

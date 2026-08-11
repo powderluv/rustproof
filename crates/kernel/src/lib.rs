@@ -874,7 +874,8 @@ const NO_AUTHORITY: (abi::CapType, abi::CapRights, u64) =
 /// falsifies: the worker mints a `Region`, a (type, object) pair in neither its role table
 /// nor any attenuation of a parent's.
 ///
-/// The third term is the one covered by no ledger — see the KNOWN GAP at [`make_region`].
+/// The third term NEEDS no ledger: minting creates no cross-space authority, and a Region
+/// capability IS ledgered the moment it is delegated. See [`make_region`].
 /// Note that the structurally similar claim about `Irq` grants (in `run`) is UNAFFECTED and
 /// still exact: `make_region` can only ever mint `Region`, never `Irq`.
 fn grants_for(role: Role) -> &'static [(abi::CapType, abi::CapRights, u64)] {
@@ -1134,6 +1135,16 @@ unsafe fn load_process<A: Arch>(
                 } else {
                     object
                 };
+                // TRIPWIRE. Everything in docs/nucleus-design.md §1.2 — why revoking an
+                // `Untyped` does not reclaim regions or processes already created from it —
+                // rests on an `Untyped` naming NO extent. The day one names a range (a
+                // contiguity constraint, an IOMMU window, a below-4G limit), that argument
+                // stops holding and the decision must be revisited rather than inherited.
+                // This is where you find out.
+                debug_assert!(
+                    cap_type != abi::CapType::Untyped || object == 0,
+                    "an Untyped acquired an extent; revisit the revocation decision"
+                );
                 let _ = s.caps.insert(cap_type, rights, object);
             }
             s.role = role;
@@ -1755,7 +1766,10 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             // capability (`a0` = cap id), like MAKE_REGION. This bounds who can spawn.
             let cap = abi::CapId(A::frame_arg(&f, 0) as usize);
             // Type AND rights, per `docs/host-contract.md`: "rights ⊇ need" on every op.
-            // A spawn consumes memory out of the untyped region — a mutation — so `WRITE`.
+            // `WRITE` because spawning CONSUMES: it allocates an address space, a stack and an
+            // image. Not "out of the untyped region" — there is no such region; an `Untyped`
+            // names no extent. And the frames come from the GENERAL pool via `alloc_frame`,
+            // not the DMA arena `make_region` draws from, which `mm` keeps strictly disjoint.
             let authorized = proc_at(cur).caps.lookup(cap).is_some_and(|s| {
                 s.cap_type == abi::CapType::Untyped && s.rights.contains(abi::CapRights::WRITE)
             });
@@ -2058,17 +2072,17 @@ pub unsafe fn preempt_trap<A: Arch>(frame: *mut u64) -> ! {
 ///
 /// # Safety
 /// Single-CPU, non-reentrant: no other live borrow of the process or region tables.
-/// KNOWN GAP, recorded here because it is the natural place to look. `MAKE_REGION` mints a
-/// `Region` capability out of an `Untyped` one in the SAME space, and that relationship is
-/// NOT recorded in the delegation ledger. So revoking the `Untyped` does not destroy regions
-/// already made from it: memory obtained through a capability outlives the revocation of
-/// that capability. seL4 would call this retype-and-revoke and does destroy the children.
+/// `MAKE_REGION` mints a `Region` out of an `Untyped` in the SAME capability space, and that
+/// relation is recorded nowhere — deliberately. An `Untyped` here names no extent (its object
+/// is always zero), so there is no naming relation for revocation to tear down: revoking it
+/// removes the ability to acquire more, not what was already acquired.
 ///
-/// This is a real hole in the "revocation tears down the AUTHORITY it granted" doctrine, not
-/// a stylistic one. It is left open deliberately rather than papered over: closing it means
-/// recording a retype edge (`Untyped` -> `Region`, different type, different object) which
-/// the ledger's forest precondition and `deleg::Endpoint` do not currently express, and that
-/// is a design change rather than a patch.
+/// This block used to call that a KNOWN GAP in the "revocation tears down the authority it
+/// granted" doctrine. It is not. `SPAWN` is gated on the same capability with the same right
+/// and retains strictly more authority than a region — a whole process with its own address
+/// space, capabilities and regions — so reclaiming regions here while spawned processes kept
+/// running would give the kernel two answers to one question. See docs/nucleus-design.md §1.2
+/// for the decision and its reversal condition.
 unsafe fn make_region<A: Arch>(owner: usize, pages: u64, rights: abi::CapRights) -> u64 {
     use abi::FrameAllocator as _;
     // Quota first, before a frame is taken or an id burned — a process at its limit must not

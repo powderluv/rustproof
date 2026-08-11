@@ -1483,24 +1483,91 @@ fn child(id: u64) -> ! {
     // Our parent revokes while we run. A capability that keeps working after revocation
     // would be the bug — and for a grandchild, so would one that is never reached.
     if have {
-        let mut seen = false;
+        // DA2: mint a region and KEEP it across the revoke, signed, so the decision below is
+        // observable at all. The loop used to mint and free immediately, which left us owning
+        // ZERO live regions when the parent revoked — nothing to check the property against.
+        let kept = make_region(0, 1);
+        let kept_va = if kept != syserr::NO_CAP && kept != syserr::NO_MEM {
+            let va = map_region(kept);
+            if va != syserr::NO_CAP && va != syserr::NO_MEM {
+                let sig = b"MINTED-BEFORE-REVOKE";
+                let mut i = 0usize;
+                while i < 20 {
+                    unsafe { core::ptr::write_volatile((va as *mut u8).wrapping_add(i), sig[i]) };
+                    i += 1;
+                }
+                va
+            } else {
+                syserr::NO_CAP
+            }
+        } else {
+            syserr::NO_CAP
+        };
+
+        // DA1: NO_CAP and NO_MEM are DIFFERENT FACTS. NO_CAP means our capability was
+        // revoked, which is the property. NO_MEM means the global region table was full —
+        // it says nothing about revocation, and folding the two together let this, the
+        // flagship revocation assertion, report success when nothing had been revoked.
+        let mut revoked = false;
+        let mut exhausted = false;
         let mut i = 0u64;
         while i < 60 {
             let c = make_region(0, 1);
-            if c != syserr::NO_CAP && c != syserr::NO_MEM {
-                free_region(c);
-            } else {
-                seen = true;
+            if c == syserr::NO_CAP {
+                revoked = true;
                 break;
             }
+            if c == syserr::NO_MEM {
+                exhausted = true;
+                break;
+            }
+            free_region(c);
             spin(2_000_000);
             i = i.wrapping_add(1);
         }
+        if exhausted {
+            tag(id);
+            dw!(b"revoke: could not test revocation -- out of regions (bug)\n");
+        }
+        // DA3: the refusal must be exactly NO_CAP. That holds only because the capability
+        // gate precedes the quota check in the kernel, an ordering nothing else pins.
         tag(id);
-        if seen {
+        if revoked {
             dw!(b"revoke: delegated cap REVOKED by parent (no longer usable)\n");
         } else {
             dw!(b"revoke: delegated cap still usable after revoke (bug)\n");
+        }
+
+        // DA2 continued: the region we minted BEFORE the revoke must still be ours, still
+        // mapped, and still hold its bytes. Revocation removes the ability to acquire more;
+        // it does not reclaim what was already acquired.
+        if kept_va != syserr::NO_CAP {
+            let mut ok = true;
+            let mut i = 0usize;
+            while i < 20 {
+                let c = unsafe { core::ptr::read_volatile((kept_va as *const u8).wrapping_add(i)) };
+                if c != b"MINTED-BEFORE-REVOKE"[i] {
+                    ok = false;
+                }
+                i += 1;
+            }
+            tag(id);
+            if ok {
+                dw!(b"revoke: memory minted BEFORE the revoke is still ours and intact\n");
+            } else {
+                dw!(b"revoke: memory minted before the revoke was corrupted (bug)\n");
+            }
+        }
+
+        // DA4: the SAME capability gates SPAWN, so revoking it must refuse a spawn too —
+        // and this is what makes it ONE story rather than two. A grandchild spawned BEFORE
+        // the revoke keeps running (its own tagged output is the evidence), exactly as a
+        // region minted before it stays alive.
+        tag(id);
+        if spawn(0) == u64::MAX {
+            dw!(b"revoke: the same revoked cap also refuses SPAWN (one story, not two)\n");
+        } else {
+            dw!(b"revoke: SPAWN still allowed through a revoked cap (bug)\n");
         }
     }
 

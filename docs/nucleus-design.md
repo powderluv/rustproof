@@ -141,11 +141,66 @@ This is the single most consequential structural decision, for two reasons:
    otherwise. Deleted. Cross-space delegation is tracked by the `deleg` ledger, whose edges
    carry process IDENTITY rather than a slot index.)
 
-Concretely, derivation is an **append-only forest**:
+> **What was actually built (2026-08).** The three bullets below describe a design that was
+> planned and then NOT implemented, and they had drifted into reading as description. Held to
+> the record: there is no watermark and no retype — an `Untyped` carries no extent at all, its
+> `object` is always zero, and `MAKE_REGION` allocates from a shared DMA arena rather than
+> carving a range out of anything. There is no static parent edge: `CapSlot.parent` was deleted
+> (see the note above), and the `deleg` ledger's `splice_out` **does** rewrite edges — it
+> re-parents them on teardown, precisely so an ancestor's revoke still reaches a dead process's
+> grandchildren. The Verus invariant sketched below has no referent in the current code.
+
+Concretely, derivation *was to be* an **append-only forest**:
 
 - Each `Untyped` cap carries a **monotonic watermark** (seL4-style). `retype(untyped, ctype, n)` bump-allocates `n` objects from the free tail of the region and advances the watermark. There is no free-list and no in-place free.
 - A derived object's provenance is a static parent edge (which Untyped it came from). Edges are never rewritten.
 - **Reclamation happens once, at teardown.** When an `AddressSpace` (equivalently, its `Tcb`'s process) terminates, the nucleus walks its owned objects, unmaps them (IOMMU domains too, §5), and resets the watermarks of the Untypeds it exclusively owned. Shared Untypeds are reference-counted at the granularity of whole subtrees, not individual frames.
+
+### Decision: revoking an `Untyped` does not reclaim what was already created
+
+`MAKE_REGION` mints DMA memory and `SPAWN` creates a process. Both are gated on the SAME
+capability with the SAME right — an `Untyped` carrying `WRITE`. Revoking that capability
+removes the ability to acquire **more**: both calls are refused immediately by a live
+capability lookup. It does **not** reclaim what was already acquired. Regions already minted
+stay alive, owned by their minter's identity; processes already spawned keep running. Both
+return only when their holder terminates, and frame conservation checks that they do.
+
+**Alternatives Considered.**
+
+- *(A) seL4-style retype-revoke — revoking an `Untyped` destroys everything retyped from it.*
+  Rejected. seL4's untyped **owns an extent**, so "everything retyped from it" is a range
+  containment property. Ours owns nothing — the object is always zero — so there is no scope
+  for a reclamation to be defined by. Worse, applied consistently it would have to destroy
+  spawned processes too, since they come from the same capability and the same right, and a
+  process retains strictly more authority than a 4-page region (its own address space, its own
+  capabilities, its own regions). Applied *inconsistently* — regions but not processes — the
+  kernel would have two different answers to one question.
+- *(B) Provenance as a field on the region (`Region.minted_from`), swept at revoke.* Rejected
+  for the same reason plus one: it requires inventing an identity for an `Untyped` that has no
+  referent, and it would make the sweep discriminate on something the capability system does
+  not model.
+- *(C) Recording a retype edge in the `deleg` ledger.* Rejected. The relation is depth-1 and
+  terminal — nothing mints an `Untyped`, so a `Region` is never a retype source — so it gains
+  nothing from a fixpoint built for transitive reachability, while adding a second recording
+  site whose child endpoint is a slot in an EXISTING process. That is exactly the case
+  `splice_out`'s forest precondition was written to exclude.
+- *(D) Narrow the claim — chosen.* The defect was the doctrine sentence, not the code. The
+  sentence "revocation tears down the authority it granted" is true of what a capability
+  NAMES: a device window is unmapped, a region mapping torn down, interrupt credits zeroed, a
+  parked rendezvous ended. An `Untyped` names nothing, so there is nothing to tear down.
+
+**Reversal condition**, stated so it is inherited rather than re-derived: the moment this
+nucleus needs DMA memory from a SPECIFIC extent — a contiguity constraint, an IOMMU domain
+window, memory below a device's addressing limit — an `Untyped` must name a range, and this
+decision must be revisited rather than assumed. A `debug_assert!` in the grant loop
+(`load_process`) fires if an `Untyped` ever acquires a nonzero object, which is where that
+change will announce itself.
+
+**What this does not do.** It does not close a threat-model gap: a compromised process whose
+capability has been revoked keeps its mapped DMA frames for as long as it runs, and nothing
+stops it running. If "revocation must disarm a live driver's DMA" ever enters the threat
+model, this decision is not sufficient and neither is any of the alternatives above — that
+needs an IOMMU.
 
 The Verus invariant is a **disjointness + containment** property, not a reachability-of-revoke property:
 
