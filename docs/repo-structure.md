@@ -6,7 +6,13 @@
 
 ## 0. Two-sentence orientation
 
-The **verified trusted computing base (TCB)** is a small set of `no_std` library crates (`nucleus-core`, `capabilities`, `vspace`, `ipc`, and the spec half of `iommu-amdvi`) that carry Verus proofs; everything that touches raw hardware is quarantined into `arch-x86_64` (Kani-checked, Verus-external) and everything that is a full application — the GPU driver, `init` — runs as **untrusted userland ELFs** the nucleus loads. The physical `lite::` driver stack is vendored as C++ under `vendor/rocr-lite/`, compiled to a static archive, and linked into an untrusted `driver-host` process that reaches the nucleus only through the capability/IPC ABI in the shared `abi` crate.
+The **trusted computing base (TCB)** is a small set of `no_std` library crates. As of 2026-08 it
+is `kernel` (the generic nucleus), `capabilities`, `deleg`, `regions`, `runstate`, `vspace`(+riscv),
+`mm`, `ipc` and `abi`, and it carries **no Verus proofs yet** — the crates named here are covered
+by host unit tests, several exhaustive over their whole small state space (`tools/host-tests.sh`,
+which refuses to run if a crate containing `#[test]` is missing from its list). `nucleus-core` and
+`iommu-amdvi` are stubs that no build depends on. This paragraph previously called the set
+"verified" and said it "carries Verus proofs", neither of which was ever true; everything that touches raw hardware is quarantined into `arch-x86_64` (Kani-checked, Verus-external) and everything that is a full application — the GPU driver, `init` — runs as **untrusted userland ELFs** the nucleus loads. The physical `lite::` driver stack is vendored as C++ under `vendor/rocr-lite/`, compiled to a static archive, and linked into an untrusted `driver-host` process that reaches the nucleus only through the capability/IPC ABI in the shared `abi` crate.
 
 ---
 

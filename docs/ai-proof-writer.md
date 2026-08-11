@@ -203,7 +203,7 @@ The agent's realistic role at M3 is **filling mechanical sub-lemmas under a full
 
 ## 6. Cost / how Gate G1 changes
 
-**What Gate G1 is today.** Plan §8 R1 (and next-action #1): *"secure genuine Verus proof-engineering before M1 — hire or a research partnership — budget a 3–6 month ramp; until it's secured, treat everything past M0 as unfunded."* The gate is a **scarce hire with a long search**, and it is named the single largest schedule cliff.
+**What Gate G1 is today.** [`implementation-plan.md` §4](implementation-plan.md) — the same section this document cites for Gate G1 above; the "§8 R1 / next-action #1" numbering previously cited here does not exist, as that plan has no R-numbered items and its §8 is "What is trusted": *"secure genuine Verus proof-engineering before M1 — hire or a research partnership — budget a 3–6 month ramp; until it's secured, treat everything past M0 as unfunded."* The gate is a **scarce hire with a long search**, and it is named the single largest schedule cliff.
 
 **What it becomes.** Replace "one scarce full-time Verus proof engineer" with **an agent harness + a lighter human role**:
 

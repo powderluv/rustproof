@@ -99,8 +99,20 @@ Eight typed capabilities, each a rights-decorated reference to a kernel object:
 
 | CapType | Object | Confers |
 |---|---|---|
-| `Untyped` | contiguous physical region + watermark | retype into other objects |
+| `Untyped` | *(none — see below)* | allocate a region (`MAKE_REGION`); create a process (`SPAWN`) |
 | `Frame` | one 4 KiB (or 2 MiB) physical frame | map into a `PageTable` |
+
+> **What exists (2026-08).** This table is the PLANNED object model; most of it was never
+> built. Implemented today: `Untyped`, `Endpoint`, `Mmio`, `Irq`, and `Region` (which is not in
+> this table — it is the single memory mechanism, monotonic never-reused ids, added later).
+> `Frame`, `PageTable`, `Notification`, `Tcb` and `IommuDomain` are declared in `abi::CapType`
+> and used by nothing.
+>
+> The `Untyped` row above said "contiguous physical region + watermark / retype into other
+> objects" — seL4's contract, and NOT this kernel's. An `Untyped` here carries no extent at
+> all: its object is always zero and it names no frames. That one sentence, repeated across
+> four documents and one ABI doc comment, manufactured a phantom "isolation hole" that took a
+> full design cycle to disprove. See §1.2.
 | `PageTable` | one paging structure (PML4/PDPT/PD/PT) | install mappings; root = an AS |
 | `Endpoint` | synchronous IPC port | send/recv (rights-gated) |
 | `Notification` | async signal word | signal/wait; IRQ target |

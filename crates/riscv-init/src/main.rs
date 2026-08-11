@@ -936,7 +936,8 @@ fn compute(id: u64) -> ! {
 
     // Regression test for authority amplification via slot recycling: by now the
     // producer and consumer have exited and freed their slots, so this spawn lands in a
-    // RECYCLED one. The child must STILL be a worker. If the kernel derived authority from
+    // RECYCLED one. The child must STILL get `Role::Child` — an EMPTY grant table — and not
+    // the exited occupant's authority. If the kernel derived authority from
     // the slot index, this child would inherit the producer's send right on the shared
     // endpoint (and, running producer(), would block forever and deadlock the boot).
     if id == 2 {

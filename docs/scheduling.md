@@ -56,7 +56,11 @@ Every authority-granting op now checks BOTH halves of the capability — the obj
 type and `rights ⊇ need`, as `host-contract.md` specifies: `SEND` needs `WRITE`
 and `RECV` needs `READ` on an `Endpoint`; `MAP_BAR` needs `READ` on an `Mmio`
 (mapping exposes the device's registers); `MAKE_REGION` and `SPAWN` need `WRITE`
-on an `Untyped` (both carve memory out of it). `FREE_REGION` needs `WRITE` on the
+on an `Untyped` (both CONSUME memory, so both need the write half — but not out of
+the capability: an `Untyped` names no extent, and the two draw from disjoint
+pools, `MAKE_REGION` from the shared DMA arena and `SPAWN` from the general one.
+See nucleus-design.md §1.2 for why that means revoking it reclaims neither).
+`FREE_REGION` needs `WRITE` on the
 region capability *and* ownership by process identity — a read-only loan must not
 be able to destroy what it was lent.
 So that the rights half is never vacuously true, `load_process` also mints two
@@ -83,14 +87,16 @@ and receive `WRITE` on the shared endpoint — authority no worker holds, i.e. a
 principal minting a stronger principal. Identity is likewise separate from the
 slot (a monotonic counter), so a slot's current and former occupants can never be
 conflated. The demo spawns late, into a deliberately recycled slot, and asserts
-the child is still a worker.
+the child holds NOTHING of its own — no endpoint, no interrupt, no device
+authority — rather than the exited occupant's grants.
 
 Capabilities are no longer only grantable at load time: `SPAWN` takes an optional
 capability of the caller's to **delegate** to the child, plus the rights to hand
-over. The child receives `caller_rights ∩ requested` — the same intersection
-`CapSpace::derive` performs within one space, though delegation must `insert` a
-fresh root: a capability space here is FLAT, and the parent/child relation lives
-in the cross-space ledger, keyed by process identity. A parent may attenuate but
+over. The child receives `caller_rights ∩ requested` — `abi::CapRights::intersect`,
+applied at the SPAWN site — and delegation `insert`s a fresh root: a capability
+space here is FLAT, with no intra-space derivation of any kind, and the
+parent/child relation lives in the cross-space `deleg` ledger, keyed by process
+identity. A parent may attenuate but
 never amplify, and requesting more
 than it holds yields only what it holds. Asking to delegate a capability the
 caller does not hold refuses the whole spawn rather than quietly producing a
@@ -101,9 +107,11 @@ with no authority whatsoever, so everything it can do is exactly what its parent
 delegated. That makes "spawn cannot mint authority" true by construction rather
 than by an argument about who is allowed to spawn — and it is what makes the
 demo's positive case meaningful: a child with an empty role allocates through a
-delegated `Untyped`, which no role table could have given it. The negative case
-hands another child a `READ`-only `Untyped` *with full rights requested*; it is
-still refused.
+delegated `Untyped`, which no role table could have given it. (The old negative
+case — handing a child a `WRITE`-less `Untyped` with full rights requested — was
+retired when the late spawn switched to delegating the device capability; the
+refusal it demonstrated is now asserted directly, by the worker calling
+`MAKE_REGION` through a `WRITE`-less `Untyped` and through an `Endpoint`.)
 
 An IPC message carries a word **and** an optional byte payload (up to
 `abi::MAX_MSG_BYTES`), so a message can hold a request rather than just a
@@ -450,7 +458,8 @@ and a probe in one says nothing about the other.
 
 Scrubbing on *release* would read as the more natural choice and is not enough on
 its own: a frame that has never been allocated still holds whatever the firmware
-left in it. Zeroing on the way out covers both. Region allocation goes through it too —
-nothing can read VRAM today, since it is handed out as a physical address and
-never mapped, but a driver's purpose is to point a DEVICE at it, and a device
-reading a dead process's memory is the same disclosure with an extra step.
+left in it. Zeroing on the way out covers both. Region allocation goes through it too,
+and there it is not hypothetical: `MAP_REGION` installs a region's frames in the
+caller's own address space, and the demo's borrower reads every page of a
+delegated region at ring 3 today. Pointing a DEVICE at those frames, once a
+driver exists, is the same disclosure with one more step.

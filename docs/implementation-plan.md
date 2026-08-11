@@ -55,7 +55,11 @@ The program runs on **two tracks that proceed in parallel and only converge at M
 - **Track B — Bring-up (self-serve now).** Everything needed to boot the nucleus and dispatch a wave: the nucleus's boot/memory/AS/IPC/scheduler plumbing, the host-contract server, the no-POSIX C++ hosting of `lite::`, firmware provisioning, in-guest MES/IH bring-up. This is ordinary (hard) systems work; **a strong systems engineer can do all of M0 alone.** No verification is load-bearing here.
 - **Track V — Verification (gated).** Everything Verus: the invariant ladder V1–V7, the trusted-stub contracts, the Kani harnesses, the reference model, the red-team oracle. **This track cannot start in earnest until the proof-engineer gate (§4) is cleared.** M1+ dates do not exist until then.
 
-The tracks share one artifact discipline: the **nucleus state representations are fixed in Track B with Track V's needs in mind** (bounded single-level capability table, tracked-permission global frame view, append-only no-revocation derivation forest, reach-as-map-equality). The expensive mistake is discovering the state representation is unprovable *after* the exec code exists — so the design docs (`nucleus-design.md`, `verification.md`) pin those choices now, before Track V is staffed.
+The tracks share one artifact discipline: the **nucleus state representations are fixed in Track B with Track V's needs in mind** (bounded single-level capability table, tracked-permission global frame view,
+reach-as-map-equality — note the fourth, an "append-only no-revocation derivation forest", was
+pinned here and then NOT built: capability spaces are flat, revocation exists and is transitive
+across spaces via the `deleg` ledger, and the intra-space derivation tree was deleted in
+73a0c60. Track V should target the representations that exist). The expensive mistake is discovering the state representation is unprovable *after* the exec code exists — so the design docs (`nucleus-design.md`, `verification.md`) pin those choices now, before Track V is staffed.
 
 ### 3.2 Dependency graph — today → M0
 
