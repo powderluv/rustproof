@@ -855,14 +855,28 @@ const NO_AUTHORITY: (abi::CapType, abi::CapRights, u64) =
 
 /// The capability set granted to each role, positionally: entry `i` becomes `CapId(i)`.
 ///
-/// PROOF(later): immediately after `load_process`, a process's `CapSpace` holds exactly
-/// this role's table — entry `i` at `CapId(i)` — and nothing else. Exactly ONE kernel site
-/// adds to a `CapSpace` afterwards: the `SPAWN` delegation `insert` in [`syscall_trap`],
-/// which appends a capability whose rights are `parent_rights ∩ requested` and whose type
-/// and object are copied verbatim from a capability the parent already holds. So a
-/// process's authority is bounded by (its role's table) ∪ (an attenuation of its parent's
-/// authority) — and since [`Role::Child`]'s table is empty, a spawned process's authority
-/// is bounded by its parent's.
+/// PROOF(later): immediately after `load_process`, a process's `CapSpace` holds exactly this
+/// role's table — entry `i` at `CapId(i)` — and nothing else. TWO kernel sites add to a
+/// `CapSpace` afterwards:
+///
+/// 1. the `SPAWN` delegation `insert` in [`syscall_trap`], which appends a capability whose
+///    rights are `parent_rights ∩ requested` and whose type and object are copied verbatim
+///    from a capability the parent already holds; and
+/// 2. the `MAKE_REGION` mint in [`make_region`], which is the only site that adds a
+///    capability of a type NO role table contains. It is always [`abi::CapType::Region`],
+///    with a fresh never-reused object, gated on an `Untyped` carrying `WRITE` that the
+///    process already holds.
+///
+/// So the bound is (role table) ∪ (an attenuation of the parent's authority) ∪ (`Region`
+/// capabilities minted from an `Untyped` the process holds) — and since [`Role::Child`]'s
+/// table is empty, a spawned process's authority is bounded by its parent's plus whatever it
+/// mints for itself. This block used to name only site 1, which the boot demo itself
+/// falsifies: the worker mints a `Region`, a (type, object) pair in neither its role table
+/// nor any attenuation of a parent's.
+///
+/// The third term is the one covered by no ledger — see the KNOWN GAP at [`make_region`].
+/// Note that the structurally similar claim about `Irq` grants (in `run`) is UNAFFECTED and
+/// still exact: `make_region` can only ever mint `Region`, never `Irq`.
 fn grants_for(role: Role) -> &'static [(abi::CapType, abi::CapRights, u64)] {
     const MMIO_BASE: u64 = 0xE000_0000;
     match role {

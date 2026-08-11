@@ -171,7 +171,9 @@ bitflags::bitflags! {
         const DMAGRANT= 1 << 3; // enter into an IOMMU domain (make GPU-reachable)
         const IRQBIND = 1 << 4; // bind an MSI-X source to a Notification
         const DOORBELL= 1 << 5; // ring a doorbell index in the granted sub-aperture
-        const GRANT   = 1 << 6; // derive children / transfer this cap over IPC
+        const GRANT   = 1 << 6; // transfer this cap over IPC (NOT YET CHECKED by the
+                                //   nucleus; the "derive children" half has no operation —
+                                //   capability spaces are flat, see crates/capabilities)
         const REVOKE  = 1 << 7; // revoke children (usually held only by the manager)
     }
 }

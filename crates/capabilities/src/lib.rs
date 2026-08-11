@@ -6,15 +6,23 @@
 //! the array is inline storage). Capabilities are addressed by their slot index
 //! (`abi::CapId`). Free slots are marked by `CapType::Null`.
 //!
-//! Two authority rules are enforced structurally and are the properties the Verus
-//! proofs (later) will discharge:
+//! ONE rule is enforced structurally here, and it is worth being exact about which:
 //!
-//! 1. **Authority-monotonic derivation** — a derived (child) capability's rights are
-//!    `parent.rights ∩ requested`, so a child can NEVER hold a right its parent lacks.
-//! 2. **Coarse revocation only** — we deliberately do NOT support fine-grained
-//!    mid-execution rights downgrade. The only removal primitive is
-//!    [`CapSpace::revoke`], which drops a whole derivation subtree (e.g. on
-//!    address-space teardown).
+//! - **Coarse revocation only.** The sole removal primitive is [`CapSpace::revoke`], which
+//!   empties exactly one slot. There is no fine-grained mid-execution rights downgrade, and
+//!   no subtree: a space is FLAT.
+//!
+//! **Authority monotonicity is NOT a property of this crate.** Rights are attenuated by
+//! `abi::CapRights::intersect` at the kernel sites that mint capabilities — the `SPAWN`
+//! delegation and `make_region` — and asserted exhaustively over the rights lattice in
+//! `abi`'s own tests. This crate stores whatever rights it is handed; it enforces nothing
+//! about them. Transitive teardown likewise is not here: it lives in `deleg`, whose edges
+//! carry process IDENTITY rather than a slot index.
+//!
+//! This page used to claim both of those as this crate's rules, on the strength of a
+//! `derive` operation and a revocation fixpoint that the kernel never once exercised. They
+//! were deleted; a reader — in particular a future Verus author picking a first target —
+//! should not be handed a proof obligation with nothing to discharge it against.
 //!
 //! See docs/nucleus-design.md and docs/verification.md.
 
@@ -23,9 +31,8 @@ use abi::{CapId, CapRights, CapType};
 /// One capability slot. A slot is *free* iff `cap_type == CapType::Null`.
 ///
 /// `object` is an opaque handle to the referenced kernel object (e.g. a physical
-/// address / frame number / TCB index); this crate never interprets it. `parent`
-/// records the slot index this cap was derived from (`None` for a freshly inserted
-/// root cap), which is what makes subtree revocation possible.
+/// address / frame number / TCB index); this crate never interprets it. Every live slot is
+/// a ROOT — there is no `parent` link and no derivation relation inside a space.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CapSlot {
     pub cap_type: CapType,
@@ -51,12 +58,17 @@ impl CapSlot {
 /// A capability space: fixed-capacity, heap-free, generic over its slot count `N`.
 ///
 /// # Invariants (PROOF(later))
-/// - Every *live* slot with `parent == Some(p)` has `p < N` and `slots[p]` live.
-///   (Established by [`derive`](CapSpace::derive) — the parent is validated live
-///   before a child is minted — and preserved by
-///   [`revoke`](CapSpace::revoke), which removes an entire subtree so
-///   no dangling parent link is ever left behind.) Revocation's termination and
-///   completeness rely on this.
+/// - A slot's authority depends on NO OTHER SLOT. Slots are independent roots; there is no
+///   derivation relation inside a space, so there is nothing here to keep consistent and
+///   nothing whose termination or completeness needs an argument.
+/// - `lookup(c)` is `Some` exactly when `c < N` and `slots[c].cap_type != Null`.
+/// - `revoke(c)` restores `slots[c]` to `CapSlot::EMPTY` exactly, so a recycled slot carries
+///   nothing of its predecessor.
+///
+/// The invariant this block used to state — "every live slot with `parent == Some(p)` has
+/// `slots[p]` live" — was VACUOUS: no live slot ever had a parent, because the only writer of
+/// a live space is `insert`, which mints roots. A proof obligation discharged by emptiness is
+/// worse than none, since it reads as coverage.
 pub struct CapSpace<const N: usize> {
     slots: [CapSlot; N],
 }
@@ -156,6 +168,39 @@ impl<const N: usize> CapSpace<N> {
 mod tests {
     use super::*;
     use abi::{CapId, CapRights, CapType};
+
+    #[test]
+    fn revoke_frees_exactly_the_named_slot() {
+        // Nothing pinned this once the fixpoint went. `revoke` must empty the slot it is
+        // given and touch no other — the whole of what the primitive now promises.
+        let mut cs: CapSpace<4> = CapSpace::new();
+        let a = cs.insert(CapType::Untyped, CapRights::ALL, 1).unwrap();
+        let b = cs.insert(CapType::Endpoint, CapRights::READ, 2).unwrap();
+        let c = cs.insert(CapType::Mmio, CapRights::WRITE, 3).unwrap();
+        cs.revoke(b);
+        assert!(cs.lookup(b).is_none(), "the named slot must be freed");
+        assert_eq!(cs.lookup(a).unwrap().object, 1, "a neighbour was disturbed");
+        assert_eq!(cs.lookup(c).unwrap().object, 3, "a neighbour was disturbed");
+        // And the freed slot carries nothing of its predecessor.
+        let reused = cs.insert(CapType::Irq, CapRights::READ, 9).unwrap();
+        assert_eq!(reused, b, "insert should reuse the freed slot");
+        let slot = cs.lookup(reused).unwrap();
+        assert_eq!(slot.cap_type, CapType::Irq);
+        assert_eq!(slot.object, 9);
+    }
+
+    #[test]
+    fn insert_stores_the_rights_it_was_given() {
+        // The other half of attenuation: `intersect` computes the rights (asserted in abi),
+        // and this crate must store them verbatim. With `derive` gone, nothing else pinned
+        // that a mint cannot quietly widen what it was handed.
+        for bits in 0u8..8 {
+            let mut cs: CapSpace<2> = CapSpace::new();
+            let r = CapRights(bits);
+            let id = cs.insert(CapType::Untyped, r, 0x77).unwrap();
+            assert_eq!(cs.lookup(id).unwrap().rights, r, "rights altered on insert");
+        }
+    }
 
     #[test]
     fn insert_then_lookup_roundtrips() {

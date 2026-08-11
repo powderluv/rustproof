@@ -300,13 +300,22 @@ pub mod sysno {
     /// it and invalidates every capability naming it, so no mapping and no authority
     /// survives the memory.
     pub const FREE_REGION: u64 = 16;
-    /// Revoke every capability derived from `a0` (one of the caller's own capabilities) by
-    /// DELEGATION, transitively — the children it was handed to and the grandchildren they
-    /// passed it on to. Nothing is derived "within a holder's own space": capability spaces
-    /// here are flat, and this doc used to claim otherwise on the strength of a mechanism
-    /// the kernel never exercised.
-    /// Returns `OK`, or `NO_CAP` if the caller does not hold `a0`. The caller keeps its own
-    /// capability; only the derivations are destroyed.
+    /// Revoke every capability DELEGATED from `a0` (one of the caller's own capabilities),
+    /// transitively — the children it was handed to and the grandchildren they passed it on
+    /// to. Returns `OK`, or `NO_CAP` if the caller does not hold `a0`. The caller keeps its
+    /// own capability; only the delegations are destroyed.
+    ///
+    /// "Derived" means DELEGATED and nothing else. Two things are deliberately outside it:
+    ///
+    /// * Capability spaces are FLAT — nothing is derived within a holder's own space, so
+    ///   there is no per-space subtree to walk.
+    /// * A `Region` minted from an `Untyped` via [`MAKE_REGION`] is NOT a delegation of that
+    ///   `Untyped` and is not recorded as one. Revoking the `Untyped` therefore leaves such
+    ///   regions alive: memory obtained through a capability outlives that capability's
+    ///   revocation. That is a known hole in the "revocation tears down the authority it
+    ///   granted" doctrine, described at the kernel's `make_region`. It is stated here
+    ///   rather than glossed, because a caller reasoning about REVOKE from this doc alone
+    ///   would otherwise conclude the memory is gone.
     pub const REVOKE: u64 = 10;
 }
 
