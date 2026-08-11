@@ -55,9 +55,10 @@ concrete lets the process table be a plain non-generic static.
 Every authority-granting op now checks BOTH halves of the capability — the object
 type and `rights ⊇ need`, as `host-contract.md` specifies: `SEND` needs `WRITE`
 and `RECV` needs `READ` on an `Endpoint`; `MAP_BAR` needs `READ` on an `Mmio`
-(mapping exposes the device's registers); `ALLOC_VRAM` and `SPAWN` need `WRITE`
-on an `Untyped` (both carve memory out of it). `FREE_VRAM` needs no capability —
-releasing your own frame grants no authority — and is ownership-checked instead.
+(mapping exposes the device's registers); `MAKE_REGION` and `SPAWN` need `WRITE`
+on an `Untyped` (both carve memory out of it). `FREE_REGION` needs `WRITE` on the
+region capability *and* ownership by process identity — a read-only loan must not
+be able to destroy what it was lent.
 So that the rights half is never vacuously true, `load_process` also mints two
 deliberately under-powered caps (a `WRITE`-less `Untyped`, a `READ`-less `Mmio`)
 that the demo uses to prove each refusal on real hardware.
@@ -74,7 +75,9 @@ in order. The demo asserts each of those refusals on hardware.
 Authority is never derived from a table index. Slots are recycled by `EXIT` /
 `SPAWN`, so `load_process` takes the role as an explicit parameter: the boot
 policy (`boot_role`) applies only to the initial, never-recycled ids, and a
-`SPAWN`ed process is always a `Worker`, chosen at the spawn site. Deriving it
+`SPAWN`ed process is always a `Child` — a role whose grant table is EMPTY, so it
+begins with no authority of its own and holds exactly what its parent delegated.
+Deriving it
 from the slot instead would let a worker spawn into the exited producer's slot
 and receive `WRITE` on the shared endpoint — authority no worker holds, i.e. a
 principal minting a stronger principal. Identity is likewise separate from the
@@ -86,9 +89,9 @@ Capabilities are no longer only grantable at load time: `SPAWN` takes an optiona
 capability of the caller's to **delegate** to the child, plus the rights to hand
 over. The child receives `caller_rights ∩ requested` — the same intersection
 `CapSpace::derive` performs within one space, though delegation must `insert` a
-fresh root rather than `derive`, because `CapSlot.parent` is a slot index within
-*one* space and recording the parent's index in the child's space would corrupt
-`revoke_subtree`. A parent may attenuate but never amplify, and requesting more
+fresh root: a capability space here is FLAT, and the parent/child relation lives
+in the cross-space ledger, keyed by process identity. A parent may attenuate but
+never amplify, and requesting more
 than it holds yields only what it holds. Asking to delegate a capability the
 caller does not hold refuses the whole spawn rather than quietly producing a
 child without it.
@@ -261,19 +264,22 @@ cannot see the run queue, and giving it a way to would be authority it should
 not have.
 
 With that, a driver process has all four things the host contract owes it:
-device registers (`MAP_BAR`), DMA memory (`ALLOC_VRAM`/`FREE_VRAM`), a way to
+device registers (`MAP_BAR`), DMA memory (`MAKE_REGION`/`FREE_REGION`), a way to
 talk to clients (IPC), and its device's interrupts.
 
 Delegated capabilities can be **revoked**. `REVOKE(cap)` destroys everything
 derived from one of the caller's own capabilities — transitively: the children it
-was handed to, the grandchildren they passed it on to, and (via
-`CapSpace::revoke_subtree`) anything a holder derived from it inside its own
-space. The caller keeps its own capability; revoking grants does not disarm you.
+was handed to and the grandchildren they passed it on to. The caller keeps its
+own capability; revoking grants does not disarm you.
 
-The cross-space edges live in a fixed kernel ledger rather than in `CapSpace`,
-because `CapSlot.parent` is a slot index within *one* space and cannot express
-them. The two mechanisms compose: the ledger walks between spaces,
-`revoke_subtree` finishes the job inside each one.
+There is ONE mechanism, not two. The edges live in a kernel ledger (`deleg`)
+keyed by process IDENTITY, and inside each holder the capability is simply freed.
+This paragraph used to describe a second, intra-space half — a `parent` slot
+index and a revocation fixpoint in `CapSpace` — which the kernel never built:
+every write into a live capability space is an `insert`, so the fixpoint never
+iterated and `revoke_subtree` freed exactly one slot while its name said
+otherwise. `docs/nucleus-design.md` had already rejected that design
+("Rustproof needs none of it"); the code has now caught up with it.
 
 Three properties that mattered enough to get wrong once each:
 
@@ -344,11 +350,11 @@ compute loop with `DF=1` as a standing regression test.
 | **riscv-timer** ✅ | Preemptive on RISC-V too: the Sstc `stimecmp` supervisor timer (`scause` int code 5) routes to the same generic `preempt_trap`. Both arches now time-slice. | done |
 | **x86-M3a** ✅ | Cross-address-space IPC: `SEND`/`RECV` synchronous 1-word rendezvous with process blocking (`ProcState` + run-queue add/remove), deadlock detection. Generic; x86 + RISC-V. | done |
 | **x86-M3b** ✅ | A real `SPAWN` syscall (Untyped-cap-gated): load the embedded image into a fresh process at runtime, with full frame reclamation on `EXIT` (a spawn/exit cycle leaks no address space). Generic; x86 + RISC-V. | done |
-| **vram-quota** ✅ | Per-process VRAM quota + `FREE_VRAM`: `ALLOC_VRAM` refuses past the quota (`VRAM_QUOTA_FRAMES`); `FREE_VRAM(phys)` frees an owned frame (ownership-checked — a process can only free its own), returning quota; VRAM tracked separately from AS frames, both reclaimed on exit. Generic; x86 + RISC-V. | done |
+| **region-quota** ✅ | DMA memory IS a region — `ALLOC_VRAM`/`FREE_VRAM` were deleted as a strictly weaker duplicate of `MAKE_REGION` (they returned a raw host physical address into a bare list, with no id, no capability, no delegation and no revocation). A per-owner quota (`abi::REGION_QUOTA`) replaces the per-process frame quota, checked before a frame is taken or an id burned; the demo asserts the exact headroom, since `NO_MEM` alone cannot distinguish a quota refusal from a full table. Generic; x86 + RISC-V. | done |
 | **ipc-caps** ✅ | IPC endpoints are capabilities, not raw integers: `SEND`/`RECV` take a `CapId`, require `CapType::Endpoint` with `WRITE`/`READ` respectively, and rendezvous on the cap's *object* — so two processes meet only when their caps name the same endpoint, and an unauthorized caller gets `NO_CAP` without blocking. Generic; x86 + RISC-V. | done |
 | **role-caps** ✅ | Per-role grants: each process is loaded with only its role's capability table (producer = send-only, consumer = receive-only, worker = device/memory but no shared-endpoint authority), so the policy is least-authority rather than uniform. Generic; x86 + RISC-V. | done |
 | **cap-delegation** ✅ | `SPAWN` can hand the child one of the caller's own capabilities, attenuated: the child gets `caller_rights ∩ requested`, so a parent may narrow but never widen authority, and delegating a cap it does not hold refuses the spawn. Generic; x86 + RISC-V. | done |
-| **cap-revocation** ✅ | `REVOKE(cap)` destroys every capability derived from one of the caller's own, transitively across spaces (kernel ledger) and within each space (`revoke_subtree`); the caller keeps its own. Generic; x86 + RISC-V. | done |
+| **cap-revocation** ✅ | `REVOKE(cap)` destroys every capability derived from one of the caller's own, transitively across spaces via the `deleg` ledger (identity-keyed edges, exhaustively tested); the caller keeps its own. Capability spaces are flat — there is no intra-space derivation tree. Generic; x86 + RISC-V. | done |
 | **ipc-payload** ✅ | IPC messages carry a byte payload across address spaces (per-process kernel buffer; deferred copy-out when the receiver blocked first), with the copied length returned in a third register. Generic; x86 + RISC-V. | done |
 | **irq-delivery** ✅ | Device interrupts delivered to user processes as capability-gated authority: `CapType::Irq` + `POLL_IRQ`, counted per line, invisible without the capability, dropped on revocation. Generic; x86 + RISC-V. | done |
 | **fault-isolation** ✅ | A user-mode fault kills the faulting process (frames reclaimed, ledger spliced, slot freed) and the scheduler carries on; kernel faults stay fatal. Generic; x86 + RISC-V. | done |
@@ -444,7 +450,7 @@ and a probe in one says nothing about the other.
 
 Scrubbing on *release* would read as the more natural choice and is not enough on
 its own: a frame that has never been allocated still holds whatever the firmware
-left in it. Zeroing on the way out covers both. `ALLOC_VRAM` goes through it too —
+left in it. Zeroing on the way out covers both. Region allocation goes through it too —
 nothing can read VRAM today, since it is handed out as a physical address and
 never mapped, but a driver's purpose is to point a DEVICE at it, and a device
 reading a dead process's memory is the same disclosure with an extra step.

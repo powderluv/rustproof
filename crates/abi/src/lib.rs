@@ -301,8 +301,10 @@ pub mod sysno {
     /// survives the memory.
     pub const FREE_REGION: u64 = 16;
     /// Revoke every capability derived from `a0` (one of the caller's own capabilities) by
-    /// delegation, transitively — the children it was handed to, the grandchildren they
-    /// passed it on to, and anything derived from those within a holder's own space.
+    /// DELEGATION, transitively — the children it was handed to and the grandchildren they
+    /// passed it on to. Nothing is derived "within a holder's own space": capability spaces
+    /// here are flat, and this doc used to claim otherwise on the strength of a mechanism
+    /// the kernel never exercised.
     /// Returns `OK`, or `NO_CAP` if the caller does not hold `a0`. The caller keeps its own
     /// capability; only the derivations are destroyed.
     pub const REVOKE: u64 = 10;
@@ -361,4 +363,61 @@ pub trait HostEnv {
     fn write_user_bytes(&mut self, uptr: u64, bytes: &[u8]) -> bool;
     /// Copy from the caller's memory at `uptr` into `out`. Returns false on a bad pointer.
     fn read_user_bytes(&self, uptr: u64, out: &mut [u8]) -> bool;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rights lattice, exhaustively.
+    ///
+    /// `intersect` is what makes delegation safe: a child receives
+    /// `holder_rights ∩ requested`, so it can never hold a right its source lacked. Until
+    /// now that property was covered only as a side effect of testing `CapSpace::derive` —
+    /// a function the kernel never called on a live capability space, and which has been
+    /// deleted. The property itself is load-bearing in three places that DO run (`SPAWN`
+    /// delegation, `make_region`'s minted rights, and every `contains` gate), so it is
+    /// asserted directly here, over every pair.
+    #[test]
+    fn intersect_never_grants_a_right_either_side_lacks() {
+        for a in 0u8..8 {
+            for b in 0u8..8 {
+                let (x, y) = (CapRights(a), CapRights(b));
+                let got = x.intersect(y);
+                assert!(
+                    x.contains(got),
+                    "{a:#05b} ∩ {b:#05b} = {:#05b} exceeds the holder",
+                    got.0
+                );
+                assert!(
+                    y.contains(got),
+                    "{a:#05b} ∩ {b:#05b} = {:#05b} exceeds the request",
+                    got.0
+                );
+                assert_eq!(got, y.intersect(x), "intersect must be commutative");
+                assert_eq!(got.0, a & b);
+            }
+        }
+    }
+
+    #[test]
+    fn intersect_is_idempotent_and_bounded_by_none_and_all() {
+        for a in 0u8..8 {
+            let x = CapRights(a);
+            assert_eq!(x.intersect(x), x);
+            assert_eq!(x.intersect(CapRights::ALL), x);
+            assert_eq!(x.intersect(CapRights::NONE), CapRights::NONE);
+            assert!(CapRights::ALL.contains(x));
+            assert!(x.contains(CapRights::NONE));
+        }
+    }
+
+    #[test]
+    fn contains_is_subset_not_overlap() {
+        // The gate is "holds every requested right", not "holds any of them" — a capability
+        // with READ alone must not pass a check for READ|WRITE.
+        assert!(!CapRights::READ.contains(CapRights(CapRights::READ.0 | CapRights::WRITE.0)));
+        assert!(CapRights::ALL.contains(CapRights::WRITE));
+        assert!(!CapRights::WRITE.contains(CapRights::READ));
+    }
 }

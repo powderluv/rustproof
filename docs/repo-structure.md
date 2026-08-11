@@ -53,7 +53,8 @@ rustproof/
 │   │
 │   ├── capabilities/             # lib: capability system (CNode, rights, derivation tree)
 │   │   ├── src/lib.rs             #   Cap, CapRights, CapType; verified derive/revoke/mint
-│   │   └── proofs/derivation.rs   #   proof: authority monotonicity (child ⊑ parent)
+│   │   └── (no proofs/ yet — authority monotonicity is asserted exhaustively over the
+│   │       rights lattice in crates/abi's tests; there is no derivation tree to prove)
 │   │
 │   ├── vspace/                   # lib: x86_64 4-level page tables + address-space model
 │   │   ├── src/lib.rs             #   PML4/PDPT/PD/PT types, map/unmap, verified

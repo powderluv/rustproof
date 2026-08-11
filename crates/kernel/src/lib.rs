@@ -378,8 +378,8 @@ unsafe fn endpoint_at(proc: usize, cap: usize) -> deleg::Endpoint {
 ///
 /// Walks the cross-space ledger to a fixpoint: any delegation whose source has been revoked
 /// is itself revoked, which then makes ITS child a revoked source (grandchildren and deeper).
-/// Inside each holder, `revoke_subtree` removes the delegated capability along with anything
-/// that holder derived from it. The root capability itself is untouched — a process revoking
+/// Inside each holder the capability is simply freed: capability spaces here are flat, and
+/// the transitive part of revocation is the LEDGER's, not a per-space derivation tree. The root capability itself is untouched — a process revoking
 /// its own grants does not disarm itself.
 ///
 /// # Safety
@@ -399,7 +399,7 @@ unsafe fn revoke_delegations<A: Arch>(root_proc: usize, root_cap: usize) {
             // Only strip the capability while the slot still holds the same process.
             let p = proc_at(d.proc);
             if p.state != ProcState::Free && p.id == d.id {
-                p.caps.revoke_subtree(abi::CapId(d.cap));
+                p.caps.revoke(abi::CapId(d.cap));
                 // Revoking an endpoint capability must also end any rendezvous it is parked
                 // in: the IPC matcher keys on the blocked state's endpoint, not on present
                 // authority, so a process left blocked would go on sending or receiving
@@ -680,7 +680,7 @@ unsafe fn run_region_plan<A: Arch>(plan: &regions::Plan<PLAN_STEPS>) {
                             sl.cap_type == abi::CapType::Region && sl.object == region
                         });
                         if names_it {
-                            proc_at(p).caps.revoke_subtree(abi::CapId(c));
+                            proc_at(p).caps.revoke(abi::CapId(c));
                             forget_cap_edges(p, c);
                         }
                     }
@@ -1335,33 +1335,6 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
     );
     if let Some(p) = f0 {
         fa.free_frame(p);
-    }
-
-    // ---------------- capabilities: authority-monotonic derivation ----------------
-    {
-        let mut caps = capabilities::CapSpace::<64>::new();
-        let root = caps
-            .insert(abi::CapType::Untyped, abi::CapRights::ALL, 0xF00D)
-            .expect("root cap");
-        let child = caps
-            .derive(root, abi::CapRights::READ)
-            .expect("read-only child");
-        let escalated = caps
-            .derive(child, abi::CapRights::WRITE)
-            .and_then(|c| caps.lookup(c))
-            .map(|s| s.rights.0)
-            .unwrap_or(0);
-        let _ = writeln!(
-            con,
-            "\n[cap] READ-only child derives WRITE -> rights={:#05b} ({})",
-            escalated,
-            if escalated & abi::CapRights::WRITE.0 == 0 {
-                "WRITE dropped — authority-monotonic"
-            } else {
-                "ESCALATED?! (bug)"
-            }
-        );
-        caps.revoke_subtree(root);
     }
 
     // ---------------- ipc: synchronous endpoint ----------------
@@ -2071,6 +2044,17 @@ pub unsafe fn preempt_trap<A: Arch>(frame: *mut u64) -> ! {
 ///
 /// # Safety
 /// Single-CPU, non-reentrant: no other live borrow of the process or region tables.
+/// KNOWN GAP, recorded here because it is the natural place to look. `MAKE_REGION` mints a
+/// `Region` capability out of an `Untyped` one in the SAME space, and that relationship is
+/// NOT recorded in the delegation ledger. So revoking the `Untyped` does not destroy regions
+/// already made from it: memory obtained through a capability outlives the revocation of
+/// that capability. seL4 would call this retype-and-revoke and does destroy the children.
+///
+/// This is a real hole in the "revocation tears down the AUTHORITY it granted" doctrine, not
+/// a stylistic one. It is left open deliberately rather than papered over: closing it means
+/// recording a retype edge (`Untyped` -> `Region`, different type, different object) which
+/// the ledger's forest precondition and `deleg::Endpoint` do not currently express, and that
+/// is a design change rather than a patch.
 unsafe fn make_region<A: Arch>(owner: usize, pages: u64, rights: abi::CapRights) -> u64 {
     use abi::FrameAllocator as _;
     // Quota first, before a frame is taken or an id burned — a process at its limit must not

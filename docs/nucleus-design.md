@@ -135,6 +135,11 @@ This is the single most consequential structural decision, for two reasons:
 
 1. **Verified user code can't be sabotaged by the kernel.** A user thread whose safety proof assumes its stack/heap stay mapped would be unsound if the kernel could revoke a frame under it. Prohibiting revocation makes "the frames I hold stay mapped for my lifetime" a *kernel-guaranteed* premise that user proofs may rely on.
 2. **It deletes seL4's mapping database.** seL4 tracks a full capability-derivation tree (the CDT / mdb) precisely so `revoke` can recursively invalidate descendants; the CDT invariants are a large fraction of its proof. Rustproof needs none of it.
+   (Held to: `CapSpace` carried a vestigial `parent` index and a revocation fixpoint — a
+   miniature CDT — for a long time without the kernel ever building a non-flat space, so the
+   fixpoint never iterated and `revoke_subtree` freed exactly one slot while its name promised
+   otherwise. Deleted. Cross-space delegation is tracked by the `deleg` ledger, whose edges
+   carry process IDENTITY rather than a slot index.)
 
 Concretely, derivation is an **append-only forest**:
 
