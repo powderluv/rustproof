@@ -7,6 +7,11 @@
 
 /// `sstatus` — supervisor status (SPP bit 8 = prev priv, SUM bit 18 = S-access-to-U).
 pub const SSTATUS: u32 = 0x100;
+
+/// `scounteren` — which hardware counters U-mode may read. Left at 0 so `rdtime`,
+/// `rdcycle` and `rdinstret` trap from user mode: observing elapsed time is not
+/// authority this kernel hands out by default. x86 denies the same via `CR4.TSD`.
+pub const SCOUNTEREN: u32 = 0x106;
 /// `stvec` — supervisor trap-vector base address + mode.
 pub const STVEC: u32 = 0x105;
 /// `sscratch` — supervisor scratch register (holds the kernel trap stack while in U-mode).

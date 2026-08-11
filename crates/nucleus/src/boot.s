@@ -56,9 +56,17 @@ _start:
     movl $pml4, %eax
     movl %eax, %cr3
 
-    /* CR4.PAE = 1 */
+    /* CR4.PAE = 1 (0x20) | CR4.TSD = 1 (0x04)
+     *
+     * TSD makes `rdtsc` privileged. Without it every ring-3 process — including the
+     * least-authority producer, which holds one send-only endpoint capability and
+     * nothing else — has a free-running nanosecond clock that no capability gates.
+     * riscv denies the same observation by leaving `scounteren` clear, so without this
+     * the two arches disagreed about whether reading elapsed time is authority, and
+     * nothing asserted either. Denying is the reversible direction: a process that
+     * needs a clock can be given one deliberately. */
     movl %cr4, %eax
-    orl  $0x20, %eax
+    orl  $0x24, %eax
     movl %eax, %cr4
 
     /* EFER.LME = 1 */

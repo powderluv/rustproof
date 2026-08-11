@@ -463,3 +463,56 @@ and there it is not hypothetical: `MAP_REGION` installs a region's frames in the
 caller's own address space, and the demo's borrower reads every page of a
 delegated region at ring 3 today. Pointing a DEVICE at those frames, once a
 driver exists, is the same disclosure with one more step.
+
+
+## Time, and why the kernel has none
+
+A driver needs to bound a wait: *ask the device, give up if it never answers.* The obvious
+shapes are a deadline argument on `WAIT_IRQ` or a `GET_TIME` syscall. Neither was built, and
+the reason is worth recording, because "add a timeout" is the kind of thing that looks
+obviously right.
+
+The kernel already ends a wait exactly when the wait has become **unanswerable** — the
+capability was revoked, or the line is one it does not deliver — and those are facts only the
+kernel knows. "My device is slow" is not one of them. How slow is too slow is the driver's
+judgement, and a kernel deadline would be the kernel guessing on its behalf.
+
+And a bounded wait already composes from primitives that exist: poll the device line, block one
+tick on the timer line, repeat until a bound. `POLL_IRQ` on a timer capability returns elapsed
+ticks, and credits accrue even while the process is blocked on a *different* line. So the gap
+was never the mechanism — it was that **nothing in the tree performed the composition**, which
+by this project's own standard makes "a process can bound its wait" asserted rather than
+implemented. Both demos now do it, and the assertion takes three facts together, because any
+one of them alone passes for the wrong reason: it ended on its bound and not on a credit
+(`hit == 0`), it genuinely blocked (`ticks >= bound` — a process cannot manufacture timer
+credits by spinning), and the quiet line is still untouched (so a byte did not race in and
+answer the wait).
+
+**Revisit when** a Linux-personality server needs `clock_gettime`/`nanosleep`, or at the first
+real driver bring-up, or if that composition ever surfaces a kernel bug — that last one would
+be evidence *for* the deadline. A microsecond-denominated ABI would also need a better timer
+than the PIT.
+
+### Observing time is not authority here
+
+Reading elapsed time is **denied to ring 3 by default**, and the two arches required different
+work to say so — one of them cannot fully say it at all.
+
+x86 now sets `CR4.TSD`, so `rdtsc` traps. Before this it did not: every process, including the
+least-authority producer holding one send-only endpoint capability, had a free-running
+nanosecond clock that no capability gated.
+
+RISC-V clears `scounteren`, which denies `rdcycle` and `rdinstret` — but **not** `rdtime`, and
+that was measured rather than assumed. A differential probe settled it: `rdcycle` traps while
+`rdtime` returns, so `scounteren` is being honoured and `rdtime` is emulated *above us*. The
+illegal-instruction trap is not delegated to S-mode; it lands in M-mode firmware (OpenSBI),
+which services the read and returns to U-mode without this kernel ever seeing it. Only
+`mcounteren` could deny it, and we do not run in M-mode.
+
+Both demos assert this the only way a denial like it can be asserted: a process reads the
+counter as its final act and must be **killed** for it. A process that is allowed to read it
+simply lives, so there is no failure line to print — the runners grep for the kill instead, and
+removing either denial fails the run.
+
+Consuming CPU time is a separate question and stays open: it is what an MCS `SchedContext`
+would make capability-controlled.

@@ -237,7 +237,13 @@ impl Arch for Riscv {
         // Enable the Sstc supervisor timer + arm the first tick. Ticks fire in U-mode
         // (an S-interrupt is delivered there regardless of sstatus.SIE); the kernel runs
         // with SIE clear, so the handler stays non-reentrant.
-        unsafe { timer::init() }
+        unsafe {
+            // Deny U-mode the hardware counters explicitly rather than relying on the
+            // reset value. `rdtime`/`rdcycle`/`rdinstret` now trap from ring 3, matching
+            // what `CR4.TSD` does on x86 — see crates/nucleus/src/boot.s.
+            csr::write::<{ csr::SCOUNTEREN }>(0);
+            timer::init()
+        }
     }
 
     unsafe fn idle() -> ! {

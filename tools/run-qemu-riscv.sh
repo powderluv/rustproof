@@ -97,6 +97,14 @@ if echo "$OUT" | grep -q '(bug)'; then
     exit 1
 fi
 
+# The clock denial is asserted by a process being KILLED, so the guest cannot print a failure
+# line for it — a process that is allowed to read the counter simply lives. Require the kill.
+if [ "${PROVOKE_FAULT:-0}" != "1" ] &&
+    ! echo "$OUT" | grep -qE '\[kernel\] proc [0-9]+ killed: (general protection fault|illegal instruction)'; then
+    echo "RESULT: FAIL — ring 3 was not refused the hardware clock (CR4.TSD / scounteren)"
+    exit 1
+fi
+
 # A frame leak makes the kernel exit early, so check it BEFORE anything else: otherwise the
 # first unrelated check to fail gets the blame and the real cause scrolls past.
 if echo "$OUT" | grep -q '\[mm\] LEAK:'; then

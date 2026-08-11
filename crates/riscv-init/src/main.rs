@@ -143,8 +143,15 @@ fn exit(code: u64) -> ! {
 /// How many times the interrupt helper blocks before giving up and exiting. It has to
 /// outlast every other process, because the kernel only parks once nothing else is
 /// runnable — a helper that finishes first would prove nothing. Each iteration costs one
-/// timer period, so this is a duration in ticks, not a workload -- the Sstc timer runs at ~400 Hz, so this is ~3 s, chosen to
-/// outlast the rest of the demo with margin rather than to hit a particular count.
+/// timer period, so this is a duration rather than a workload -- the Sstc timer runs at
+/// ~400 Hz, making 300 iterations about 0.75 s. (It said "~3 s" here, copied from the x86
+/// twin where 300 ticks at 100 Hz really is ~3 s. Same constant, different clock, and the
+/// comment travelled while the arithmetic did not.)
+///
+/// Note also that an iteration is a WAKEUP, not a tick: `WAIT_IRQ` returns a BATCHED credit
+/// count, so 300 wakeups is at least 300 ticks and possibly many more. Any duration read off
+/// this number is a lower bound with no upper end. It is chosen to outlast the rest of the
+/// demo with margin rather than to hit a particular time.
 const IRQ_HELPER_WAITS: u64 = 300;
 
 /// Busy-compute for ~`iters` iterations without making any syscall, so only the supervisor
@@ -1038,6 +1045,48 @@ fn compute(id: u64) -> ! {
         debug_write(b"irq: one line's count leaked into the other (bug)\n");
     }
 
+    // A BOUNDED wait, built from what already exists rather than from a new syscall.
+    // The kernel deliberately has no deadline and no clock call: a wait it cannot answer it
+    // already ends by itself, and "my device is slow" is the driver's judgement, not the
+    // kernel's. What the driver needs is the COMPOSITION — poll the device line, sleep one
+    // timer tick, repeat until a bound — and until now nothing in this tree performed it, so
+    // "a process can bound its wait" was asserted rather than demonstrated.
+    //
+    // Deliberately placed BEFORE the console-blocking line the harness watches for, so the
+    // byte cannot arrive during it: a bound that ends because the device answered would prove
+    // nothing, and that is the whole theatre risk here.
+    let _ = poll_irq(6); // drain the stopwatch first, or the first sleep returns instantly
+    let bound = 30u64;
+    let mut ticks = 0u64;
+    let mut hit = 0u64;
+    while ticks < bound {
+        let b = poll_irq(7);
+        if b > 0 && b != syserr::NO_CAP {
+            hit = b;
+            break;
+        }
+        let n = wait_irq(6);
+        if n == 0 || n == syserr::NO_CAP {
+            break;
+        }
+        // SUM the credits, do not count iterations: WAIT_IRQ returns a BATCH, so one wakeup
+        // can be several ticks. Counting iterations would understate the time waited.
+        ticks = ticks.wrapping_add(n);
+    }
+    tag(id);
+    // Three facts, and it takes all three. That it returned proves nothing (an answered wait
+    // returns identically). `hit == 0` says it ended on the bound rather than on a credit;
+    // `ticks >= bound` is the independent witness that it really blocked, since a process
+    // cannot manufacture timer credits by spinning; and the console line must still be
+    // untouched, which fails loudly if a byte raced in and answered the wait instead.
+    if hit == 0 && ticks >= bound && poll_irq(7) == 0 {
+        debug_write(b"wait: bounded a wait on a quiet line, gave up after ");
+        dbg_dec(ticks);
+        debug_write(b" ticks\n");
+    } else {
+        debug_write(b"wait: the bounded wait did not end on its bound (bug)\n");
+    }
+
     // Now block on the CONSOLE line. Nothing the kernel does can end this wait: the timer
     // fires throughout and cannot credit it, so the kernel parks, wakes on each tick with
     // nobody to run, and parks again -- until a byte actually arrives from outside. Every
@@ -1107,6 +1156,27 @@ fn child(id: u64) -> ! {
             } else {
                 debug_write(b"share: a WRITABLE loan would not take our write (bug)\n");
             }
+            // Time is not ours to read — as far as this kernel can enforce it.
+            //
+            // `scounteren = 0` denies U-mode the hardware counters, and `rdcycle` below
+            // duly traps and kills us: being killed IS the assertion, since a process
+            // that survives goes on to print the line after it.
+            //
+            // `rdtime` is different and worth stating, because it was measured rather
+            // than assumed: it returns a value in U-mode ANYWAY. The illegal-instruction
+            // trap is not delegated to S-mode, so it lands in M-mode firmware (OpenSBI),
+            // which emulates the read and returns to U-mode without this kernel ever
+            // seeing it. A differential probe proved it — `rdtime` returns while
+            // `rdcycle` traps, so `scounteren` is being honoured and `rdtime` is simply
+            // emulated above us. S-mode cannot deny it; only `mcounteren` could, and we
+            // do not run in M-mode. x86 has no equivalent hole: `CR4.TSD` is ours to set.
+            tag(id);
+            debug_write(b"clock: rdtime is readable in U-mode (M-mode firmware emulates it)\n");
+            // SAFETY: deliberately privileged; the kernel is expected to kill us here.
+            unsafe { core::arch::asm!("rdcycle {t}", t = out(reg) _) };
+            tag(id);
+            debug_write(b"clock: U-mode read a hardware counter unpunished (bug)\n");
+
             // Owner-identity, isolated. FREE_REGION now also demands WRITE, so the READ-only
             // borrower below is refused by the RIGHTS gate and proves nothing about who owns
             // the region. This borrower HAS write, so only the owner check can stop it —
