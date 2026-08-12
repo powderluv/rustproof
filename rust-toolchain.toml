@@ -1,9 +1,13 @@
 # Exec/boot build toolchain. The nucleus boot spike builds on STABLE Rust against
 # the built-in `x86_64-unknown-none` target (naked/inline asm and no_std are stable).
 #
-# The Verus PROOF track will pin its own nightly (docs/verification.md +
-# toolchain/verus.lock); that pin is intentionally NOT set here yet, so the boot
-# inner-loop builds on a released stable toolchain with no extra download.
+# The Verus PROOF track does NOT need a nightly, and does not read this file.
+# Measured 2026-08-11: Verus 0.2026.08.09 pins STABLE 1.97.1 and carries its own
+# rustc driver, so it ignores this rustup pin entirely. It also cannot share a
+# build with it -- rustc 1.95.0 rejects a Verus-built rlib with E0514 -- so any
+# in-tree `verus!{}` would move this whole repo to 1.97.1. In-tree adoption was
+# DECLINED on 2026-08-11; see the decision block at the top of
+# docs/verification.md. `toolchain/verus.lock` remains an unfilled placeholder.
 [toolchain]
 channel = "1.95.0"
 targets = ["x86_64-unknown-none"]

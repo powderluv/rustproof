@@ -1,8 +1,93 @@
 # docs/verification.md — Verus verification ladder & proof-engineering plan
 
-Status: design sketch, nothing here verifies yet. The Verus fragments below are **illustrative** — they name the right idioms, specs, and proof obligations so a Verus-literate engineer can start typing, but they will not pass `verus` as-is (missing lemmas, trigger tuning, and vstd glue are elided). Treat this as the map, not the territory.
+## DECISION 2026-08-11 — Verus is DECLINED for now, on measured grounds
+
+Nothing in this tree verifies, and after actually running the tool, nothing should yet. Everything
+below in this line-item list was measured on 2026-08-11, not estimated.
+
+1. **Verus works here.** Release `0.2026.08.09.92f466f`. It pins **stable 1.97.1**, not a nightly —
+   the claim in `rust-toolchain.toml` that the proof track "will pin its own nightly" was false.
+   It ships its own driver and ignores this repo's rustup pin entirely.
+2. **`no_std` is not an obstacle.** A `no_std` crate verifies with `--no-vstd` (3/3), and `vstd`'s
+   `Seq` is usable from `no_std` as well.
+3. **Unbounded proofs are within reach.** "insert disturbs no neighbouring slot", over an
+   arbitrary-length `Seq` rather than the `N ∈ {2,4,8}` the tests sample, verified 4/4 in about
+   twenty lines and two lemmas.
+4. **But adoption is not incremental — it is a whole-repo toolchain move.** `rustc 1.95.0` cannot
+   load a Verus-built rlib: `error[E0514]: found crate verus_builtin compiled by an incompatible
+   version of rustc`. Any crate containing a `verus!{}` block must be built by 1.97.1, and every
+   TCB crate links into the bare-metal kernel. There is no feature gate that avoids this; the
+   alternative — a second plain-Rust copy behind a `cfg` — is two copies of the TCB, which is the
+   drift trap this project has paid for before.
+5. **The decisive finding: a Verus pass count is not a measure of content.** Replacing every
+   `ensures` clause in a candidate spec with `ensures true` produced *byte-identical* output —
+   `21 verified, 0 errors`. "N obligations verified" is exactly the kind of number this project
+   calls theatre. Any future adoption must gate on **spec mutation** (corrupt the `ensures`, watch
+   it go red), never on a pass count.
+6. **The three candidate targets did not survive scrutiny.** `CapSpace<N>` "for all N" is a
+   property of the *type*: the tree monomorphises one N (16) and the tests sample {2,4,8}, so the
+   real gap is "the deployed N is untested" — a test-matrix line, not a proof. `mm` frame
+   conservation was falsified: `free` has four consumers tree-wide, all of them log lines or the
+   leak verdict, while allocation reads the *bitmap*; a divergent counter is a wrong log line, not
+   a double-mapped page. Proposed mutants for both die under the existing suite already.
+
+**Reversal condition.** Revisit when a property is (a) load-bearing for isolation, (b) beyond
+exhaustive search, and (c) *not* already killed by a host mutation. `deleg`'s revocation closure
+over arbitrary ledgers is the standing candidate — no one has yet run a spec-mutation test against
+it, so it is untried rather than rejected. The first real IO page-table code would also qualify.
+
+What was done instead, the same day: `crates/mm` gained `partition_holds_for_every_dma_top`, which
+widens the one axis every other `mm` test held constant. See §0 below.
+
+---
+
+Status of the rest of this document: **design sketch for a system that does not exist yet.** The
+ladder below is keyed to milestones M0–M5 (VFIO → vIOMMU → bare-metal AMD-Vi) that have no code in
+this tree — `crates/iommu-amdvi` is seven lines of doc comment with no functions, no tests, and no
+dependents, and `toolchain/verus.lock` / `toolchain/fetch-verus.sh` are placeholders (`REPLACE_ME`,
+`exit 1`). Read §1 onward as intent, not as a description of the repo.
 
 Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DMA-containment**. GPU compute correctness is permanently out of scope. The C++ `lite::` gfx1201 driver and its GPUVM are **untrusted user processes** that emit only IOVAs; the nucleus owns the AMD-Vi IOMMU tables. Under plain VFIO (M0–M2) the *host* programs the physical IOMMU, so the nucleus IOMMU proof is not load-bearing until **M3 (emulated vIOMMU)** and **M4 (bare-metal AMD-Vi)**.
+
+---
+
+## 0. What is actually checked today (and how to prove the checks can fail)
+
+Assurance in this tree is host tests plus one scripted QEMU boot per arch. Several of the host
+suites are *exhaustive searches* rather than samples, and where a search covers its whole universe
+it is a proof — that is why Verus buys nothing on those axes. The honest qualifier is that a search
+proves nothing about an axis its universe holds constant, which is a defect this project has found
+repeatedly, and the searches below still hold real axes constant:
+
+| Crate | Search | Axis still held constant |
+|---|---|---|
+| `abi` | all 64 rights pairs over the 3-bit lattice | `CapRights` is representationally 256-valued; `0..8` exhausts it only because the sole non-constant construction site masks `& 0b111`. Nothing pins that mask. |
+| `deleg` | all forests of ≤3 edges on 6 endpoints (15,666 checks) | edge count (kernel ledger holds 16); insertion order |
+| `runstate` | every 3-slot state vector × 5 predicates (3,645) | **slot count — the kernel calls `classify` on a 6-slot vector (`MAX_PROCS`)** |
+| `regions` | 1,296 configs × 7 plans (9,072) | `S=2` vs kernel `SHARE_SLOTS=4`; holders 1–2 have fixed identities |
+| `capabilities` | rights bits only, inside `CapSpace<2>` | deployed `N` is 16; tests sample {2,4,8} |
+| `mm` | `partition_holds_for_every_dma_top` (1,040 configs) | alloc/free *sequences* are drain-shaped, not arbitrary |
+
+Every crate above is generic over an `N` that the kernel monomorphises to a value the tests never
+instantiate. That is a test-matrix gap, and it is cheap; it is not an argument for a proof
+assistant.
+
+**The `mm` test, and why it is not theatre.** Before it existed, every `BitmapAllocator::new` call
+in the suite passed `DMA_TOP = 16 MiB`, which pins two axes at their most forgiving values at once:
+`dma_top` is page-aligned, so the round-up in `general_floor` is a no-op, and `general_floor` lands
+on a bitmap *word* boundary, so `first_free`'s `start_bit` mask is a no-op. Both are load-bearing
+off those values. Measured: with either of these single-expression mutations applied, the other 14
+`mm` tests stay **green**, and the new test is the only one that fails.
+
+```
+mm/src/lib.rs:76   ((dma_top + PAGE_SIZE - 1) >> PAGE_SHIFT)  ->  (dma_top >> PAGE_SHIFT)
+mm/src/lib.rs:215  word | ((1u64 << start_bit) - 1)           ->  word
+```
+
+Either mutant hands a device-reachable frame to the general pool. The failure is concrete rather
+than abstract — `dma_top=0x200001: general allocation 0x200000 is device-reachable` — i.e. a
+`dma_top` one byte off a page boundary is enough. Re-run the two mutations rather than trusting
+this paragraph; that is the point of naming them.
 
 ---
 
@@ -14,9 +99,9 @@ Each rung is a machine-checked property of the nucleus. Lower rungs are lemmas t
 |----|----------|-----------------|-----------|-------|
 | **V1** | Nucleus-core memory safety: no UB in safe nucleus code; every `unsafe` sits behind a trusted, spec'd boundary | M1 | Verus default (ownership + `PointsTo` permissions), big-lock | not started |
 | **V2** | `reachable(AS) == capabilitied(AS)` for every address space, **preserved** across `map/unmap/grant/revoke` | M2 | Flat permission map + ghost `path`/`subtree` fields to de-recursify the radix tree | not started |
-| **V3** | `dma_reach(GPU_domain) ⊆ authorized(GPU_domain)` — the crux | M3, hardened M4 | Same flat-map machinery over the **IO** page tables; `authorized` = GPU domain's frame caps | not started |
-| **V4** | DTE-config invariant: for the GPU's BDF, `V=1 ∧ TV=1 ∧ translation-on ∧ bypass-off ∧ ATS-off ∧ root==our-tables` | M3/M4 | Struct invariant on the trusted DTE model; bridges V3 to hardware axioms A1/A3 | not started |
-| **V5** | Reclaim / stale-IOTLB safety: a frame is returned to the free pool only after it is unmapped from **all** IO/CPU tables **and** the IOTLB/DTE cache is invalidated to completion | M4 | Ghost "in-flight invalidation" token; frame free-list disjoint from any live `dma_reach` | not started |
+| **V3** | `dma_reach(GPU_domain) ⊆ authorized(GPU_domain)` — the crux | M3, hardened M4 | Same flat-map machinery over the **IO** page tables; `authorized` = GPU domain's frame caps | **no subsystem exists** (`crates/iommu-amdvi` is a 7-line stub) |
+| **V4** | DTE-config invariant: for the GPU's BDF, `V=1 ∧ TV=1 ∧ translation-on ∧ bypass-off ∧ ATS-off ∧ root==our-tables` | M3/M4 | Struct invariant on the trusted DTE model; bridges V3 to hardware axioms A1/A3 | **no subsystem exists** (same stub) |
+| **V5** | Reclaim / stale-IOTLB safety: a frame is returned to the free pool only after it is unmapped from **all** IO/CPU tables **and** the IOTLB/DTE cache is invalidated to completion | M4 | Ghost "in-flight invalidation" token; frame free-list disjoint from any live `dma_reach` | **no subsystem exists** (no IO page tables, no IOTLB code) |
 | **V6** | No IPC authority amplification: a message transfer never yields the receiver a capability the sender did not already hold (grant is monotone-down) | M2/M5 | Cap-set monotonicity lemma over the IPC transition relation | not started |
 | **V7** | *(optional)* host-submission well-formedness: ring/doorbell descriptors the nucleus forwards are bounds- and type-checked | M5 | Bounded structural predicate; mostly Kani-territory | optional |
 
@@ -34,202 +119,26 @@ If big-lock throughput ever bites, the escape hatch is per-address-space locks w
 
 ---
 
-## 2. Actual Verus specs for the three that matter (V2, V3, V4)
+## 2. Specs for V2/V3/V4 — REMOVED 2026-08-11
 
-Shared ghost vocabulary (in `nucleus/src/model/mod.rs`, `spec`-only, compiled away):
+This section held ~200 lines of illustrative Verus for V2 (reachable == capabilitied), V3
+(DMA-reach ⊆ authorized) and V4 (the DTE-config invariant). It has been deleted rather than
+updated, for two reasons stated in the section's own former preamble and in the DECISION block
+above:
 
-```rust
-verus! {
+- It **did not verify**, and said so: "they will not pass `verus` as-is (missing lemmas, trigger
+  tuning, and vstd glue are elided)". Unverifiable code in a document is indistinguishable from
+  verified code to a reader skimming for status, and this project has already paid a full design
+  cycle for exactly that confusion (`CapType::Untyped` importing seL4's contract by name alone).
+- It specified **page tables and IOMMU device tables that do not exist in this tree**. V3 and V4
+  are properties of `crates/iommu-amdvi`, which is seven lines of doc comment with no functions,
+  no tests, and no dependents. A spec for absent code cannot be wrong, which is precisely what
+  makes it worthless: there is nothing it can fail against.
 
-pub struct Frame { pub base: nat, pub order: nat }   // 2^order * 4KiB, base 4KiB-aligned
-pub struct VPage(pub nat);                            // 4KiB virtual page index
-pub struct IOVA(pub nat);                             // device virtual address
-pub struct PAddr(pub nat);
+When there is IO page-table code, write the spec against that code, and gate it on spec mutation
+(§DECISION item 5) rather than on an obligation count. Until then the honest statement is that
+these three rungs are unstarted, which the table in §1 now says plainly.
 
-pub struct Rights { pub r: bool, pub w: bool, pub x: bool }
-
-// Every 4KiB physical page covered by a frame.
-pub open spec fn frame_pages(f: Frame) -> Set<PAddr> {
-    Set::new(|pa: PAddr| f.base <= pa.0 < f.base + (pow2(f.order) * 4096))
-}
-
-}
-```
-
-### 2.1 V2 — reachable == capabilitied, preserved across map/unmap
-
-The **flat permission map** is the whole trick. Instead of a `spec fn reachable(tree)` that recurses over four levels of radix nodes (which forces `decreases` on tree height and makes every map/unmap proof re-walk the tree), we keep a ghost `Map<VPage, Mapping>` that *is* the set of leaf mappings, and prove **once** that the concrete radix tree refines it.
-
-```rust
-verus! {
-
-pub struct Mapping { pub frame: Frame, pub rights: Rights }
-
-pub struct AddrSpaceModel {
-    pub mappings: Map<VPage, Mapping>,   // flat: the leaves, de-recursified
-    pub caps: Set<Frame>,                // frames this AS legitimately holds
-}
-
-// THE V2 INVARIANT.
-pub open spec fn reachable_is_capabilitied(m: AddrSpaceModel) -> bool {
-    forall|vp: VPage| #[trigger] m.mappings.dom().contains(vp)
-        ==> m.caps.contains(m.mappings[vp].frame)
-}
-
-// map preserves V2 iff you already own the frame and aren't clobbering.
-pub proof fn lemma_map_preserves(m: AddrSpaceModel, vp: VPage, map: Mapping)
-    requires
-        reachable_is_capabilitied(m),
-        m.caps.contains(map.frame),               // must hold the cap FIRST
-        !m.mappings.dom().contains(vp),           // no silent overwrite
-    ensures
-        reachable_is_capabilitied(AddrSpaceModel {
-            mappings: m.mappings.insert(vp, map), ..m
-        }),
-{ }  // Z3 closes: only key `vp` is new, its frame is in `caps` by requires.
-
-// revoke removes a frame from caps; V2 forces every mapping of it to be gone.
-pub proof fn lemma_revoke_requires_unmapped(m: AddrSpaceModel, f: Frame)
-    requires
-        reachable_is_capabilitied(m),
-        forall|vp: VPage| m.mappings.dom().contains(vp) ==> m.mappings[vp].frame != f,
-    ensures
-        reachable_is_capabilitied(AddrSpaceModel { caps: m.caps.remove(f), ..m }),
-{ }
-
-}
-```
-
-The concrete side — the radix tree carries **ghost linking fields** so each node's invariant is *local* (references only its children one level down), never the whole tree:
-
-```rust
-verus! {
-
-// One 512-entry node of the concrete 4-level tree.
-pub struct PtNode {
-    pub entries: [PtEntry; 512],
-    pub ghost path: Ghost<Seq<u16>>,       // 9-bit indices from root to here
-    pub ghost subtree: Ghost<Set<Frame>>,  // EXACTLY the leaves reachable below
-}
-
-// Local node invariant: subtree = union of children's subtrees (one hop).
-pub open spec fn node_inv(node: PtNode, level: nat, children: Map<u16, PtNode>) -> bool {
-    &&& forall|i: u16| present(node.entries[i as int]) && level > 0 ==>
-            children.dom().contains(i)
-            && children[i].path@ == node.path@.push(i)
-            && children[i].subtree@.subset_of(node.subtree@)
-    &&& forall|i: u16| present(node.entries[i as int]) && level == 0 ==>   // leaf
-            node.subtree@.contains(leaf_frame(node.entries[i as int]))
-}
-
-}
-```
-
-The **refinement lemma** — proved once, by induction on `level` with `decreases 4 - level` — establishes `root.subtree@ == flatten(mappings)`, i.e. the flat map faithfully models the tree. After that, `map_page`/`unmap_page` reason **only** against the flat map (constant work per op) and cite the refinement lemma to update the concrete tree. This is the Atmosphere technique verbatim: pay the recursion tax once, then stay flat.
-
-Exec entry point:
-
-```rust
-verus! {
-impl AddrSpace {
-    pub fn map_page(&mut self, vp: VPage, frame: Frame, rights: Rights)
-        requires
-            old(self).inv(),                                  // includes V2
-            old(self).g@.caps.contains(frame),
-            !old(self).g@.mappings.dom().contains(vp),
-        ensures
-            self.inv(),
-            self.g@.mappings == old(self).g@.mappings.insert(vp, Mapping{frame, rights}),
-    {
-        // 1. walk/allocate L3..L0 nodes (updates ghost path on each new node)
-        // 2. write the leaf PTE (unsafe MMIO/DRAM store, behind trusted stub §3)
-        // 3. proof: lemma_map_preserves + refinement lemma re-link subtree ghosts
-    }
-}
-}
-```
-
-### 2.2 V3 — DMA-reach ⊆ authorized (the crux, load-bearing at M3/M4)
-
-Structurally identical to V2 but over the **IO** page tables the nucleus owns for the GPU domain. GPUVM (untrusted) hands the device IOVAs; the device DMAs through them; AMD-Vi translates via *our* tables. The theorem: whatever the untrusted stack does, the device cannot reach a physical page outside the GPU domain's cap set.
-
-```rust
-verus! {
-
-pub struct IommuDomainModel {
-    pub leaves: Map<IOVA, IoLeaf>,    // flat IO leaves (same de-recursify trick)
-    pub table_frames: Set<Frame>,     // frames holding the IO page tables themselves
-}
-pub struct IoLeaf { pub frame: Frame, pub rights: Rights, pub present: bool }
-
-pub open spec fn translate(d: IommuDomainModel, iova: IOVA) -> Option<PAddr> {
-    if d.leaves.dom().contains(iova) && d.leaves[iova].present {
-        Some(pa_of(d.leaves[iova].frame, iova))
-    } else { None }
-}
-
-// Everything the device can physically touch through the IOMMU.
-pub open spec fn dma_reach(d: IommuDomainModel) -> Set<PAddr> {
-    Set::new(|pa: PAddr| exists|iova: IOVA| #[trigger] translate(d, iova) == Some(pa))
-}
-
-// THE V3 INVARIANT (with the self-protection clause).
-pub open spec fn dma_confined(d: IommuDomainModel, authorized: Set<PAddr>) -> bool {
-    &&& dma_reach(d).subset_of(authorized)
-    // the IOMMU's own tables must be UNREACHABLE by the device it governs,
-    // else a compromised GPUVM could DMA-rewrite its own translations:
-    &&& forall|f: Frame| d.table_frames.contains(f)
-            ==> frame_pages(f).disjoint(dma_reach(d))
-}
-
-// Installing a mapping keeps confinement iff the frame is authorized.
-pub proof fn lemma_iommu_map_confined(
-    d: IommuDomainModel, iova: IOVA, leaf: IoLeaf, authorized: Set<PAddr>)
-    requires
-        dma_confined(d, authorized),
-        frame_pages(leaf.frame).subset_of(authorized),   // ONLY authorized frames
-        leaf.present,
-    ensures
-        dma_confined(IommuDomainModel { leaves: d.leaves.insert(iova, leaf), ..d },
-                     authorized),
-{ /* insert adds only pa's already in `authorized`; disjointness preserved */ }
-
-}
-```
-
-**Why this is load-bearing and where.** The nucleus is the *sole writer* of `leaves`. Every write goes through an exec `iommu_map` whose `requires` is `frame_pages(leaf.frame).subset_of(authorized)`, and `authorized` is derived from the GPU domain's capability set (tied back to V2's `caps`). So a fully compromised `lite::`/GPUVM — feeding arbitrary IOVAs, arbitrary descriptors — still cannot enlarge `dma_reach` beyond `authorized`. At M0–M2 the host IOMMU already enforces this, so the proof is "just" future-proofing; at **M3** (we emulate the vIOMMU) and **M4** (we drive real AMD-Vi) it is the *only* thing standing between the GPU and other guests' RAM.
-
-### 2.3 V4 — DTE-config invariant (bridges V3 to silicon)
-
-V3 is a statement about our *model* of translation. It only corresponds to reality if the AMD-Vi Device Table Entry actually routes the device through those tables — translation on, no bypass, no ATS pre-translated shortcut. V4 is the struct invariant that makes that link, and it is exactly where hardware axioms A1/A3 (§4) get consumed.
-
-```rust
-verus! {
-
-pub enum PagingMode { Passthrough, Level4, Level5 }  // AMD-Vi Mode field
-
-pub struct Dte {
-    pub v: bool,               // entry Valid
-    pub tv: bool,              // Translation Valid (page tables present)
-    pub mode: PagingMode,      // must NOT be Passthrough
-    pub ats_enabled: bool,     // must be false
-    pub root_ptr: PAddr,       // must equal our domain root
-    // IntCtl/PASID/PRI fields modeled but pinned to "off" for the GPU BDF
-}
-
-pub open spec fn dte_confining(dte: Dte, domain_root: PAddr) -> bool {
-    &&& dte.v && dte.tv                       // valid + translating
-    &&& dte.mode != PagingMode::Passthrough   // translation ON, no identity/bypass
-    &&& !dte.ats_enabled                       // ATS OFF: no pre-translated TLPs
-    &&& dte.root_ptr == domain_root            // points at OUR owned tables
-}
-
-}
-```
-
-The device-table write path has `ensures dte_confining(self.dte@, self.domain_root@)`, and the M5 assurance case reads: *given A1 (hardware honors a confining DTE) and A3 (ATS-off blocks bypass), `dte_confining` + V3 ⇒ every physical request the gfx1201 emits lands in `authorized`.*
-
----
 
 ## 3. The unsafe stub and Kani (bug-finding, not proof)
 

@@ -636,4 +636,54 @@ mod tests {
         assert_eq!(f, PhysAddr(1 * MIB + 4 * 1024));
         assert!(a.alloc_dma_frame().is_none());
     }
+
+    /// The partition holds for EVERY `dma_top`, not just 16 MiB.
+    ///
+    /// The rest of this file passes `DMA_TOP = 16 MiB` to every `BitmapAllocator::new`,
+    /// which pins two axes at their most forgiving values: `dma_top` is page-aligned (so
+    /// the round-up in `general_floor` is a no-op) and `general_floor` lands on a bitmap
+    /// WORD boundary (so `first_free`'s `start_bit` mask is a no-op). Both are load-bearing
+    /// off those values. Mutation-checked: this test is the ONLY thing in the suite that
+    /// fails when line 76 drops `+ PAGE_SIZE - 1`, or when line 215 drops
+    /// `| ((1u64 << start_bit) - 1)`. Either mutant hands a device-reachable frame to the
+    /// general pool while the other 14 tests stay green.
+    #[test]
+    fn partition_holds_for_every_dma_top() {
+        let regions = synthetic_regions();
+        let mut top = 2 * MIB;
+        let mut n = 0;
+        while top <= 15 * MIB {
+            // deltas straddle a page boundary so `dma_top` is sometimes unaligned.
+            for delta in [0u64, 1, 2048, PAGE_SIZE, PAGE_SIZE + 8] {
+                let dma_top = top + delta;
+                let words = BitmapAllocator::bitmap_words_needed(&regions);
+                let mut a =
+                    BitmapAllocator::new(&regions, leak_bitmap(words), RESERVE_BELOW, dma_top);
+                for _ in 0..8 {
+                    if let Some(f) = a.alloc_frame() {
+                        assert!(
+                            f.as_u64() >= dma_top,
+                            "dma_top={:#x}: general allocation {:#x} is device-reachable",
+                            dma_top,
+                            f.as_u64()
+                        );
+                        n += 1;
+                    }
+                }
+                for _ in 0..8 {
+                    if let Some(f) = a.alloc_dma_frame() {
+                        assert!(
+                            f.as_u64() < dma_top,
+                            "dma_top={:#x}: arena frame {:#x} above dma_top",
+                            dma_top,
+                            f.as_u64()
+                        );
+                        n += 1;
+                    }
+                }
+            }
+            top += 20 * PAGE_SIZE;
+        }
+        assert!(n > 1000, "universe too small: {}", n);
+    }
 }

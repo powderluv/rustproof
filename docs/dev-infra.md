@@ -12,7 +12,7 @@ The nucleus lives in a new Cargo workspace, `rustproof/` (proposed `github.com/p
 
 ```
 rustproof/
-├── rust-toolchain.toml           # pins the nightly (must match Verus's bundled rustc — see §2.1)
+├── rust-toolchain.toml           # pins STABLE 1.95.0 (Verus does NOT read it — see §2.1)
 ├── verus-toolchain.toml          # pins verus release + z3 (our file, read by tools/verus-run)
 ├── Cargo.toml                    # [workspace]
 ├── .cargo/config.toml            # build-std flags + QEMU test runner (§1.1)
@@ -43,7 +43,7 @@ rustproof/
 
 | Thing | Pinned by | Why |
 |---|---|---|
-| rustc nightly | `rust-toolchain.toml` (`channel = "nightly-YYYY-MM-DD"`) | must equal the nightly Verus was built against (§2.1) |
+| rustc | `rust-toolchain.toml` (`channel = "1.95.0"`, STABLE) | Verus carries its own driver and ignores this pin; the two toolchains CANNOT share a build (E0514) — see §2.1 |
 | Verus + bundled Z3 | `verus-toolchain.toml` → a vendored `verus-<ver>-<os>.zip` (contains `verus`, `z3`, `rust_verify`) | Verus has no LTS; proof stability is version-locked (decision doc R5) |
 | Kani | `cargo kani --version` pinned in CI matrix | bounded model checker for the `hal/` stub |
 | QEMU | recorded in `tools/qemu-inner.sh` + the nightly-HW runner image; `qemu-system-x86_64 --version` asserted in CI | vIOMMU behaviour (§4) is version-sensitive |
@@ -153,7 +153,7 @@ Five jobs. Four run on ordinary GitHub-hosted (or self-hosted x86) Linux; one ru
 
 ### 2.1 The rustc/Verus toolchain coupling (read this first)
 
-Verus is a rustc *driver*: it ships and is locked to one specific nightly. The nucleus must build on **that same nightly** or you maintain two source-compatibility targets. So `rust-toolchain.toml`'s `channel` is chosen to equal the nightly of the pinned Verus release, and both the `build` job and the `proof` job use it. When we bump Verus (expect churn — decision doc R5), we bump the nightly in lockstep and re-green the whole matrix in one PR. `tools/verus-run` reads `verus-toolchain.toml`, unpacks the vendored `verus-<ver>` into a cached dir, and execs its `verus` with our source — CI never `curl`s a floating Verus.
+**Corrected 2026-08-11 — this paragraph asserted a nightly, and that was measured false.** Verus is a rustc *driver*, but the pinned release (0.2026.08.09) is locked to **stable 1.97.1**, not a nightly, and it does not consult `rust-toolchain.toml` at all. The real constraint is sharper than the one described here: `rustc 1.95.0` **cannot link a Verus-built rlib** (`error[E0514]`), so the nucleus and the proof track cannot share a build at different versions — adopting `verus!{}` in any crate moves the WHOLE repo to Verus's rustc. That cost is why in-tree adoption was declined; see the decision block atop docs/verification.md. `tools/verus-run` and the vendored-unpack flow below remain unbuilt.
 
 ### 2.2 Proof job — `verus` (pinned)
 
@@ -281,7 +281,7 @@ tools/repro-m0.sh
 
 **The M0 workload is the existing multi-dispatch test**, reused unchanged: the internal `multi_dispatch_test.cpp` launches a trivial `inc` kernel N times through the ROCr/`lite::` MES path, synchronizing each iteration (like torch's `.item()`), copies back, and prints `SURVIVED N dispatches; verify=PASS`. It is the smallest thing that proves the untrusted-driver-over-nucleus architecture physically dispatches a real wave — exactly the M0 exit criterion. The driver bring-up retry logic (KIQ activation is flaky across cold boots) is already encoded in the internal `run-multi-dispatch-test.sh`; port its retry loop into `tools/run-m0-workload.sh` but drive the reset via the BMC power-cycle, respecting the one-bring-up-per-POST reality.
 
-**Everything a repro depends on is pinned (§0):** rustc nightly, Verus+Z3, QEMU version, the libvirt XML, and the firmware-blob SHA-256 manifest. A repro that can't match `boot/firmware.sha256` refuses to run rather than silently using a different PSP/SMU/MES blob.
+**Everything a repro depends on is pinned (§0):** rustc (stable 1.95.0), Verus+Z3 (unbuilt), QEMU version, the libvirt XML, and the firmware-blob SHA-256 manifest. A repro that can't match `boot/firmware.sha256` refuses to run rather than silently using a different PSP/SMU/MES blob.
 
 **A portable smoke runner as the regression workload.** The internal `tri_os_smoke.py` is a portable PyTorch smoke runner used across the tri-OS effort; on the verified host it is the higher-level regression that a real ROCm workload still runs. `tools/run-tri-os-smoke.sh` invokes it in-guest against the SDK dist, e.g.:
 

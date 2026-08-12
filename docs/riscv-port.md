@@ -88,7 +88,8 @@ round-robin scheduler (see [`scheduling.md`](scheduling.md)).
 
 Stable Rust `1.95.0` + `rustup target add riscv64gc-unknown-none-elf` (tier-2, precompiled
 core/alloc — no build-std) + `qemu-system-riscv64`. Same "stable + built-in target" model
-as the x86 exec build; the Verus proof track's pinned nightly is orthogonal and shared.
+as the x86 exec build. (The Verus proof track needs no nightly — it pins stable 1.97.1 and is
+not in the tree; see docs/verification.md.)
 Build/boot: `tools/run-qemu-riscv.sh`.
 
 ## 6. Alternatives Considered
