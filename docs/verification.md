@@ -67,6 +67,29 @@ escalation in the boot grant tables, because the demo only exercises what a proc
 Seven host properties now cover the tables; each was mutation-checked against a distinct
 authority change.
 
+**What else the boot cannot see.** Rather than guess, the same probe was run against the
+kernel's authority gates one at a time, deleting the RIGHTS half of each and booting x86:
+
+| Gate | Boot verdict with the rights check deleted |
+|---|---|
+| IPC endpoint rights (`endpoint_of`) | FAIL — caught |
+| `SPAWN` requires `Untyped` + WRITE | FAIL — caught |
+| `holds_mmio` requires `Mmio` + READ | **PASS — invisible** |
+| `MAP_REGION` requires `Region` + READ | **PASS — invisible** |
+
+Two of four were vacuous on hardware while `grants_for` claimed otherwise in a comment. The
+grant tables *do* contain the discriminating capability — the worker holds an `Mmio` without
+READ — but the revocation teardown the demo checks runs in the CHILD, which holds no second
+`Mmio` at all. The case existed in the tables and was never reached. That is a sharper
+version of the recurring defect: not an axis held constant, but a case present in the fixture
+and unreachable by the scenario.
+
+The fix separates the DECISION from the process table: `caps_hold_mmio` / `caps_hold_irq` /
+`caps_hold_endpoint` / `caps_endpoint_object` are pure functions over a capability space, and
+the `unsafe fn`s reading `PROCS` are thin wrappers. That also collapsed a duplicate — the
+`WAIT_IRQ` credit path open-coded its own copy of the Irq check instead of calling it, so the
+two could drift and only one would be fixed.
+
 Assurance in this tree is host tests plus one scripted QEMU boot per arch. Several of the host
 suites are *exhaustive searches* rather than samples, and where a search covers its whole universe
 it is a proof — that is why Verus buys nothing on those axes. The honest qualifier is that a search
@@ -81,7 +104,7 @@ repeatedly, and the searches below still hold real axes constant:
 | `regions` | 10,368 configs × 7 plans, at `P=6`/`S=4`/`N=52` | at most 2 regions vs kernel `MAX_REGIONS=12`; owners ⊂ {A,B,C} |
 | `capabilities` | rights bits (in `CapSpace<2>`) + every slot of `CapSpace<16>` | slot CONTENTS are still hand-picked, not enumerated |
 | `mm` | `partition_holds_for_every_dma_top` (1,040 configs) | alloc/free *sequences* are drain-shaped, not arbitrary |
-| `kernel` | the boot grant tables (7 authority properties) | everything else in 2360 lines — this is a first foothold, not coverage |
+| `kernel` | boot grant tables + the authority predicates (12 properties) | everything else in ~2400 lines — a foothold, not coverage |
 
 **Closed 2026-08-11 — the deployed-shape gap.** Every crate above is generic over an `N`, and the
 kernel monomorphises each to a value the tests never instantiated: `CapSpace<16>`, `Ledger<16>`,

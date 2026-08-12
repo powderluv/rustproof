@@ -495,16 +495,8 @@ unsafe fn credit_irq<A: Arch>(irq: u64) {
         if proc_at(i).state == ProcState::Free {
             continue;
         }
-        let holds = {
-            let caps = &proc_at(i).caps;
-            (0..CAP_SLOTS).any(|c| {
-                caps.lookup(abi::CapId(c)).is_some_and(|s| {
-                    s.cap_type == abi::CapType::Irq
-                        && s.object == irq
-                        && s.rights.contains(abi::CapRights::READ)
-                })
-            })
-        };
+        // ONE copy of the Irq authority predicate. This site used to open-code a second.
+        let holds = caps_hold_irq(&proc_at(i).caps)(irq);
         if !holds {
             continue;
         }
@@ -749,18 +741,80 @@ unsafe fn destroy_regions_owned_by<A: Arch>(proc: usize, owner_id: u64) {
 }
 
 /// Does process `proc` still hold an `Irq` capability carrying `READ` for `line`?
+
+// ---------------------------------------------------------------- authority predicates
+//
+// The questions "does this hold authority for X" separated from "where the process table
+// lives". Both halves were previously fused into `unsafe fn`s reading `PROCS`, which made
+// them untestable off-hardware — and one of them was silently duplicated: the WAIT_IRQ
+// credit path open-coded a second copy of the Irq check rather than calling it, so the two
+// could drift and only one would ever be fixed.
+//
+// Measured, and the reason these are here: deleting the `READ` check from `holds_mmio`
+// leaves the QEMU boot completely GREEN. The grant tables give the worker an `Mmio` WITHOUT
+// READ precisely so that the rights half of this gate is exercised, but the revocation
+// teardown the demo checks runs in the CHILD, which holds no second `Mmio` at all -- so the
+// discriminating case exists in the tables and is never reached. The same is true of the
+// `Region` READ gate. A comment in `grants_for` claimed both were exercised on hardware;
+// they were not.
+
+/// Does this capability space hold any `Irq` capability for `line`, carrying READ?
+fn caps_hold_irq(caps: &capabilities::CapSpace<CAP_SLOTS>) -> impl Fn(u64) -> bool + '_ {
+    move |line| {
+        (0..CAP_SLOTS).any(|i| {
+            caps.lookup(abi::CapId(i)).is_some_and(|s| {
+                s.cap_type == abi::CapType::Irq
+                    && s.object == line
+                    && s.rights.contains(abi::CapRights::READ)
+            })
+        })
+    }
+}
+
+/// Does this capability space hold ANY `Mmio` capability carrying READ — i.e. any remaining
+/// authority to have the device window mapped at all?
+///
+/// The READ requirement is the whole content: holding an `Mmio` without it is possession
+/// without authority, and a mapping must not survive on the strength of one.
+fn caps_hold_mmio(caps: &capabilities::CapSpace<CAP_SLOTS>) -> bool {
+    (0..CAP_SLOTS).any(|i| {
+        caps.lookup(abi::CapId(i)).is_some_and(|s| {
+            s.cap_type == abi::CapType::Mmio && s.rights.contains(abi::CapRights::READ)
+        })
+    })
+}
+
+/// Does this capability space hold any endpoint capability naming `ep` with `needed`?
+fn caps_hold_endpoint(
+    caps: &capabilities::CapSpace<CAP_SLOTS>,
+    ep: u64,
+    needed: abi::CapRights,
+) -> bool {
+    (0..CAP_SLOTS).any(|i| {
+        caps.lookup(abi::CapId(i)).is_some_and(|s| {
+            s.cap_type == abi::CapType::Endpoint && s.object == ep && s.rights.contains(needed)
+        })
+    })
+}
+
+/// Resolve one capability id to the endpoint it names, enforcing type AND rights.
+fn caps_endpoint_object(
+    caps: &capabilities::CapSpace<CAP_SLOTS>,
+    cap: u64,
+    needed: abi::CapRights,
+) -> Option<u64> {
+    let slot = caps.lookup(abi::CapId(cap as usize))?;
+    if slot.cap_type == abi::CapType::Endpoint && slot.rights.contains(needed) {
+        Some(slot.object)
+    } else {
+        None
+    }
+}
 ///
 /// # Safety
 /// Single-CPU, non-reentrant: no other live borrow of the process table.
 unsafe fn holds_irq(proc: usize, line: u64) -> bool {
-    let caps = &proc_at(proc).caps;
-    (0..CAP_SLOTS).any(|i| {
-        caps.lookup(abi::CapId(i)).is_some_and(|s| {
-            s.cap_type == abi::CapType::Irq
-                && s.object == line
-                && s.rights.contains(abi::CapRights::READ)
-        })
-    })
+    caps_hold_irq(&proc_at(proc).caps)(line)
 }
 
 /// Does process `proc` still hold ANY `Mmio` capability carrying `READ` — i.e. any
@@ -769,12 +823,7 @@ unsafe fn holds_irq(proc: usize, line: u64) -> bool {
 /// # Safety
 /// Single-CPU, non-reentrant: no other live borrow of the process table.
 unsafe fn holds_mmio(proc: usize) -> bool {
-    let caps = &proc_at(proc).caps;
-    (0..CAP_SLOTS).any(|i| {
-        caps.lookup(abi::CapId(i)).is_some_and(|s| {
-            s.cap_type == abi::CapType::Mmio && s.rights.contains(abi::CapRights::READ)
-        })
-    })
+    caps_hold_mmio(&proc_at(proc).caps)
 }
 
 /// Does process `proc` still hold ANY endpoint capability naming `ep` with `needed` rights?
@@ -784,12 +833,7 @@ unsafe fn holds_mmio(proc: usize) -> bool {
 /// # Safety
 /// Single-CPU, non-reentrant: no other live borrow of the process table.
 unsafe fn holds_endpoint(proc: usize, ep: u64, needed: abi::CapRights) -> bool {
-    let caps = &proc_at(proc).caps;
-    (0..CAP_SLOTS).any(|i| {
-        caps.lookup(abi::CapId(i)).is_some_and(|s| {
-            s.cap_type == abi::CapType::Endpoint && s.object == ep && s.rights.contains(needed)
-        })
-    })
+    caps_hold_endpoint(&proc_at(proc).caps, ep, needed)
 }
 
 /// A `&'static mut` to process slot `i`, via a raw pointer (no direct `static mut` ref).
@@ -926,12 +970,7 @@ fn grants_for(role: Role) -> &'static [(abi::CapType, abi::CapRights, u64)] {
 /// # Safety
 /// Single-CPU, non-reentrant: no other live borrow of the process table.
 unsafe fn endpoint_of(proc: usize, cap: u64, needed: abi::CapRights) -> Option<u64> {
-    let slot = proc_at(proc).caps.lookup(abi::CapId(cap as usize))?;
-    if slot.cap_type == abi::CapType::Endpoint && slot.rights.contains(needed) {
-        Some(slot.object)
-    } else {
-        None
-    }
+    caps_endpoint_object(&proc_at(proc).caps, cap, needed)
 }
 
 /// Project the process table onto the pure state vector `runstate` reasons about.
@@ -2539,5 +2578,134 @@ mod tests {
                 i
             );
         }
+    }
+
+    // ------------------------------------------------------- authority predicates
+    //
+    // These cover gates the QEMU boot demonstrably CANNOT see. Measured before writing them:
+    // deleting the READ requirement from `holds_mmio`, and separately from the MAP_REGION
+    // Region gate, each leaves the x86 boot at `RESULT: PASS`. The grant tables contain the
+    // discriminating capabilities — the worker holds an `Mmio` without READ — but the demo
+    // reaches them from the wrong process, so the rights half of the gate never decides
+    // anything on hardware.
+
+    fn space(entries: &[(abi::CapType, abi::CapRights, u64)]) -> capabilities::CapSpace<CAP_SLOTS> {
+        let mut cs = capabilities::CapSpace::new();
+        for &(t, r, o) in entries {
+            cs.insert(t, r, o).expect("test space overflow");
+        }
+        cs
+    }
+
+    /// Possession is not authority. An `Mmio` capability without READ must not keep a device
+    /// window alive — this is the exact case the boot cannot see.
+    #[test]
+    fn an_mmio_capability_without_read_is_not_authority_to_stay_mapped() {
+        let full = space(&[(abi::CapType::Mmio, abi::CapRights::ALL, 0xE000_0000)]);
+        assert!(caps_hold_mmio(&full), "a full Mmio cap is authority");
+
+        let write_only = space(&[(abi::CapType::Mmio, abi::CapRights::WRITE, 0xE000_0000)]);
+        assert!(
+            !caps_hold_mmio(&write_only),
+            "an Mmio without READ counted as authority to stay mapped"
+        );
+
+        // The worker's actual shape: a full cap AND an under-powered one. Revoking the full
+        // one must drop the authority, rather than the leftover propping the mapping up.
+        let mut both = space(&[
+            (abi::CapType::Mmio, abi::CapRights::ALL, 0xE000_0000),
+            (abi::CapType::Mmio, abi::CapRights::WRITE, 0xE000_0000),
+        ]);
+        assert!(caps_hold_mmio(&both));
+        both.revoke(abi::CapId(0));
+        assert!(
+            !caps_hold_mmio(&both),
+            "revoking the only READ-bearing Mmio left the process still 'holding' one"
+        );
+    }
+
+    /// A capability of the wrong TYPE is not authority either, whatever its rights.
+    #[test]
+    fn only_an_mmio_capability_counts_as_device_authority() {
+        for other in [
+            abi::CapType::Untyped,
+            abi::CapType::Endpoint,
+            abi::CapType::Region,
+            abi::CapType::Irq,
+        ] {
+            let cs = space(&[(other, abi::CapRights::ALL, 0xE000_0000)]);
+            assert!(
+                !caps_hold_mmio(&cs),
+                "a {:?} with ALL rights counted as device authority",
+                other
+            );
+        }
+    }
+
+    /// Interrupt authority is PER LINE. Holding line 0 must confer nothing on line 1 — with a
+    /// single line in the system this property is vacuously true, which is why the grant
+    /// tables deliberately carry two.
+    #[test]
+    fn interrupt_authority_does_not_cross_lines_or_survive_without_read() {
+        let timer = space(&[(abi::CapType::Irq, abi::CapRights::READ, IRQ_TIMER)]);
+        assert!(caps_hold_irq(&timer)(IRQ_TIMER));
+        assert!(
+            !caps_hold_irq(&timer)(IRQ_CONSOLE),
+            "a capability for one line granted authority over another"
+        );
+
+        let no_read = space(&[(abi::CapType::Irq, abi::CapRights::WRITE, IRQ_TIMER)]);
+        assert!(
+            !caps_hold_irq(&no_read)(IRQ_TIMER),
+            "an Irq capability without READ credited its line"
+        );
+    }
+
+    /// Endpoint resolution must enforce type and rights, and must return the capability's
+    /// OBJECT rather than its slot id — two processes rendezvous only when their caps name
+    /// the same endpoint, whatever slot each holds it in.
+    #[test]
+    fn endpoint_resolution_enforces_type_and_rights_and_returns_the_object() {
+        // Slot 0 is a decoy of the wrong type; the endpoint lives at slot 1 naming object 7.
+        let cs = space(&[
+            (abi::CapType::Mmio, abi::CapRights::ALL, 0),
+            (abi::CapType::Endpoint, abi::CapRights::WRITE, 7),
+        ]);
+        assert_eq!(
+            caps_endpoint_object(&cs, 1, abi::CapRights::WRITE),
+            Some(7),
+            "must return the endpoint OBJECT, not the slot id"
+        );
+        assert_eq!(
+            caps_endpoint_object(&cs, 1, abi::CapRights::READ),
+            None,
+            "a send-only capability resolved for a receive"
+        );
+        assert_eq!(
+            caps_endpoint_object(&cs, 0, abi::CapRights::WRITE),
+            None,
+            "a non-Endpoint capability resolved as an endpoint"
+        );
+        assert_eq!(
+            caps_endpoint_object(&cs, 9, abi::CapRights::WRITE),
+            None,
+            "an empty slot resolved"
+        );
+    }
+
+    /// The stranding check after a revocation: a second capability to the SAME endpoint keeps
+    /// a blocked process legitimately waiting, but one naming a different endpoint does not.
+    #[test]
+    fn holding_an_endpoint_is_specific_to_its_object() {
+        let cs = space(&[(abi::CapType::Endpoint, abi::CapRights::READ, 3)]);
+        assert!(caps_hold_endpoint(&cs, 3, abi::CapRights::READ));
+        assert!(
+            !caps_hold_endpoint(&cs, 4, abi::CapRights::READ),
+            "a capability for endpoint 3 answered for endpoint 4"
+        );
+        assert!(
+            !caps_hold_endpoint(&cs, 3, abi::CapRights::WRITE),
+            "a receive-only capability answered a send query"
+        );
     }
 }
