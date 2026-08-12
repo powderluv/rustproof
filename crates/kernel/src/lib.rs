@@ -1781,7 +1781,7 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             // The lookup copies the slot out, so no borrow of `PROCS[cur]` stays live.
             let deleg_arg = A::frame_arg(&f, 1);
             let want_deleg = deleg_arg != abi::sysno::NO_DELEGATE;
-            let requested = abi::CapRights((A::frame_arg(&f, 2) & 0b111) as u8);
+            let requested = abi::CapRights::from_user(A::frame_arg(&f, 2));
             let delegated: Option<(abi::CapType, abi::CapRights, u64)> = if want_deleg {
                 proc_at(cur)
                     .caps

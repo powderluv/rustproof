@@ -684,4 +684,144 @@ mod tests {
         assert_eq!(n, 2);
         assert!(l.is_empty());
     }
+
+    /// How many edges the insertion-ORDER search permutes. Bounded below `MAX_EDGES` because
+    /// the cost is forests x k! x roots; at 3 that is ~188k ledger builds, at 4 it is ~8M.
+    const ORDER_EDGES: usize = 3;
+
+    /// Every live edge, as raw field tuples rather than `Endpoint`s.
+    ///
+    /// Deliberately NOT compared through `Endpoint`'s own equality: writing assertions in
+    /// terms of the thing under test is how `same_proc` once became untestable, and the same
+    /// hazard applies to any derived comparison this crate might get wrong.
+    fn live_edges<const M: usize>(l: &Ledger<M>) -> Vec<(usize, u64, usize, usize, u64, usize)> {
+        let mut v: Vec<_> = l
+            .edges
+            .iter()
+            .filter(|e| e.live)
+            .map(|e| {
+                (
+                    e.parent.proc,
+                    e.parent.id,
+                    e.parent.cap,
+                    e.child.proc,
+                    e.child.id,
+                    e.child.cap,
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn ends(out: &[Endpoint]) -> Vec<(usize, u64, usize)> {
+        let mut v: Vec<_> = out.iter().map(|x| (x.proc, x.id, x.cap)).collect();
+        v.sort();
+        v
+    }
+
+    fn permutations(items: &[(Endpoint, Endpoint)]) -> Vec<Vec<(Endpoint, Endpoint)>> {
+        fn rec(
+            k: usize,
+            cur: &mut Vec<(Endpoint, Endpoint)>,
+            out: &mut Vec<Vec<(Endpoint, Endpoint)>>,
+        ) {
+            if k == cur.len() {
+                out.push(cur.clone());
+                return;
+            }
+            for i in k..cur.len() {
+                cur.swap(k, i);
+                rec(k + 1, cur, out);
+                cur.swap(k, i);
+            }
+        }
+        let mut out = Vec::new();
+        let mut cur = items.to_vec();
+        rec(0, &mut cur, &mut out);
+        out
+    }
+
+    /// INSERTION ORDER — the last axis these searches held constant.
+    ///
+    /// `for_every_ledger` emits each edge set in one fixed ascending order and `build`
+    /// records in that order, so until now every forest occupied exactly ONE array layout.
+    /// `record` fills the first free slot and performs no validation, so a different
+    /// insertion order is the same forest in a different layout — and both operations below
+    /// walk the array BY INDEX. `splice_out` is the reason to care: it is a single forward
+    /// pass that reparents edges it may already have walked past, so if any outcome depended
+    /// on layout, that is where it would.
+    ///
+    /// The claim is that no outcome does. Reasoning says an edge's `child` never changes, so
+    /// a forward pass visits every candidate whatever the order — but that argument is
+    /// exactly what a search is for, and a prior review could not turn it into a divergence
+    /// by hand either. This makes it falsifiable rather than argued.
+    ///
+    /// RESULT, stated plainly because it is not the flattering one: no divergence exists, and
+    /// this test CLOSED NO GAP. Three real order-dependence mutants were run — reparenting
+    /// only forward (`j in i..N`), only backward (`j in 0..i`), and stopping after the first
+    /// match — and every one is caught by tests that already existed. A fourth, reversing the
+    /// outer pass, is caught by nothing, which is correct: it is not a bug.
+    ///
+    /// The reason is worth keeping. Insertion order was flagged as an unexplored axis, but it
+    /// is not INDEPENDENT of the axis already explored: varying which edges a forest contains
+    /// already varies which edge lands in slot 0, so enumerating 2611 forests was producing
+    /// layout diversity the whole time. An axis is only unexplored if the search cannot reach
+    /// it, not merely if no loop is named after it.
+    ///
+    /// Retained anyway, at 0.5s, because it states the layout-independence invariant DIRECTLY
+    /// rather than as a by-product — an implementation that later assumed a sorted or
+    /// compacted array is the case the forest enumeration might not reach. It is a statement
+    /// of intent, not evidence of coverage, and should not be counted as the latter.
+    #[test]
+    fn exhaustive_outcome_is_independent_of_insertion_order() {
+        let mut checks = 0u64;
+        for k in 0..=ORDER_EDGES {
+            for_every_ledger(k, |made| {
+                let perms = permutations(made);
+                for victim in universe() {
+                    let want = {
+                        let mut l = build(made);
+                        l.splice_out(victim.proc, victim.id);
+                        live_edges(&l)
+                    };
+                    for p in perms.iter() {
+                        let mut l = build(p);
+                        l.splice_out(victim.proc, victim.id);
+                        assert_eq!(
+                            live_edges(&l),
+                            want,
+                            "splice_out depends on insertion order: {made:?} vs {p:?}"
+                        );
+                        checks += 1;
+                    }
+                }
+                for root in universe() {
+                    let (want_out, want_live) = {
+                        let mut l = build(made);
+                        let mut o = [e(0, 0, 0); DEPLOYED];
+                        let n = l.revoke_from(root, &mut o);
+                        (ends(&o[..n]), live_edges(&l))
+                    };
+                    for p in perms.iter() {
+                        let mut l = build(p);
+                        let mut o = [e(0, 0, 0); DEPLOYED];
+                        let n = l.revoke_from(root, &mut o);
+                        assert_eq!(
+                            ends(&o[..n]),
+                            want_out,
+                            "revoke closure depends on insertion order: {made:?} vs {p:?}"
+                        );
+                        assert_eq!(
+                            live_edges(&l),
+                            want_live,
+                            "revoke residue depends on insertion order: {made:?} vs {p:?}"
+                        );
+                        checks += 1;
+                    }
+                }
+            });
+        }
+        assert!(checks > 1000, "expected a real search, only did {checks}");
+    }
 }

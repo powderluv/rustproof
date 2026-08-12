@@ -162,6 +162,25 @@ impl CapRights {
     pub const fn intersect(self, other: CapRights) -> CapRights {
         CapRights(self.0 & other.0)
     }
+
+    /// Build rights from an untrusted user word, discarding every bit that is not a defined
+    /// right.
+    ///
+    /// This truncation is LOAD-BEARING for the exhaustive searches below, and that was not
+    /// visible from where it used to live. `CapRights` is representationally 256-valued, so
+    /// enumerating `0u8..8` exhausts the universe only while every construction site is
+    /// either a named constant or masked — and the sole non-constant site open-coded
+    /// `& 0b111` in a kernel syscall path, where NOTHING pinned it. Delete it there and the
+    /// searches here silently stop covering the universe: `ALL` is no longer the top of the
+    /// lattice, so `CapRights(0b1000).intersect(ALL)` is `NONE` rather than `0b1000`, and
+    /// `intersect_is_idempotent_and_bounded_by_none_and_all` is asserting something false
+    /// about values it never tries.
+    ///
+    /// Keeping the mask here means one place defines it and this crate's own tests pin it.
+    #[inline]
+    pub const fn from_user(word: u64) -> CapRights {
+        CapRights((word as u8) & CapRights::ALL.0)
+    }
 }
 
 /// Index of a capability slot within a capability space.
@@ -425,6 +444,46 @@ mod tests {
                 assert_eq!(got.0, a & b);
             }
         }
+    }
+
+    /// `ALL` must cover every named right. Nothing else checks this, and the exhaustive
+    /// searches all assume it: they enumerate `0u8..8` because that is `0..=ALL.0`. Add a
+    /// fourth right and forget to widen `ALL`, and every search below quietly stops covering
+    /// the lattice while staying green.
+    #[test]
+    fn all_is_exactly_the_defined_rights() {
+        assert_eq!(
+            CapRights::ALL.0,
+            CapRights::READ.0 | CapRights::WRITE.0 | CapRights::GRANT.0,
+            "ALL must be the union of the named rights"
+        );
+        for r in [CapRights::READ, CapRights::WRITE, CapRights::GRANT] {
+            assert!(CapRights::ALL.contains(r));
+        }
+    }
+
+    /// The universe-narrowing mask, pinned where it is defined.
+    ///
+    /// Over EVERY u8 and a spread of wider words: what comes back is always inside the
+    /// lattice the searches enumerate, and bits below the mask survive untouched.
+    #[test]
+    fn from_user_truncates_to_the_defined_lattice() {
+        for w in 0u64..256 {
+            let got = CapRights::from_user(w);
+            assert!(
+                CapRights::ALL.contains(got),
+                "from_user({w:#010b}) = {:#010b} escaped the lattice",
+                got.0
+            );
+            assert_eq!(got.0, (w as u8) & CapRights::ALL.0);
+        }
+        // Wide words must not smuggle bits in through the cast either.
+        for w in [0x100u64, 0xFF00, 0xDEAD_BEEF, u64::MAX] {
+            assert!(CapRights::ALL.contains(CapRights::from_user(w)));
+        }
+        // And the mask is not a no-op: an undefined bit is actually dropped.
+        assert_eq!(CapRights::from_user(0b1000), CapRights::NONE);
+        assert_eq!(CapRights::from_user(0b1011), CapRights(0b011));
     }
 
     #[test]

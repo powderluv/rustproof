@@ -61,8 +61,8 @@ repeatedly, and the searches below still hold real axes constant:
 
 | Crate | Search | Axis still held constant |
 |---|---|---|
-| `abi` | all 64 rights pairs over the 3-bit lattice | `CapRights` is representationally 256-valued; `0..8` exhausts it only because the sole non-constant construction site masks `& 0b111`. Nothing pins that mask. |
-| `deleg` | all forests of ≤5 edges on 6 endpoints, in `Ledger<16>` | **insertion order** — each edge set is built in one fixed ascending order |
+| `abi` | all 64 rights pairs over the 3-bit lattice, + `from_user` over every u8 | — (the mask that makes `0..8` exhaustive now lives in `abi::CapRights::from_user` and is pinned by its own test) |
+| `deleg` | all forests of ≤5 edges on 6 endpoints, in `Ledger<16>`; ≤3-edge forests in every insertion order | universe size (3 procs / 2 caps vs kernel 6 × 16) |
 | `runstate` | every state vector of length 1..=6 × 7 predicates | endpoint/line values ∈ {0,1}; 7 of the boolean functions over the reachable domain |
 | `regions` | 10,368 configs × 7 plans, at `P=6`/`S=4`/`N=52` | at most 2 regions vs kernel `MAX_REGIONS=12`; owners ⊂ {A,B,C} |
 | `capabilities` | rights bits (in `CapSpace<2>`) + every slot of `CapSpace<16>` | slot CONTENTS are still hand-picked, not enumerated |
