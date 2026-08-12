@@ -288,15 +288,50 @@ mod tests {
         ]
     }
 
-    /// Every 3-slot state vector, passed to `f`.
-    fn for_every_state(mut f: impl FnMut(&[Slot; 3])) {
+    /// The slot count the kernel actually deploys: `run_slots()` returns
+    /// `[runstate::Slot; MAX_PROCS]` (crates/kernel/src/lib.rs:945-946, MAX_PROCS = 6) and
+    /// hands that to `classify` and `uncreditable`. Every search in this module used to stop
+    /// at 3.
+    const DEPLOYED: usize = 6;
+
+    /// Every state vector of length `n`, over the full alphabet, passed to `f`.
+    ///
+    /// An odometer rather than nested loops, because the length is now a parameter.
+    fn for_every_state_of_len(n: usize, f: &mut impl FnMut(&[Slot])) {
         let a = alphabet();
-        for i in a.iter() {
-            for j in a.iter() {
-                for k in a.iter() {
-                    f(&[*i, *j, *k]);
-                }
+        let mut digits = vec![0usize; n];
+        let mut state = vec![Slot::FREE; n];
+        loop {
+            for (s, &d) in state.iter_mut().zip(digits.iter()) {
+                *s = a[d];
             }
+            f(&state[..]);
+            let mut p = 0;
+            loop {
+                if p == n {
+                    return;
+                }
+                digits[p] += 1;
+                if digits[p] < a.len() {
+                    break;
+                }
+                digits[p] = 0;
+                p += 1;
+            }
+        }
+    }
+
+    /// Every state vector, at EVERY length from 1 up to the length the kernel deploys.
+    ///
+    /// This used to be 3-slot only, which held the slot count constant at half the deployed
+    /// value — the "an exhaustive search proves nothing about an axis its universe holds
+    /// constant" defect, in the crate whose own comments name that defect. Nothing in this
+    /// module could distinguish a function that ignored every slot past the third: truncating
+    /// `classify`'s and `uncreditable`'s iterators to `.take(3)` left the whole suite green.
+    /// Both lengths are kept — 1 and 2 are cheap and cover the degenerate ends.
+    fn for_every_state(mut f: impl FnMut(&[Slot])) {
+        for n in 1..=DEPLOYED {
+            for_every_state_of_len(n, &mut f);
         }
     }
 
@@ -310,13 +345,21 @@ mod tests {
     /// unchecked — and per-process authority is exactly the axis of the revoked-capability
     /// hang. Both polarities are present so neither "always the first slot" nor "always the
     /// others" can pass.
-    fn predicates() -> [&'static dyn Fn(usize, u64) -> bool; 5] {
+    /// The last two are new, and they are the reason widening the slot count is not merely
+    /// more of the same. Every predicate above them splits the index space at 0, so at three
+    /// slots the suite could not distinguish per-process authority from "slot 0 versus the
+    /// rest" — and a predicate keyed to a HIGH index was not merely absent, it was
+    /// unexpressible: `i >= 3` is constant-false on a 3-slot vector. Authority held by a
+    /// process in the deployed tail was therefore an axis no search could reach.
+    fn predicates() -> [&'static dyn Fn(usize, u64) -> bool; 7] {
         [
             YES,
             NO,
             &|_, line| line == 0,
             &|i, line| line == 0 && i == 0,
             &|i, line| line == 0 && i != 0,
+            &|i, line| line == 0 && i >= 3,
+            &|i, line| line == 1 && i + 1 == DEPLOYED,
         ]
     }
 
@@ -419,7 +462,7 @@ mod tests {
         for cred in predicates() {
             for_every_state(|s| {
                 let woken: Vec<usize> = uncreditable(s, cred).collect();
-                let mut after = *s;
+                let mut after = s.to_vec();
                 for &i in &woken {
                     after[i] = Slot::ready();
                 }

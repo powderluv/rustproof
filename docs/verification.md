@@ -62,15 +62,32 @@ repeatedly, and the searches below still hold real axes constant:
 | Crate | Search | Axis still held constant |
 |---|---|---|
 | `abi` | all 64 rights pairs over the 3-bit lattice | `CapRights` is representationally 256-valued; `0..8` exhausts it only because the sole non-constant construction site masks `& 0b111`. Nothing pins that mask. |
-| `deleg` | all forests of ≤3 edges on 6 endpoints (15,666 checks) | edge count (kernel ledger holds 16); insertion order |
-| `runstate` | every 3-slot state vector × 5 predicates (3,645) | **slot count — the kernel calls `classify` on a 6-slot vector (`MAX_PROCS`)** |
-| `regions` | 1,296 configs × 7 plans (9,072) | `S=2` vs kernel `SHARE_SLOTS=4`; holders 1–2 have fixed identities |
-| `capabilities` | rights bits only, inside `CapSpace<2>` | deployed `N` is 16; tests sample {2,4,8} |
+| `deleg` | all forests of ≤5 edges on 6 endpoints, in `Ledger<16>` | **insertion order** — each edge set is built in one fixed ascending order |
+| `runstate` | every state vector of length 1..=6 × 7 predicates | endpoint/line values ∈ {0,1}; 7 of the boolean functions over the reachable domain |
+| `regions` | 10,368 configs × 7 plans, at `P=6`/`S=4`/`N=52` | at most 2 regions vs kernel `MAX_REGIONS=12`; owners ⊂ {A,B,C} |
+| `capabilities` | rights bits (in `CapSpace<2>`) + every slot of `CapSpace<16>` | slot CONTENTS are still hand-picked, not enumerated |
 | `mm` | `partition_holds_for_every_dma_top` (1,040 configs) | alloc/free *sequences* are drain-shaped, not arbitrary |
 
-Every crate above is generic over an `N` that the kernel monomorphises to a value the tests never
-instantiate. That is a test-matrix gap, and it is cheap; it is not an argument for a proof
-assistant.
+**Closed 2026-08-11 — the deployed-shape gap.** Every crate above is generic over an `N`, and the
+kernel monomorphises each to a value the tests never instantiated: `CapSpace<16>`, `Ledger<16>`,
+`Holder<4>`, `Plan<52>`, and a 6-slot state vector. The searches ran at half those widths or less.
+That is a test-matrix gap, and it was cheap — but it was not cosmetic, because in every case a
+scan that simply *stopped early* was invisible. Measured, each of these mutants left the old suite
+fully green and fails now:
+
+| Mutation | Old suite | Now |
+|---|---|---|
+| `classify` ignores slots past the third | 17 passed | 2 fail |
+| `uncreditable` ignores slots past the third | 17 passed | 1 fails |
+| `first_free` scans only the first 8 cap slots | 10 passed | 1 fails |
+| `revoke_from` scans only the first 4 ledger slots | 17 passed | 3 fail |
+| `holders_of` reads only the first 2 share slots | 16 passed | 2 fail |
+| `holders_of` reads only the first 3 holders | 16 passed | 2 fail |
+
+Two candidate mutants were *rejected* as evidence because they died under the old suite too — a
+`revoke_from` fixpoint capped at two rounds, and `classify` collapsing per-process authority to
+index 0. The widening did not buy those, and the first of them had already been written into a
+comment as justification before being run; the comment was corrected rather than kept.
 
 **The `mm` test, and why it is not theatre.** Before it existed, every `BitmapAllocator::new` call
 in the suite passed `DMA_TOP = 16 MiB`, which pins two axes at their most forgiving values at once:

@@ -289,4 +289,45 @@ mod tests {
         assert!(cs.lookup(a).is_none());
         assert!(cs.slots[a.0].is_free());
     }
+
+    /// The capacity the kernel actually deploys: `CapSpace<CAP_SLOTS>` with CAP_SLOTS = 16
+    /// (crates/kernel/src/lib.rs:65, :146). Every other test in this file uses N in {2, 4, 8},
+    /// so the deployed width was never instantiated — and because `first_free` is a linear
+    /// scan, no test could distinguish it from a scan that stops early. Truncating that scan
+    /// to the first 8 slots leaves the rest of this suite green.
+    const DEPLOYED: usize = 16;
+
+    #[test]
+    fn every_slot_of_the_deployed_width_is_reachable() {
+        let mut cs: CapSpace<DEPLOYED> = CapSpace::new();
+        // Fill it completely; each insert must land in the next free slot, including the
+        // ones past the widths the other tests use.
+        for i in 0..DEPLOYED {
+            let id = cs
+                .insert(CapType::Endpoint, CapRights::ALL, i as u64)
+                .unwrap_or_else(|| panic!("space full at slot {i} of {DEPLOYED}"));
+            assert_eq!(id, CapId(i), "insert skipped to the wrong slot");
+        }
+        assert_eq!(cs.len(), DEPLOYED);
+        assert!(cs.insert(CapType::Endpoint, CapRights::ALL, 99).is_none());
+
+        // Every slot round-trips by index, and carries its own object rather than a
+        // neighbour's.
+        for i in 0..DEPLOYED {
+            assert_eq!(cs.lookup(CapId(i)).unwrap().object, i as u64);
+        }
+
+        // Freeing any single slot -- including one only the deployed width has -- makes
+        // exactly that slot the next one handed out.
+        for i in 0..DEPLOYED {
+            cs.revoke(CapId(i));
+            assert!(cs.lookup(CapId(i)).is_none());
+            let back = cs.insert(CapType::Irq, CapRights::READ, 0xAA).unwrap();
+            assert_eq!(back, CapId(i), "first_free did not find the hole at {i}");
+            // restore the original occupant so the next iteration starts from a full space
+            cs.revoke(CapId(i));
+            cs.insert(CapType::Endpoint, CapRights::ALL, i as u64)
+                .unwrap();
+        }
+    }
 }

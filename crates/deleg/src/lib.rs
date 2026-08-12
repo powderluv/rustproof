@@ -487,8 +487,28 @@ mod tests {
         rec(0, k, 0, &pairs, &mut acc, &mut f);
     }
 
-    fn build(made: &[(Endpoint, Endpoint)]) -> Ledger<4> {
-        let mut l: Ledger<4> = Ledger::new();
+    /// The ledger capacity the kernel actually deploys: `Ledger<MAX_DELEGATIONS>` with
+    /// MAX_DELEGATIONS = 16, revoking into `[Endpoint; MAX_DELEGATIONS]`
+    /// (crates/kernel/src/lib.rs:345, :358, :391). The searches below used `Ledger<4>`, which
+    /// capped them at 3-edge forests for a structural reason rather than a chosen one: a
+    /// 4-slot ledger cannot hold a 5-edge forest at all. Capacity and edge count are therefore
+    /// ONE axis, and widening the capacity without the edge count would have changed nothing.
+    const DEPLOYED: usize = 16;
+
+    /// Longest forest the searches enumerate.
+    ///
+    /// What this buys, measured rather than assumed: truncating `revoke_from`'s scan to the
+    /// first 4 ledger slots (`for i in 0..4.min(N)`) leaves the 3-edge/`Ledger<4>` suite
+    /// entirely GREEN — it cannot notice, because its ledger only ever held 4 entries — and
+    /// fails three tests here.
+    ///
+    /// What it does NOT buy, also measured: capping the revocation fixpoint at two rounds is
+    /// caught either way. A first draft of this comment claimed otherwise; the mutant was run
+    /// and refuted it.
+    const MAX_EDGES: usize = 5;
+
+    fn build(made: &[(Endpoint, Endpoint)]) -> Ledger<DEPLOYED> {
+        let mut l: Ledger<DEPLOYED> = Ledger::new();
         for (p, c) in made {
             assert!(l.record(*p, *c));
         }
@@ -501,12 +521,12 @@ mod tests {
         // skips the fixpoint, over-reaches, reports duplicates, includes the root, or reports
         // nothing at all is caught — none of which the previous formulation could see.
         let mut checks = 0u64;
-        for k in 0..=3 {
+        for k in 0..=MAX_EDGES {
             for_every_ledger(k, |made| {
                 for root in universe() {
                     let mut l = build(made);
                     let want = expected_closure(made, root);
-                    let mut out = [e(0, 0, 0); 4];
+                    let mut out = [e(0, 0, 0); DEPLOYED];
                     let n = l.revoke_from(root, &mut out);
                     assert_eq!(
                         n,
@@ -535,12 +555,12 @@ mod tests {
     #[test]
     fn exhaustive_revoke_removes_exactly_the_right_edges() {
         // The surviving ledger must be exactly the edges whose parent was never reached.
-        for k in 0..=3 {
+        for k in 0..=MAX_EDGES {
             for_every_ledger(k, |made| {
                 for root in universe() {
                     let mut l = build(made);
                     let want = expected_closure(made, root);
-                    let mut out = [e(0, 0, 0); 4];
+                    let mut out = [e(0, 0, 0); DEPLOYED];
                     l.revoke_from(root, &mut out);
                     let survivors: Vec<_> = l.live_edges().collect();
                     for (p, c) in made.iter() {
@@ -559,7 +579,7 @@ mod tests {
     fn exhaustive_splice_preserves_what_an_ancestor_can_reach() {
         // The confirmed defect this crate exists to prevent: teardown CUT chains instead of
         // splicing, so an ancestor's revoke silently missed grandchildren.
-        for k in 0..=3 {
+        for k in 0..=MAX_EDGES {
             for_every_ledger(k, |made| {
                 for dying in [(0usize, A), (0, D), (1, B), (2, C)] {
                     for root in universe() {
@@ -572,7 +592,7 @@ mod tests {
                             .collect();
                         let mut l = build(made);
                         l.splice_out(dying.0, dying.1);
-                        let mut out = [e(0, 0, 0); 4];
+                        let mut out = [e(0, 0, 0); DEPLOYED];
                         let n = l.revoke_from(root, &mut out);
                         for w in want {
                             assert!(
@@ -590,7 +610,7 @@ mod tests {
     fn exhaustive_no_edge_ever_names_a_dead_incarnation() {
         // After a process dies, no live edge may name that INCARNATION at either end — and
         // edges naming a different incarnation of the same slot must be left alone.
-        for k in 0..=3 {
+        for k in 0..=MAX_EDGES {
             for_every_ledger(k, |made| {
                 for dying in [(0usize, A), (0, D), (1, B), (2, C)] {
                     let mut l = build(made);
@@ -621,7 +641,7 @@ mod tests {
 
     #[test]
     fn exhaustive_forget_drops_exactly_the_named_endpoint() {
-        for k in 0..=3 {
+        for k in 0..=MAX_EDGES {
             for_every_ledger(k, |made| {
                 for target in universe() {
                     let mut l = build(made);
@@ -638,11 +658,11 @@ mod tests {
 
     #[test]
     fn exhaustive_operations_never_invent_or_lose_edges() {
-        for k in 0..=3 {
+        for k in 0..=MAX_EDGES {
             for_every_ledger(k, |made| {
                 for root in universe() {
                     let mut l = build(made);
-                    let mut out = [e(0, 0, 0); 4];
+                    let mut out = [e(0, 0, 0); DEPLOYED];
                     let n = l.revoke_from(root, &mut out);
                     assert!(n <= made.len(), "revoke reported more edges than exist");
                     assert_eq!(l.len() + n, made.len(), "edges appeared or vanished");
@@ -659,7 +679,7 @@ mod tests {
         let mut l: Ledger<4> = Ledger::new();
         l.record(e(0, A, 0), e(1, B, 0));
         l.record(e(1, B, 0), e(0, A, 0));
-        let mut out = [e(0, 0, 0); 4];
+        let mut out = [e(0, 0, 0); DEPLOYED];
         let n = l.revoke_from(e(0, A, 0), &mut out);
         assert_eq!(n, 2);
         assert!(l.is_empty());

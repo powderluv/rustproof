@@ -253,9 +253,14 @@ pub fn teardown<const S: usize, const N: usize>(
 mod tests {
     use super::*;
 
-    const P: usize = 3; // processes
-    const S: usize = 2; // share slots each
-    const N: usize = 32; // plan capacity, generous for the sizes below
+    // The shapes the kernel actually deploys (crates/kernel/src/lib.rs:41, :91, :622):
+    // MAX_PROCS = 6, SHARE_SLOTS = 4, PLAN_STEPS = MAX_PROCS*SHARE_SLOTS + 2*MAX_REGIONS +
+    // SHARE_SLOTS = 52. These searches ran at P=3, S=2, N=32 — half the process count and
+    // half the share slots — so a scan that stopped after two slots, or after three holders,
+    // was invisible to every property below.
+    const P: usize = 6; // processes        (kernel MAX_PROCS)
+    const S: usize = 4; // share slots each (kernel SHARE_SLOTS)
+    const N: usize = 52; // plan capacity   (kernel PLAN_STEPS)
 
     const A: u64 = 10; // owner identities
     const B: u64 = 20;
@@ -268,7 +273,7 @@ mod tests {
     #[test]
     fn destroying_a_region_unmaps_every_holder_before_releasing_it() {
         let regions = [Region::new(1, A)];
-        let holders = [h(A, [1, 0]), h(B, [1, 0]), Holder::FREE];
+        let holders = [h(A, [1, 0, 0, 0]), h(B, [1, 0, 0, 0]), Holder::FREE];
         let plan: Plan<N> = destroy(&regions, &holders, 1);
         assert!(plan.well_ordered());
         let unmaps: Vec<_> = plan
@@ -292,7 +297,7 @@ mod tests {
     #[test]
     fn a_dying_owner_takes_its_region_down_and_unmaps_the_borrower() {
         let regions = [Region::new(1, A)];
-        let holders = [h(A, [1, 0]), h(B, [1, 0]), Holder::FREE];
+        let holders = [h(A, [1, 0, 0, 0]), h(B, [1, 0, 0, 0]), Holder::FREE];
         let plan: Plan<N> = teardown(&regions, &holders, 0, A);
         assert!(plan.well_ordered());
         assert!(plan.steps().any(|s| matches!(
@@ -309,7 +314,7 @@ mod tests {
     #[test]
     fn a_dying_borrower_does_not_release_the_owners_frames() {
         let regions = [Region::new(1, A)];
-        let holders = [h(A, [1, 0]), h(B, [1, 0]), Holder::FREE];
+        let holders = [h(A, [1, 0, 0, 0]), h(B, [1, 0, 0, 0]), Holder::FREE];
         let plan: Plan<N> = teardown(&regions, &holders, 1, B);
         assert!(
             !plan.steps().any(|s| matches!(s, Step::Release { .. })),
@@ -334,7 +339,7 @@ mod tests {
         // Slot 0 is now a different process. It owns nothing, so its teardown releases
         // nothing, even though the previous occupant of its slot owned region 1.
         let regions = [Region::new(1, A)];
-        let holders = [h(C, [0, 0]), h(B, [1, 0]), Holder::FREE];
+        let holders = [h(C, [0, 0, 0, 0]), h(B, [1, 0, 0, 0]), Holder::FREE];
         let plan: Plan<N> = teardown(&regions, &holders, 0, C);
         assert!(!plan.steps().any(|s| matches!(s, Step::Release { .. })));
     }
@@ -379,7 +384,7 @@ mod tests {
         // A plan that does not fit must be refused, not executed: a partial teardown is how
         // frames get released while something still maps them.
         let regions = [Region::new(1, A)];
-        let holders = [h(A, [1, 1]), h(B, [1, 1]), h(C, [1, 1])];
+        let holders = [h(A, [1, 1, 0, 0]), h(B, [1, 1, 0, 0]), h(C, [1, 1, 0, 0])];
         let plan: Plan<2> = destroy(&regions, &holders, 1);
         assert!(plan.truncated);
     }
@@ -390,7 +395,7 @@ mod tests {
         // own way to overflow — and a teardown that silently dropped steps would release
         // frames while a holder kept them mapped, which is the whole hazard.
         let regions = [Region::new(1, A), Region::new(2, A)];
-        let holders = [h(A, [1, 2]), h(B, [1, 2]), h(C, [1, 2])];
+        let holders = [h(A, [1, 2, 0, 0]), h(B, [1, 2, 0, 0]), h(C, [1, 2, 0, 0])];
         let plan: Plan<4> = teardown(&regions, &holders, 0, A);
         assert!(
             plan.truncated,
@@ -439,15 +444,28 @@ mod tests {
         let stale = Holder {
             live: false,
             id: C,
-            slots: [1, 2],
+            slots: [1, 2, 9, 1],
         };
-        for dead_at in 0..3usize {
+        for dead_at in 0..P {
             for id0 in ids {
                 for a in SLOT_VALUES {
                     for b in SLOT_VALUES {
-                        let mut t = vec![h(id0, [a, b]), h(B, [a, 0]), h(A, [b, a])];
-                        t[dead_at] = stale;
-                        out.push(t);
+                        for c in SLOT_VALUES {
+                            // Holders 1, 3 and 5 carry their references ONLY in the TAIL
+                            // slots, and holder 0 keeps one in slot 2. A scan that stops
+                            // after the first two slots therefore misses live shares
+                            // entirely, rather than merely seeing them in a different order.
+                            let mut t = vec![
+                                h(id0, [a, b, c, 0]),
+                                h(B, [0, 0, a, b]),
+                                h(A, [c, 0, 0, a]),
+                                h(C, [0, 0, b, c]),
+                                h(B, [a, 0, c, 0]),
+                                h(A, [0, 0, 0, b]),
+                            ];
+                            t[dead_at] = stale;
+                            out.push(t);
+                        }
                     }
                 }
             }
