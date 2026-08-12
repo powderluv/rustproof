@@ -496,7 +496,7 @@ unsafe fn credit_irq<A: Arch>(irq: u64) {
             continue;
         }
         // ONE copy of the Irq authority predicate. This site used to open-code a second.
-        let holds = caps_hold_irq(&proc_at(i).caps)(irq);
+        let holds = caps_hold_irq(&proc_at(i).caps, irq);
         if !holds {
             continue;
         }
@@ -759,16 +759,33 @@ unsafe fn destroy_regions_owned_by<A: Arch>(proc: usize, owner_id: u64) {
 // they were not.
 
 /// Does this capability space hold any `Irq` capability for `line`, carrying READ?
-fn caps_hold_irq(caps: &capabilities::CapSpace<CAP_SLOTS>) -> impl Fn(u64) -> bool + '_ {
-    move |line| {
-        (0..CAP_SLOTS).any(|i| {
-            caps.lookup(abi::CapId(i)).is_some_and(|s| {
-                s.cap_type == abi::CapType::Irq
-                    && s.object == line
-                    && s.rights.contains(abi::CapRights::READ)
-            })
+fn caps_hold_irq(caps: &capabilities::CapSpace<CAP_SLOTS>, line: u64) -> bool {
+    (0..CAP_SLOTS).any(|i| {
+        caps.lookup(abi::CapId(i)).is_some_and(|s| {
+            s.cap_type == abi::CapType::Irq
+                && s.object == line
+                && s.rights.contains(abi::CapRights::READ)
         })
-    }
+    })
+}
+
+/// Resolve one capability id to the interrupt LINE it names, enforcing type AND rights.
+///
+/// `WAIT_IRQ` and `POLL_IRQ` each open-coded this, which made three copies of the Irq
+/// authority predicate in the crate (the delivery-credit path had the third). Collapsed to
+/// one, because an authority check that exists in triplicate is two that can be fixed while
+/// the other is not.
+///
+/// Measured: deleting the READ requirement from either caller leaves the x86 boot at
+/// `RESULT: PASS`. The reason differs from the `Mmio` case and is worth distinguishing —
+/// there, the discriminating capability EXISTS in the grant tables and the scenario never
+/// reaches it. Here no `Irq` capability without READ is granted to anyone, so the case does
+/// not exist at all. A gate can be vacuous because the fixture cannot reach the case, or
+/// because the case was never built; only the first looks like a testing problem.
+fn caps_irq_line(caps: &capabilities::CapSpace<CAP_SLOTS>, cap: abi::CapId) -> Option<u64> {
+    let slot = caps.lookup(cap)?;
+    (slot.cap_type == abi::CapType::Irq && slot.rights.contains(abi::CapRights::READ))
+        .then_some(slot.object)
 }
 
 /// Does this capability space hold ANY `Mmio` capability carrying READ — i.e. any remaining
@@ -837,7 +854,7 @@ fn caps_endpoint_object(
 /// # Safety
 /// Single-CPU, non-reentrant: no other live borrow of the process table.
 unsafe fn holds_irq(proc: usize, line: u64) -> bool {
-    caps_hold_irq(&proc_at(proc).caps)(line)
+    caps_hold_irq(&proc_at(proc).caps, line)
 }
 
 /// Does process `proc` still hold ANY `Mmio` capability carrying `READ` — i.e. any
@@ -963,10 +980,20 @@ fn grants_for(role: Role) -> &'static [(abi::CapType, abi::CapRights, u64)] {
             // CapId(3): endpoint object 1, RECEIVE-ONLY — holding an endpoint cap is not
             // permission to send on it, which the demo exercises.
             (abi::CapType::Endpoint, abi::CapRights::READ, 1),
-            // CapId(4)/CapId(5): deliberately under-powered caps of the RIGHT type, so the
-            // rights half of every gate is exercised on hardware rather than vacuously
-            // true: an Untyped without WRITE cannot allocate or spawn, and an Mmio without
-            // READ cannot map a BAR.
+            // CapId(4)/CapId(5): deliberately under-powered caps of the RIGHT type — an
+            // Untyped without WRITE cannot allocate or spawn, and an Mmio without READ
+            // cannot map a BAR.
+            //
+            // This block used to claim these make "the rights half of EVERY gate" non-vacuous
+            // on hardware. Measured, that was false for three of them. Deleting the rights
+            // check from `holds_mmio`, `MAP_REGION`, `FREE_REGION`, `WAIT_IRQ` or `POLL_IRQ`
+            // each leaves the boot at RESULT: PASS. Two distinct reasons, worth keeping apart:
+            // the `Mmio` case IS represented here and the demo never reaches it from a process
+            // holding both caps, whereas no under-powered `Irq` or `Region` capability is
+            // granted to anyone at all, so those cases do not exist to be reached. The gates
+            // are covered by host properties in this crate's `tests` module instead; what
+            // these two entries actually buy is the SPAWN and MAP_BAR refusals, which the
+            // demo does exercise.
             (abi::CapType::Untyped, abi::CapRights::READ, 0),
             (abi::CapType::Mmio, abi::CapRights::WRITE, MMIO_BASE),
             // CapId(6): the timer interrupt line. A driver process would hold its device's.
@@ -1930,10 +1957,7 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             // Blocking sibling of POLL_IRQ: same capability, but park until the line has
             // fired at least once rather than returning zero.
             let cap = abi::CapId(A::frame_arg(&f, 0) as usize);
-            let irq = proc_at(cur).caps.lookup(cap).and_then(|s| {
-                (s.cap_type == abi::CapType::Irq && s.rights.contains(abi::CapRights::READ))
-                    .then_some(s.object)
-            });
+            let irq = caps_irq_line(&proc_at(cur).caps, cap);
             match irq {
                 None => A::frame_set_ret(&mut f, abi::syserr::NO_CAP),
                 Some(line) if delivers_irq(line) => {
@@ -2029,10 +2053,7 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             // Collecting a device's interrupts is authority: it requires an `Irq`
             // capability for that source, exactly like every other host-contract op.
             let cap = abi::CapId(A::frame_arg(&f, 0) as usize);
-            let irq = proc_at(cur).caps.lookup(cap).and_then(|s| {
-                (s.cap_type == abi::CapType::Irq && s.rights.contains(abi::CapRights::READ))
-                    .then_some(s.object)
-            });
+            let irq = caps_irq_line(&proc_at(cur).caps, cap);
             match irq {
                 None => A::frame_set_ret(&mut f, abi::syserr::NO_CAP),
                 // The capability names WHICH line to collect: a capability for one line
@@ -2669,15 +2690,15 @@ mod tests {
     #[test]
     fn interrupt_authority_does_not_cross_lines_or_survive_without_read() {
         let timer = space(&[(abi::CapType::Irq, abi::CapRights::READ, IRQ_TIMER)]);
-        assert!(caps_hold_irq(&timer)(IRQ_TIMER));
+        assert!(caps_hold_irq(&timer, IRQ_TIMER));
         assert!(
-            !caps_hold_irq(&timer)(IRQ_CONSOLE),
+            !caps_hold_irq(&timer, IRQ_CONSOLE),
             "a capability for one line granted authority over another"
         );
 
         let no_read = space(&[(abi::CapType::Irq, abi::CapRights::WRITE, IRQ_TIMER)]);
         assert!(
-            !caps_hold_irq(&no_read)(IRQ_TIMER),
+            !caps_hold_irq(&no_read, IRQ_TIMER),
             "an Irq capability without READ credited its line"
         );
     }
@@ -2792,5 +2813,69 @@ mod tests {
             let (_, got) = caps_region(&cs, abi::CapId(0), abi::CapRights::READ).unwrap();
             assert_eq!(got, held, "resolution altered the holder's rights");
         }
+    }
+
+    /// Resolving an interrupt capability: type, rights, and WHICH line.
+    ///
+    /// The boot cannot see any of this — deleting the READ requirement from `WAIT_IRQ` or
+    /// `POLL_IRQ` leaves `RESULT: PASS`, because no `Irq` capability without READ is granted
+    /// to anyone, so the case the gate exists for is never constructed on hardware.
+    #[test]
+    fn interrupt_resolution_enforces_type_rights_and_names_one_line() {
+        // NOTE the padding, which is load-bearing. `IRQ_TIMER` is 0 and `IRQ_CONSOLE` is 1,
+        // so an Irq capability placed at CapId(0)/CapId(1) has a slot index EQUAL to the line
+        // it names — and a resolver returning the SLOT ID instead of the line then passes
+        // every such case. The first version of this test did exactly that, and a mutation
+        // (`.then_some(cap.0 as u64)`) survived it. Every Irq capability below therefore sits
+        // at an index that differs from its line.
+        let cs = space(&[
+            (abi::CapType::Endpoint, abi::CapRights::ALL, 0),
+            (abi::CapType::Endpoint, abi::CapRights::ALL, 0),
+            (abi::CapType::Irq, abi::CapRights::READ, IRQ_CONSOLE), // CapId(2), line 1
+        ]);
+        assert_eq!(
+            caps_irq_line(&cs, abi::CapId(2)),
+            Some(IRQ_CONSOLE),
+            "must return the LINE the capability names, not the slot it sits in"
+        );
+        assert_eq!(
+            caps_irq_line(&cs, abi::CapId(0)),
+            None,
+            "a non-Irq capability resolved as an interrupt source"
+        );
+        assert_eq!(
+            caps_irq_line(&cs, abi::CapId(5)),
+            None,
+            "an empty slot resolved"
+        );
+
+        // The case that does not exist in any grant table, and so was never exercised.
+        for r in [
+            abi::CapRights::NONE,
+            abi::CapRights::WRITE,
+            abi::CapRights::GRANT,
+        ] {
+            let no_read = space(&[(abi::CapType::Irq, r, IRQ_TIMER)]);
+            assert_eq!(
+                caps_irq_line(&no_read, abi::CapId(0)),
+                None,
+                "an Irq capability with rights {:#05b} and no READ resolved a line",
+                r.0
+            );
+        }
+
+        // Two capabilities, two lines: each resolves to its own. With one line in the system
+        // this is vacuously true, which is why the grant tables carry two.
+        // Padded again, and deliberately in the REVERSE order relative to the line numbers, so
+        // neither index equals its line and a position-keyed resolver cannot pass.
+        let both = space(&[
+            (abi::CapType::Endpoint, abi::CapRights::ALL, 0),
+            (abi::CapType::Endpoint, abi::CapRights::ALL, 0),
+            (abi::CapType::Irq, abi::CapRights::READ, IRQ_CONSOLE), // CapId(2), line 1
+            (abi::CapType::Irq, abi::CapRights::READ, IRQ_TIMER),   // CapId(3), line 0
+        ]);
+        assert_eq!(caps_irq_line(&both, abi::CapId(2)), Some(IRQ_CONSOLE));
+        assert_eq!(caps_irq_line(&both, abi::CapId(3)), Some(IRQ_TIMER));
+        assert_ne!(IRQ_TIMER, IRQ_CONSOLE, "the two lines must be distinct");
     }
 }

@@ -77,8 +77,15 @@ kernel's authority gates one at a time, deleting the RIGHTS half of each and boo
 | `holds_mmio` requires `Mmio` + READ | **PASS — invisible** |
 | `MAP_REGION` requires `Region` + READ | **PASS — invisible** |
 | `FREE_REGION` requires `Region` + WRITE | **PASS — invisible** |
+| `WAIT_IRQ` requires `Irq` + READ | **PASS — invisible** |
+| `POLL_IRQ` requires `Irq` + READ | **PASS — invisible** |
+| `MAKE_REGION` requires `Untyped` + WRITE | FAIL — caught |
 
-Three of five were vacuous on hardware while `grants_for` claimed otherwise in a comment. The
+Five of eight were vacuous on hardware while `grants_for` claimed otherwise in a comment
+(now corrected). Two DISTINCT reasons, which the fix depends on telling apart: for `Mmio` the
+discriminating capability exists in the grant tables and the scenario never reaches it; for
+`Irq` and `Region` no under-powered capability is granted to anyone, so the case does not
+exist to be reached. Only the first looks like a testing problem. The
 grant tables *do* contain the discriminating capability — the worker holds an `Mmio` without
 READ — but the revocation teardown the demo checks runs in the CHILD, which holds no second
 `Mmio` at all. The case existed in the tables and was never reached. That is a sharper
@@ -105,7 +112,7 @@ repeatedly, and the searches below still hold real axes constant:
 | `regions` | 10,368 configs × 7 plans, at `P=6`/`S=4`/`N=52` | at most 2 regions vs kernel `MAX_REGIONS=12`; owners ⊂ {A,B,C} |
 | `capabilities` | rights bits (in `CapSpace<2>`) + every slot of `CapSpace<16>` | slot CONTENTS are still hand-picked, not enumerated |
 | `mm` | `partition_holds_for_every_dma_top` (1,040 configs) | alloc/free *sequences* are drain-shaped, not arbitrary |
-| `kernel` | boot grant tables + every authority predicate (14 properties) | everything else in ~2400 lines — a foothold, not coverage |
+| `kernel` | boot grant tables + every authority predicate (15 properties) | everything else in ~2400 lines — a foothold, not coverage |
 
 **Closed 2026-08-11 — the deployed-shape gap.** Every crate above is generic over an `N`, and the
 kernel monomorphises each to a value the tests never instantiated: `CapSpace<16>`, `Ledger<16>`,
