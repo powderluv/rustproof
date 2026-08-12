@@ -111,7 +111,7 @@ repeatedly, and the searches below still hold real axes constant:
 | `runstate` | every state vector of length 1..=6 × 7 predicates | endpoint/line values ∈ {0,1}; 7 of the boolean functions over the reachable domain |
 | `regions` | 10,368 configs × 7 plans, at `P=6`/`S=4`/`N=52` | at most 2 regions vs kernel `MAX_REGIONS=12`; owners ⊂ {A,B,C} |
 | `capabilities` | rights bits (in `CapSpace<2>`) + every slot of `CapSpace<16>` | slot CONTENTS are still hand-picked, not enumerated |
-| `mm` | `partition_holds_for_every_dma_top` (1,040 configs) + every 2-region map shape over unaligned starts/lengths/kinds | alloc/free *sequences* are drain-shaped, not arbitrary; maps are 2 regions, not arbitrary-length |
+| `mm` | `partition_holds_for_every_dma_top` (1,040 configs), every 2-region map shape over unaligned starts/lengths/kinds, and 5×4000-step arbitrary alloc/free interleavings | maps are 2 regions, not arbitrary-length |
 | `kernel` | boot grant tables, every authority predicate, the PVH map bound (17 properties) | everything else in ~2400 lines — a foothold, not coverage |
 
 **Closed 2026-08-11 — the deployed-shape gap.** Every crate above is generic over an `N`, and the
@@ -134,6 +134,16 @@ Two candidate mutants were *rejected* as evidence because they died under the ol
 `revoke_from` fixpoint capped at two rounds, and `classify` collapsing per-process authority to
 index 0. The widening did not buy those, and the first of them had already been written into a
 comment as justification before being run; the comment was corrected rather than kept.
+
+**Two of the listed axes turned out not to be gaps at all**, and the pattern is worth stating
+because this table is what makes them look like gaps. `deleg`'s insertion order and `mm`'s
+alloc/free sequencing were both named here as held constant; searches were written for both;
+neither caught a single mutant the suite did not already catch. Varying which edges a forest
+contains already varies which lands in slot 0, and the one interleaving that matters for the
+allocator was already written down by hand. **An axis is unexplored only if the search cannot
+REACH the case — not merely if no loop iterates over it.** Both searches were kept, each with a
+comment saying plainly that it closed no gap, because a passing test that reads as coverage is
+the failure mode this whole document exists to avoid.
 
 **The `mm` test, and why it is not theatre.** Before it existed, every `BitmapAllocator::new` call
 in the suite passed `DMA_TOP = 16 MiB`, which pins two axes at their most forgiving values at once:

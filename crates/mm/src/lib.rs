@@ -853,4 +853,134 @@ mod tests {
             "no configuration produced a single allocatable frame — the search proves nothing"
         );
     }
+
+    /// Arbitrary alloc/free INTERLEAVINGS, checked against a model.
+    ///
+    /// Every other sequence in this file is drain-shaped — allocate a run, maybe free one,
+    /// allocate again. The longest was 3 allocs, 1 free, 1 alloc. That shape cannot reach the
+    /// state this checks: a frame handed out while it is ALREADY HELD, which is two address
+    /// spaces sharing a page table.
+    ///
+    /// The sequence is a deterministic LCG rather than a random one, so a failure is
+    /// reproducible from the seed printed in the assertion. Frees are drawn only from frames
+    /// the model actually holds: `free_frame`'s contract (see its comment) is that callers
+    /// free only what they allocated, because a mid-map Reserved hole is indistinguishable
+    /// from an allocated frame in the bitmap. Freeing one anyway is a caller bug, not an
+    /// allocator bug, so it is not asserted here.
+    ///
+    /// RESULT, and it is the unflattering one again: this CLOSED NO GAP. Four mutants were
+    /// run — the double-free guard removed, the cursor rewind removed, the free counter not
+    /// decremented on allocation, and the `general_floor` clamp dropped from `alloc_frame` —
+    /// and every one is already caught by tests that existed. The last is the interesting
+    /// case, because it is precisely an interleaving bug (an arena free pulls the cursor below
+    /// the floor, then a general allocation scans from there) and
+    /// `general_never_returns_an_arena_frame_after_arena_churn` already constructs exactly
+    /// that sequence by hand.
+    ///
+    /// So "alloc/free sequences are drain-shaped" overstated the gap: no loop enumerates
+    /// interleavings, but the specific interleaving that matters was already written down.
+    /// That is the second axis named as held-constant which turned out to be covered — see
+    /// deleg's insertion-order search. An axis is only unexplored if the search CANNOT REACH
+    /// the case, not merely if nothing iterates over it.
+    ///
+    /// Kept at ~0.01s because it states the allocator's core safety property directly — a
+    /// live frame is never handed out twice — over sequences no hand-written case fixes in
+    /// advance, which is what a future free-list or cursor change would need. It is a
+    /// statement of the invariant, not evidence of new coverage.
+    #[test]
+    fn arbitrary_alloc_free_interleavings_never_hand_out_a_live_frame() {
+        for seed in [1u64, 12345, 0xDEAD_BEEF, 7, 99_991] {
+            let regions = synthetic_regions();
+            let words = BitmapAllocator::bitmap_words_needed(&regions);
+            let mut a = BitmapAllocator::new(&regions, leak_bitmap(words), RESERVE_BELOW, DMA_TOP);
+
+            let at_start = a.free_count();
+            let mut live: Vec<u64> = Vec::new();
+            let mut expect_free = at_start;
+            let mut rng = seed;
+            let mut next = || {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (rng >> 33) as usize
+            };
+
+            for step in 0..4000 {
+                match next() % 4 {
+                    // general allocation
+                    0 | 1 => {
+                        if let Some(f) = a.alloc_frame() {
+                            let p = f.as_u64();
+                            assert!(
+                                !live.contains(&p),
+                                "seed {seed} step {step}: frame {p:#x} handed out while live"
+                            );
+                            assert!(
+                                p >= DMA_TOP,
+                                "seed {seed} step {step}: general frame {p:#x} is below dma_top"
+                            );
+                            live.push(p);
+                            expect_free -= 1;
+                        }
+                    }
+                    // DMA arena allocation
+                    2 => {
+                        if let Some(f) = a.alloc_dma_frame() {
+                            let p = f.as_u64();
+                            assert!(
+                                !live.contains(&p),
+                                "seed {seed} step {step}: dma frame {p:#x} handed out while live"
+                            );
+                            assert!(
+                                p < DMA_TOP && p >= RESERVE_BELOW,
+                                "seed {seed} step {step}: dma frame {p:#x} outside the arena"
+                            );
+                            live.push(p);
+                            expect_free -= 1;
+                        }
+                    }
+                    // free one we hold, then double-free it: the second must be a no-op
+                    _ => {
+                        if !live.is_empty() {
+                            let i = next() % live.len();
+                            let p = live.swap_remove(i);
+                            a.free_frame(PhysAddr(p));
+                            expect_free += 1;
+                            assert_eq!(
+                                a.free_count(),
+                                expect_free,
+                                "seed {seed} step {step}: free_count wrong after freeing {p:#x}"
+                            );
+                            a.free_frame(PhysAddr(p));
+                        }
+                    }
+                }
+                assert_eq!(
+                    a.free_count(),
+                    expect_free,
+                    "seed {seed} step {step}: free_count diverged from the model"
+                );
+            }
+
+            // Conservation over the WHOLE arbitrary sequence: give everything back, and the
+            // allocator must be able to hand out exactly what it started with. This is the
+            // property the drain-shaped tests cannot state, because they never interleave.
+            for p in live.drain(..) {
+                a.free_frame(PhysAddr(p));
+            }
+            assert_eq!(
+                a.free_count(),
+                at_start,
+                "seed {seed}: frames were lost across an arbitrary alloc/free sequence"
+            );
+            let mut handed = 0usize;
+            while a.alloc_frame().is_some() || a.alloc_dma_frame().is_some() {
+                handed += 1;
+            }
+            assert_eq!(
+                handed, at_start,
+                "seed {seed}: drained {handed} frames but started with {at_start}"
+            );
+        }
+    }
 }
