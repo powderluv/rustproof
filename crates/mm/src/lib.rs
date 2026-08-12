@@ -111,6 +111,42 @@ impl BitmapAllocator {
             }
         }
 
+        // Re-mark every NON-Usable region as USED.
+        //
+        // Without this, a `Reserved` (or ACPI / Unusable) span that OVERLAPS a `Usable` one is
+        // handed out as ordinary memory: the pass above frees every frame inside the Usable
+        // region and nothing ever took the reserved ones back. Measured on a map declaring
+        // 0..16 MiB Usable with 8..9 MiB Reserved, the allocator handed out all 256 reserved
+        // frames, which then become page tables and user stacks. On x86 this map is not ours —
+        // it is parsed from the PVH `hvm_start_info` the hypervisor supplies
+        // (crates/kernel/src/pvh.rs), an arbitrary-length list of arbitrary triples from
+        // outside the TCB — and nothing anywhere validated that its regions are disjoint.
+        //
+        // Rounding here is OUTWARD, the opposite of the Usable pass above, and the asymmetry
+        // is the point: a frame only PARTIALLY covered by a Usable region is not fully backed
+        // so it must not be freed, while a frame only partially covered by a Reserved region
+        // still contains bytes that must never be handed out. Both directions round toward
+        // "not allocatable".
+        if total > 0 {
+            let last = total - 1;
+            for region in regions {
+                if region.kind == MemoryKind::Usable || region.len == 0 {
+                    continue;
+                }
+                let f_lo = (region.start >> PAGE_SHIFT) as usize;
+                let f_hi = (((region.end() + PAGE_SIZE - 1) >> PAGE_SHIFT).max(1) - 1) as usize;
+                if f_lo > last {
+                    continue;
+                }
+                let mut f = f_lo;
+                let hi = f_hi.min(last);
+                while f <= hi {
+                    alloc.set_used(f);
+                    f += 1;
+                }
+            }
+        }
+
         // Re-mark low frames (kernel image + low structures) as USED. This runs after
         // the Usable pass so it always wins on overlap.
         let mut f = 0usize;
@@ -685,5 +721,136 @@ mod tests {
             top += 20 * PAGE_SIZE;
         }
         assert!(n > 1000, "universe too small: {}", n);
+    }
+
+    /// A `Reserved` span INSIDE a `Usable` one must never be allocatable.
+    ///
+    /// Measured before the fix: this map handed out all 256 reserved frames. The firmware map
+    /// is not ours on x86 — it comes from the PVH `hvm_start_info` the hypervisor supplies —
+    /// and nothing validated that its regions are disjoint.
+    #[test]
+    fn a_reserved_span_inside_a_usable_one_is_never_handed_out() {
+        let regions = [
+            MemoryRegion {
+                start: 0,
+                len: 16 * MIB,
+                kind: MemoryKind::Usable,
+            },
+            MemoryRegion {
+                start: 8 * MIB,
+                len: MIB,
+                kind: MemoryKind::Reserved,
+            },
+        ];
+        let words = BitmapAllocator::bitmap_words_needed(&regions);
+        let mut a = BitmapAllocator::new(&regions, leak_bitmap(words), 0, 0);
+        let mut handed = 0u64;
+        let mut reserved_handed = 0u64;
+        while let Some(f) = a.alloc_frame() {
+            let p = f.as_u64();
+            if (8 * MIB..9 * MIB).contains(&p) {
+                reserved_handed += 1;
+            }
+            handed += 1;
+        }
+        assert_eq!(reserved_handed, 0, "handed out reserved frames");
+        assert!(handed > 0, "the whole map became unusable");
+    }
+
+    /// Every frame the allocator hands out, for EVERY map shape in a small universe.
+    ///
+    /// The rest of this suite builds from one hardcoded 3-region map, which fixes the shape of
+    /// the single input the nucleus does not control. This varies it: unaligned starts,
+    /// zero-length regions, kinds in either order, and Usable/non-Usable overlap in both
+    /// directions. Two rounding rules are asserted at once and they point opposite ways — a
+    /// frame only partly Usable must not be freed, a frame only partly Reserved must not be
+    /// handed out.
+    #[test]
+    fn every_handed_frame_is_backed_by_usable_memory_and_untouched_by_reserved() {
+        // UNALIGNED values are load-bearing. With every start and length page-aligned, no
+        // region ever partially covers a frame, and the rounding DIRECTION of the non-Usable
+        // pass stops mattering: a mutant rounding it inward (like the Usable pass) survived a
+        // page-aligned-only universe. `6000` straddles a frame boundary and a length of `1`
+        // covers a single byte, so a region can now touch a frame without filling it.
+        const STARTS: [u64; 4] = [0, 4096, 6000, 8192];
+        const LENS: [u64; 4] = [0, 1, 4096, 12288];
+        const KINDS: [MemoryKind; 3] = [
+            MemoryKind::Usable,
+            MemoryKind::Reserved,
+            MemoryKind::AcpiNvs,
+        ];
+        let mut configs = 0u64;
+        let mut frames_seen = 0u64;
+        for s0 in STARTS {
+            for l0 in LENS {
+                for k0 in KINDS {
+                    for s1 in STARTS {
+                        for l1 in LENS {
+                            for k1 in KINDS {
+                                let regions = [
+                                    MemoryRegion {
+                                        start: s0,
+                                        len: l0,
+                                        kind: k0,
+                                    },
+                                    MemoryRegion {
+                                        start: s1,
+                                        len: l1,
+                                        kind: k1,
+                                    },
+                                ];
+                                let words = BitmapAllocator::bitmap_words_needed(&regions);
+                                let mut a =
+                                    BitmapAllocator::new(&regions, leak_bitmap(words), 0, 0);
+                                let mut seen: Vec<u64> = Vec::new();
+                                while let Some(f) = a.alloc_frame() {
+                                    let lo = f.as_u64();
+                                    let hi = lo + PAGE_SIZE;
+                                    assert!(
+                                        lo % PAGE_SIZE == 0,
+                                        "unaligned frame {lo:#x} from {regions:?}"
+                                    );
+                                    assert!(
+                                        !seen.contains(&lo),
+                                        "frame {lo:#x} handed out twice from {regions:?}"
+                                    );
+                                    seen.push(lo);
+                                    // Fully backed by some Usable region.
+                                    let backed = regions.iter().any(|r| {
+                                        r.kind == MemoryKind::Usable
+                                            && r.len > 0
+                                            && r.start <= lo
+                                            && hi <= r.end()
+                                    });
+                                    assert!(
+                                        backed,
+                                        "frame {lo:#x} is not fully inside any Usable region: \
+                                         {regions:?}"
+                                    );
+                                    // Touched by NO non-Usable region.
+                                    let poisoned = regions.iter().any(|r| {
+                                        r.kind != MemoryKind::Usable
+                                            && r.len > 0
+                                            && lo < r.end()
+                                            && r.start < hi
+                                    });
+                                    assert!(
+                                        !poisoned,
+                                        "frame {lo:#x} overlaps a non-Usable region: {regions:?}"
+                                    );
+                                    frames_seen += 1;
+                                }
+                                configs += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(configs > 1000, "universe too small: {configs}");
+        assert!(
+            frames_seen > 0,
+            "no configuration produced a single allocatable frame — the search proves nothing"
+        );
     }
 }
