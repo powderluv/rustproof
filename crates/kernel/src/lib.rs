@@ -797,6 +797,29 @@ fn caps_hold_endpoint(
     })
 }
 
+/// Resolve one capability id to the REGION it names, enforcing type AND rights.
+///
+/// Returns the region id AND the rights the holder actually carries, because the caller maps
+/// with those rights: a READ-only loan that came back as writable would be amplification at
+/// the point of use rather than at the point of grant.
+///
+/// Measured: deleting the rights check from EITHER caller — `MAP_REGION`'s READ or
+/// `FREE_REGION`'s WRITE — leaves the x86 boot at `RESULT: PASS`. The second is the sharper
+/// one: without it a process holding a READ-only loan can destroy memory it was merely lent,
+/// and nothing on hardware notices.
+fn caps_region(
+    caps: &capabilities::CapSpace<CAP_SLOTS>,
+    cap: abi::CapId,
+    needed: abi::CapRights,
+) -> Option<(u64, abi::CapRights)> {
+    let slot = caps.lookup(cap)?;
+    if slot.cap_type == abi::CapType::Region && slot.rights.contains(needed) {
+        Some((slot.object, slot.rights))
+    } else {
+        None
+    }
+}
+
 /// Resolve one capability id to the endpoint it names, enforcing type AND rights.
 fn caps_endpoint_object(
     caps: &capabilities::CapSpace<CAP_SLOTS>,
@@ -1962,12 +1985,12 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
         abi::sysno::MAP_REGION => {
             // The BORROWER maps, into its own space, at an address the kernel picks.
             let cap = abi::CapId(A::frame_arg(&f, 0) as usize);
-            let named = proc_at(cur).caps.lookup(cap).filter(|s| {
-                s.cap_type == abi::CapType::Region && s.rights.contains(abi::CapRights::READ)
-            });
+            let named = caps_region(&proc_at(cur).caps, cap, abi::CapRights::READ);
             let ret = match named {
                 None => abi::syserr::NO_CAP,
-                Some(slot) => map_region::<A>(cur, slot.object, slot.rights),
+                // The holder's OWN rights decide the mapping's permissions, never the
+                // request's — see `caps_region`.
+                Some((object, rights)) => map_region::<A>(cur, object, rights),
             };
             A::frame_set_ret(&mut f, ret);
         }
@@ -1991,11 +2014,9 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             // Destroying a region takes WRITE, not merely possession: a READ-only loan must
             // not be able to destroy what it was lent, and ownership alone is not the whole
             // gate (docs/host-contract.md). The owner-by-IDENTITY check below still stands.
-            let named = proc_at(cur).caps.lookup(cap).filter(|s| {
-                s.cap_type == abi::CapType::Region && s.rights.contains(abi::CapRights::WRITE)
-            });
+            let named = caps_region(&proc_at(cur).caps, cap, abi::CapRights::WRITE);
             let me = proc_at(cur).id;
-            let ret = match named.and_then(|s| region_slot(s.object)) {
+            let ret = match named.and_then(|(object, _)| region_slot(object)) {
                 Some(idx) if (*core::ptr::addr_of!(REGIONS[idx])).owner_id == me => {
                     destroy_region::<A>(idx);
                     abi::syserr::OK
@@ -2707,5 +2728,69 @@ mod tests {
             !caps_hold_endpoint(&cs, 3, abi::CapRights::WRITE),
             "a receive-only capability answered a send query"
         );
+    }
+
+    /// The two Region gates, both of which the boot cannot see (measured: deleting either
+    /// leaves `RESULT: PASS`).
+    ///
+    /// `FREE_REGION` is the one that matters most. Requiring WRITE is what stops a process
+    /// holding a READ-only LOAN from destroying memory it was merely lent — ownership is
+    /// checked separately, by identity, but the rights half is the part that was decorative.
+    #[test]
+    fn a_read_only_region_loan_can_be_mapped_but_not_destroyed() {
+        let loan = space(&[(abi::CapType::Region, abi::CapRights::READ, 42)]);
+        assert_eq!(
+            caps_region(&loan, abi::CapId(0), abi::CapRights::READ),
+            Some((42, abi::CapRights::READ)),
+            "a READ loan must still be mappable"
+        );
+        assert_eq!(
+            caps_region(&loan, abi::CapId(0), abi::CapRights::WRITE),
+            None,
+            "a READ-only loan resolved for FREE_REGION — it can destroy what it was lent"
+        );
+
+        let owned = space(&[(abi::CapType::Region, abi::CapRights::ALL, 42)]);
+        assert!(
+            caps_region(&owned, abi::CapId(0), abi::CapRights::WRITE).is_some(),
+            "a fully-powered region cap must be destroyable by its owner"
+        );
+    }
+
+    /// A region capability must resolve to its region ID, not its slot, and must hand back the
+    /// holder's OWN rights — the mapping's permissions are derived from them, so returning
+    /// anything wider is amplification at the point of use.
+    #[test]
+    fn region_resolution_returns_the_region_id_and_the_holders_own_rights() {
+        // Decoy at slot 0 so a slot/object confusion cannot pass by coincidence.
+        let cs = space(&[
+            (abi::CapType::Endpoint, abi::CapRights::ALL, 0),
+            (abi::CapType::Region, abi::CapRights::READ, 9),
+        ]);
+        assert_eq!(
+            caps_region(&cs, abi::CapId(1), abi::CapRights::READ),
+            Some((9, abi::CapRights::READ)),
+            "must return (region id, holder's rights)"
+        );
+        assert_eq!(
+            caps_region(&cs, abi::CapId(0), abi::CapRights::READ),
+            None,
+            "a non-Region capability resolved as a region"
+        );
+        assert_eq!(
+            caps_region(&cs, abi::CapId(7), abi::CapRights::READ),
+            None,
+            "an empty slot resolved"
+        );
+        // Rights come back verbatim: never widened to what was asked for.
+        for held in [
+            abi::CapRights::READ,
+            abi::CapRights::ALL,
+            abi::CapRights(0b011),
+        ] {
+            let cs = space(&[(abi::CapType::Region, held, 5)]);
+            let (_, got) = caps_region(&cs, abi::CapId(0), abi::CapRights::READ).unwrap();
+            assert_eq!(got, held, "resolution altered the holder's rights");
+        }
     }
 }
