@@ -8,7 +8,7 @@
 //! [`syscall_trap`] services the call / `YIELD` / `EXIT` and picks the next process (see
 //! `docs/scheduling.md`). The x86-64 and RISC-V specifics live entirely behind the
 //! `hal::Arch` + `hal::Space` implementations in [`arch_x86`] / [`arch_riscv`].
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 use core::fmt::Write as _;
 use core::marker::PhantomData;
@@ -2356,5 +2356,188 @@ impl<A: Arch> abi::HostEnv for KEnv<A> {
     }
     fn read_user_bytes(&self, uptr: u64, out: &mut [u8]) -> bool {
         unsafe { A::copy_from_user(uptr, out) }
+    }
+}
+
+// ============================================================ host tests
+//
+// The kernel had NO host tests at all — 2360 lines, the largest crate in the tree, checked
+// only by one scripted QEMU boot. That was not a considered exemption: `tools/host-tests.sh`
+// guards against a tested crate going unlisted, but it fires on the PRESENCE of `#[test]`,
+// so a crate with none can never trip it. "Cannot build for the host" and "has nothing worth
+// testing" had been conflated, and the first was not even true — only a missing off-target
+// `sched::Context` stood in the way (see crates/sched/src/context_host.rs).
+//
+// What belongs here is the kernel's DECISION logic, not its effects: anything that maps a
+// page, switches a stack, or touches a register belongs under QEMU and stays there. The
+// boot grant tables are the clearest such case — they are pure data, they are the ROOT of
+// every capability that can ever exist, and until now nothing but the demo's own success
+// depended on them being right.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROLES: [Role; 4] = [Role::Producer, Role::Consumer, Role::Worker, Role::Child];
+
+    /// Rights a role holds on a given endpoint object, unioned across its whole table.
+    fn endpoint_rights(role: Role, object: u64) -> abi::CapRights {
+        let mut bits = 0u8;
+        for &(t, r, o) in grants_for(role) {
+            if t == abi::CapType::Endpoint && o == object {
+                bits |= r.0;
+            }
+        }
+        abi::CapRights(bits)
+    }
+
+    fn holds_type(role: Role, want: abi::CapType) -> bool {
+        grants_for(role).iter().any(|&(t, _, _)| t == want)
+    }
+
+    /// THE separation property. A producer that is compromised must not be able to map a
+    /// device, allocate memory, spawn, or wait on an interrupt — and the only thing that
+    /// makes that true is the absence of those capability TYPES from its table.
+    ///
+    /// Stated as "which roles may hold a privileged type" rather than as the table's
+    /// contents, so it fails on an authority change and not on a cosmetic one.
+    #[test]
+    fn only_the_worker_holds_device_memory_or_interrupt_authority() {
+        for role in ROLES {
+            for privileged in [abi::CapType::Mmio, abi::CapType::Untyped, abi::CapType::Irq] {
+                let held = holds_type(role, privileged);
+                let allowed = matches!(role, Role::Worker);
+                assert!(
+                    !held || allowed,
+                    "the {} role holds a {:?} capability; only the worker may",
+                    role_name(role),
+                    privileged
+                );
+            }
+        }
+    }
+
+    /// No role may hold both halves of one endpoint. A role carrying READ and WRITE on the
+    /// same object could rendezvous with ITSELF, which makes the producer/consumer split
+    /// decorative: the demo's "a producer cannot receive" is then a fact about the demo
+    /// rather than about authority.
+    #[test]
+    fn no_role_holds_both_ends_of_the_same_endpoint() {
+        for role in ROLES {
+            for object in 0..4u64 {
+                let r = endpoint_rights(role, object);
+                assert!(
+                    !(r.contains(abi::CapRights::READ) && r.contains(abi::CapRights::WRITE)),
+                    "the {} role holds both READ and WRITE on endpoint {}, so it can \
+                     rendezvous with itself",
+                    role_name(role),
+                    object
+                );
+            }
+        }
+    }
+
+    /// `SPAWN` must not be able to mint authority. A child's table is empty, so everything a
+    /// spawned process can do came from an explicit, rights-intersected delegation.
+    #[test]
+    fn a_spawned_child_starts_with_no_authority_of_its_own() {
+        assert!(
+            grants_for(Role::Child).is_empty(),
+            "Role::Child's grant table is not empty: spawning now mints authority by itself"
+        );
+    }
+
+    /// The claim `NO_AUTHORITY` exists to make: the placeholder is a real lookup HIT that
+    /// nonetheless passes no gate. Possession is not authority.
+    #[test]
+    fn the_placeholder_capability_confers_nothing() {
+        let (t, rights, _) = NO_AUTHORITY;
+        assert_eq!(
+            t,
+            abi::CapType::Endpoint,
+            "placeholder must still be a real slot"
+        );
+        for needed in [
+            abi::CapRights::READ,
+            abi::CapRights::WRITE,
+            abi::CapRights::GRANT,
+        ] {
+            assert!(
+                !rights.contains(needed),
+                "NO_AUTHORITY passes a gate for {:?}",
+                needed
+            );
+        }
+    }
+
+    /// Why the placeholder is there at all: entry `i` becomes `CapId(i)`, so the shared
+    /// endpoint must sit at `CapId(0)` in every role that has any table. Drop the
+    /// placeholder from the worker and its device authority silently shifts down a slot.
+    #[test]
+    fn the_shared_endpoint_is_capid_zero_in_every_non_empty_role() {
+        for role in ROLES {
+            let table = grants_for(role);
+            if table.is_empty() {
+                continue;
+            }
+            let (t, _, object) = table[0];
+            assert_eq!(
+                (t, object),
+                (abi::CapType::Endpoint, 0),
+                "the {} role's CapId(0) is not the shared endpoint, so CapId(1..) no longer \
+                 line up across roles",
+                role_name(role)
+            );
+        }
+    }
+
+    /// Protects a TESTING property rather than a safety one, which is why it is easy to
+    /// delete by accident. The worker deliberately holds under-powered caps of the right
+    /// TYPE — an `Untyped` without WRITE, an `Mmio` without READ — so that the rights half
+    /// of every gate is exercised on hardware instead of being vacuously true. Tidy those
+    /// away and the demo still passes while checking strictly less.
+    #[test]
+    fn the_worker_holds_an_under_powered_cap_of_each_privileged_type() {
+        for privileged in [abi::CapType::Mmio, abi::CapType::Untyped] {
+            let entries: Vec<abi::CapRights> = grants_for(Role::Worker)
+                .iter()
+                .filter(|&&(t, _, _)| t == privileged)
+                .map(|&(_, r, _)| r)
+                .collect();
+            assert!(
+                entries.iter().any(|r| *r == abi::CapRights::ALL),
+                "the worker holds no fully-powered {:?}",
+                privileged
+            );
+            assert!(
+                entries.iter().any(|r| *r != abi::CapRights::ALL),
+                "every {:?} the worker holds carries ALL rights, so the rights half of that \
+                 gate is never exercised — the on-hardware refusal becomes vacuous",
+                privileged
+            );
+        }
+    }
+
+    /// The boot policy must put the two halves of the IPC pair in DIFFERENT processes.
+    #[test]
+    fn boot_role_splits_the_ipc_pair_across_processes() {
+        let p = boot_role(0);
+        let c = boot_role(1);
+        assert!(
+            endpoint_rights(p, 0).contains(abi::CapRights::WRITE),
+            "boot process 0 cannot send on the shared endpoint"
+        );
+        assert!(
+            endpoint_rights(c, 0).contains(abi::CapRights::READ),
+            "boot process 1 cannot receive on the shared endpoint"
+        );
+        // And every later process is a worker, which holds neither half.
+        for i in 2..6u64 {
+            let r = endpoint_rights(boot_role(i), 0);
+            assert!(
+                !r.contains(abi::CapRights::READ) && !r.contains(abi::CapRights::WRITE),
+                "boot process {} has authority on the shared endpoint",
+                i
+            );
+        }
     }
 }

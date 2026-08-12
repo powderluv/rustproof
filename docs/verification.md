@@ -53,6 +53,20 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ## 0. What is actually checked today (and how to prove the checks can fail)
 
+**The kernel was exempt from all of this until 2026-08-11**, and not by decision.
+`crates/kernel` — 2360 lines, the whole syscall surface — had zero `#[test]`, so it could
+never trip `tools/host-tests.sh`'s guard, which fires on the PRESENCE of `#[test]`. It was
+believed unable to build for the host; in fact only a missing off-target `sched::Context`
+stood in the way. "Cannot build for the host" and "has nothing worth testing" are different
+claims and neither had been checked. It now builds and is tested on every host.
+
+Measured, and the reason this mattered: granting the least-authority producer a full
+`Untyped`/`ALL` capability — allocate and spawn, to the process the isolation story rests on
+— produced a clean `BOOT OK` and `RESULT: PASS` on x86. The QEMU boot cannot see a privilege
+escalation in the boot grant tables, because the demo only exercises what a process CAN do.
+Seven host properties now cover the tables; each was mutation-checked against a distinct
+authority change.
+
 Assurance in this tree is host tests plus one scripted QEMU boot per arch. Several of the host
 suites are *exhaustive searches* rather than samples, and where a search covers its whole universe
 it is a proof — that is why Verus buys nothing on those axes. The honest qualifier is that a search
@@ -67,6 +81,7 @@ repeatedly, and the searches below still hold real axes constant:
 | `regions` | 10,368 configs × 7 plans, at `P=6`/`S=4`/`N=52` | at most 2 regions vs kernel `MAX_REGIONS=12`; owners ⊂ {A,B,C} |
 | `capabilities` | rights bits (in `CapSpace<2>`) + every slot of `CapSpace<16>` | slot CONTENTS are still hand-picked, not enumerated |
 | `mm` | `partition_holds_for_every_dma_top` (1,040 configs) | alloc/free *sequences* are drain-shaped, not arbitrary |
+| `kernel` | the boot grant tables (7 authority properties) | everything else in 2360 lines — this is a first foothold, not coverage |
 
 **Closed 2026-08-11 — the deployed-shape gap.** Every crate above is generic over an `N`, and the
 kernel monomorphises each to a value the tests never instantiated: `CapSpace<16>`, `Ledger<16>`,

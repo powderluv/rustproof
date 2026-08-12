@@ -17,6 +17,14 @@ mod context_riscv;
 #[cfg(target_arch = "riscv64")]
 pub use context_riscv::{switch, Context};
 
+// Neither real arch: a development host (e.g. aarch64 macOS). Exists so `crates/kernel`
+// COMPILES for `cargo test` here, which is the precondition for host-testing it at all.
+// See context_host.rs — it is inert, and `switch` panics rather than pretending.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+mod context_host;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+pub use context_host::{switch, Context};
+
 // ============================================================ run queue
 
 /// A fixed-capacity, allocation-free round-robin run queue of ready [`ThreadId`]s.

@@ -23,10 +23,21 @@ HOST_CRATES=(
     loader
     loader-riscv
     hostcontract
+    kernel
 )
 
-# Every crate whose source contains a #[test] must appear above. Bare-metal crates that
-# genuinely cannot be host-tested have no #[test] in them, so they do not trip this.
+# Every crate whose source contains a #[test] must appear above.
+#
+# The comment here used to add: "Bare-metal crates that genuinely cannot be host-tested have
+# no #[test] in them, so they do not trip this." That reasoning is backwards, and it exempted
+# the largest crate in the tree. `kernel` -- 2360 lines, the whole syscall surface -- had NO
+# tests, so it could never trip a guard that fires on the PRESENCE of #[test]; and it could
+# not be host-built only because `sched::Context` had no off-target stub. "Cannot build for
+# the host" and "has nothing worth testing" are different claims, and neither was checked.
+# Both are fixed: see crates/sched/src/context_host.rs.
+#
+# So the guard still cannot see a crate that is testable but untested. What it can now see is
+# a crate that HAS tests and is not listed, which is the failure it was written for.
 missing=()
 while IFS= read -r dir; do
     name=$(basename "$dir")
