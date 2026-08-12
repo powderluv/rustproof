@@ -39,6 +39,38 @@ fn kind_of(typ: u32) -> MemoryKind {
     }
 }
 
+/// Largest memory map this will walk, whatever the hypervisor declares.
+///
+/// `hvm_start_info.memmap_entries` is a `u32` supplied from outside the TCB, and the walk
+/// below dereferences `table.add(i)` for each one. The `count >= out.len()` break does NOT
+/// bound it: that fires only when an entry is ACCEPTED, so a map whose entries are all
+/// rejected (`end <= start`, trivially arranged with zero sizes) walks the full declared
+/// count — up to 2^32-1 dereferences marching off the end of any real table.
+pub(crate) const MAX_MAP_ENTRIES: usize = 256;
+
+/// Bytes per `HvmMemmapEntry`. Asserted against the real layout below.
+const ENTRY_SIZE: u64 = 24;
+
+const _: () = assert!(core::mem::size_of::<HvmMemmapEntry>() as u64 == ENTRY_SIZE);
+
+/// How many map entries it is safe to dereference, given a hypervisor-supplied table address
+/// and count.
+///
+/// Two independent bounds, and neither was present: a hard cap on the COUNT, and the
+/// requirement that the whole table lie inside the identity-mapped window the boot trampoline
+/// actually established. Dereferencing outside it is not merely a fault — low physical memory
+/// holds device MMIO, and a read there can have side effects.
+///
+/// Pure arithmetic, so it is host-testable; the walk that uses it is not.
+pub(crate) fn walkable_entries(memmap_paddr: u64, declared: u32) -> usize {
+    if memmap_paddr == 0 || memmap_paddr >= IDENTITY_LIMIT {
+        return 0;
+    }
+    let capped = (declared as usize).min(MAX_MAP_ENTRIES);
+    let room = (IDENTITY_LIMIT - memmap_paddr) / ENTRY_SIZE;
+    capped.min(room as usize)
+}
+
 /// Parse the PVH memory map into `out`, clipped to the identity window. Returns the count.
 pub fn memory_map(start_info: u64, out: &mut [MemoryRegion]) -> usize {
     if start_info == 0 {
@@ -48,7 +80,7 @@ pub fn memory_map(start_info: u64, out: &mut [MemoryRegion]) -> usize {
     if si.magic != PVH_MAGIC || si.version < 1 || si.memmap_paddr == 0 {
         return 0;
     }
-    let entries = si.memmap_entries as usize;
+    let entries = walkable_entries(si.memmap_paddr, si.memmap_entries);
     let table = si.memmap_paddr as *const HvmMemmapEntry;
     let mut count = 0;
     for i in 0..entries {

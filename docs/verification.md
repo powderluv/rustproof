@@ -112,7 +112,7 @@ repeatedly, and the searches below still hold real axes constant:
 | `regions` | 10,368 configs × 7 plans, at `P=6`/`S=4`/`N=52` | at most 2 regions vs kernel `MAX_REGIONS=12`; owners ⊂ {A,B,C} |
 | `capabilities` | rights bits (in `CapSpace<2>`) + every slot of `CapSpace<16>` | slot CONTENTS are still hand-picked, not enumerated |
 | `mm` | `partition_holds_for_every_dma_top` (1,040 configs) + every 2-region map shape over unaligned starts/lengths/kinds | alloc/free *sequences* are drain-shaped, not arbitrary; maps are 2 regions, not arbitrary-length |
-| `kernel` | boot grant tables + every authority predicate (15 properties) | everything else in ~2400 lines — a foothold, not coverage |
+| `kernel` | boot grant tables, every authority predicate, the PVH map bound (17 properties) | everything else in ~2400 lines — a foothold, not coverage |
 
 **Closed 2026-08-11 — the deployed-shape gap.** Every crate above is generic over an `N`, and the
 kernel monomorphises each to a value the tests never instantiated: `CapSpace<16>`, `Ledger<16>`,

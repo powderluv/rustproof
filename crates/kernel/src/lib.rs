@@ -16,7 +16,10 @@ use hal::{Arch, Perms, Space, UserFrame};
 
 #[cfg(target_arch = "x86_64")]
 mod arch_x86;
-#[cfg(target_arch = "x86_64")]
+// Compiled on EVERY host, not just x86, so the bound it puts on the hypervisor-supplied
+// memory map can be host-tested anywhere — same reasoning as crates/sched's off-target
+// `Context`. Only x86 ever calls it.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 mod pvh;
 #[cfg(target_arch = "x86_64")]
 pub use arch_x86::X86 as CurrentArch;
@@ -2877,5 +2880,54 @@ mod tests {
         assert_eq!(caps_irq_line(&both, abi::CapId(2)), Some(IRQ_CONSOLE));
         assert_eq!(caps_irq_line(&both, abi::CapId(3)), Some(IRQ_TIMER));
         assert_ne!(IRQ_TIMER, IRQ_CONSOLE, "the two lines must be distinct");
+    }
+
+    // ------------------------------------------------------- untrusted firmware map
+    //
+    // `hvm_start_info` comes from the hypervisor, i.e. from outside the TCB, and the PVH walk
+    // dereferences one struct per declared entry. Both bounds below were absent.
+
+    #[test]
+    fn a_declared_entry_count_cannot_walk_off_the_table() {
+        // The hypervisor may declare anything up to u32::MAX. The walk must not follow it.
+        let n = pvh::walkable_entries(0x9000, u32::MAX);
+        assert!(
+            n <= pvh::MAX_MAP_ENTRIES,
+            "walked {n} entries on a declared count of u32::MAX"
+        );
+        // A sane count passes through untouched.
+        assert_eq!(pvh::walkable_entries(0x9000, 8), 8);
+        assert_eq!(pvh::walkable_entries(0x9000, 0), 0);
+    }
+
+    #[test]
+    fn the_map_table_must_lie_inside_the_identity_mapped_window() {
+        // Low physical memory holds device MMIO; a read outside the identity window is not
+        // merely a fault, it can have side effects.
+        assert_eq!(
+            pvh::walkable_entries(pvh::IDENTITY_LIMIT, 4),
+            0,
+            "a table at the identity limit was walked"
+        );
+        assert_eq!(
+            pvh::walkable_entries(pvh::IDENTITY_LIMIT + 0x1000, 4),
+            0,
+            "a table beyond the identity limit was walked"
+        );
+        assert_eq!(pvh::walkable_entries(0, 4), 0, "a null table was walked");
+
+        // A table that STARTS inside the window but whose declared entries would run past the
+        // end is clipped to what actually fits — not accepted whole, and not refused whole.
+        let near = pvh::IDENTITY_LIMIT - 100; // room for 4 x 24-byte entries
+        let n = pvh::walkable_entries(near, 64);
+        assert_eq!(n, 4, "expected the count clipped to what fits, got {n}");
+        assert!(
+            near + (n as u64) * 24 <= pvh::IDENTITY_LIMIT,
+            "the walk would still run past the identity limit"
+        );
+
+        // Exactly one entry of room.
+        assert_eq!(pvh::walkable_entries(pvh::IDENTITY_LIMIT - 24, 9), 1);
+        assert_eq!(pvh::walkable_entries(pvh::IDENTITY_LIMIT - 23, 9), 0);
     }
 }
