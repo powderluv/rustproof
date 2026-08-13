@@ -4,14 +4,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/nucleus-core",
     "crates/capabilities",
     "crates/deleg",
     "crates/runstate",
     "crates/regions",
     "crates/vspace",
     "crates/ipc",
-    "crates/iommu-amdvi",
     "crates/arch-x86_64",
     "crates/abi",
     "crates/mm",

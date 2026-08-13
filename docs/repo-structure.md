@@ -11,7 +11,9 @@ is `kernel` (the generic nucleus), `capabilities`, `deleg`, `regions`, `runstate
 `mm`, `ipc` and `abi`, and it carries **no Verus proofs yet** — the crates named here are covered
 by host unit tests, several exhaustive over their whole small state space (`tools/host-tests.sh`,
 which refuses to run if a crate containing `#[test]` is missing from its list). `nucleus-core` and
-`iommu-amdvi` are stubs that no build depends on. This paragraph previously called the set
+`iommu-amdvi` were empty stubs that no build depended on, and were DELETED on 2026-08-12; the
+remaining empty crates (`userland-rt`, `driver-shim`, `driver-host`) say so in their own doc
+comments. This paragraph previously called the set
 "verified" and said it "carries Verus proofs", neither of which was ever true; everything that touches raw hardware is quarantined into `arch-x86_64` (Kani-checked, Verus-external) and everything that is a full application — the GPU driver, `init` — runs as **untrusted userland ELFs** the nucleus loads. The physical `lite::` driver stack is vendored as C++ under `vendor/rocr-lite/`, compiled to a static archive, and linked into an untrusted `driver-host` process that reaches the nucleus only through the capability/IPC ABI in the shared `abi` crate.
 
 ---
@@ -24,7 +26,7 @@ Root of the new repository (`github.com/<org>/rustproof`), Cargo virtual workspa
 rustproof/
 ├── Cargo.toml                     # [workspace] virtual manifest, no root package
 ├── Cargo.lock                     # committed — proof + build reproducibility
-├── rust-toolchain.toml            # pinned nightly (dictated by the Verus release)
+├── rust-toolchain.toml            # pins STABLE 1.95.0 (Verus needs no nightly and does
 ├── .cargo/
 │   └── config.toml                # build-std, default target, `runner = tools/run-vm`
 ├── rustfmt.toml
@@ -37,14 +39,14 @@ rustproof/
 │   └── x86_64-rustproof-user.json
 │
 ├── toolchain/                     # pinned verifier toolchain (§2)
-│   ├── verus.lock                 # Verus git SHA + release tag + bundled Z3 version
-│   ├── fetch-verus.sh             # downloads/pins the exact Verus release + z3
+│   ├── verus.lock                 # UNFILLED placeholder (REPLACE_ME); Verus declined 2026-08-11
+│   ├── fetch-verus.sh             # NOT IMPLEMENTED (exit 1)
 │   └── README.md                  # how to reproduce the verifier bit-for-bit
 │
 ├── crates/
 │   │
-│   │  # ---------- VERIFIED TCB (Verus, no_std, minimal deps) ----------
-│   ├── nucleus-core/              # lib: the heart of the kernel, verified
+│   │  # ---------- TCB (no_std, ZERO deps; host-tested, NOT verified) ----------
+│   ├── kernel/                    # lib: the generic nucleus (this is the real one)
 │   │   ├── Cargo.toml             #   deps: vstd, builtin, builtin_macros, abi, capabilities, vspace, ipc
 │   │   ├── src/
 │   │   │   ├── lib.rs             #   #![no_std]; verus!{} module tree
@@ -71,7 +73,7 @@ rustproof/
 │   │   ├── src/lib.rs             #   Endpoint, send/recv/call state machine, verified
 │   │   └── proofs/progress.rs     #   proof: no message forged, sender authority preserved
 │   │
-│   ├── iommu-amdvi/              # lib: AMD-Vi (IOMMU) Device Table + I/O page tables
+│   │                              # (iommu-amdvi/ DELETED 2026-08-12 — was an empty stub
 │   │   ├── src/
 │   │   │   ├── lib.rs             #   DTE, IO-PTE (AMD v1 4-level), IOVA->SPA walk
 │   │   │   ├── model.rs           #   spec: reachable_spa(dev, iova) set  ── the CRUX
@@ -107,7 +109,7 @@ rustproof/
 │   │   └── src/main.rs            #   #![no_std] #![no_main]; Limine entry -> init nucleus-core
 │   │
 │   │  # ---------- UNTRUSTED USERLAND ----------
-│   ├── userland-rt/             # lib: minimal Rust userland runtime (start, alloc, IPC)
+│   ├── userland-rt/             # lib: EMPTY PLACEHOLDER (intended: userland runtime)
 │   │   └── src/lib.rs            #   syscall stubs (from abi), talc allocator, panic=abort
 │   │
 │   ├── init/                    # bin: root task; loads driver-host, wires caps, runs M0
@@ -134,7 +136,7 @@ rustproof/
 │   │   └── src/main.rs
 │   ├── mkimage/                 # builds the Limine boot ISO (nucleus + init + driver-host)
 │   ├── run-vm/                  # wraps libvirt/start-gpu-vm.sh to boot the ISO w/ passthrough
-│   └── verify/                  # runs Verus over the TCB crates with the pinned Z3 (CI gate)
+│   └── verify/                  # NOT IMPLEMENTED (prints 'verify: not yet implemented')
 │
 ├── libvirt/
 │   ├── rustproof-gpu.xml         # domain template: direct-boot ISO + gfx1201 <hostdev>
@@ -152,20 +154,36 @@ rustproof/
 
 **Crate responsibility summary**
 
-| Crate | Trust | Verified by | Responsibility |
+The **"Verified by"** column of this table used to read `Verus` for five crates. Nothing in this
+tree is verified by Verus, which the paragraph at the top of this file already said — the prose was
+corrected and the table under it was not, so the document contradicted itself in the place readers
+scan. The column now names what actually checks each crate today. Verus was evaluated and declined
+on 2026-08-11 with a written reversal condition; see docs/verification.md.
+
+`nucleus-core` and `iommu-amdvi` are **gone**, not merely stale rows. Both were empty crates whose
+doc comments called them "VERIFIED TCB" over zero functions and zero tests, and `nucleus-core`
+claimed the role — kernel state machine, syscall dispatch, scheduler — that `kernel` actually
+fills, so a reader looking for the dispatch could open it and find nothing. Their intent survives
+in this file and in docs/verification.md, which is where intent belongs.
+
+| Crate | Trust | Checked today by | Responsibility |
 |---|---|---|---|
-| `nucleus-core` | TCB | Verus | Kernel state machine, syscall dispatch, scheduler, top-level invariants |
-| `capabilities` | TCB | Verus | Capability objects, derivation/revocation, authority monotonicity |
-| `vspace` | TCB | Verus | x86_64 page tables + address-space model, walk refinement |
-| `ipc` | TCB | Verus | Endpoints, synchronous message transfer, authority preservation |
-| `iommu-amdvi` | TCB | Verus (+Kani for pokes) | AMD-Vi Device Table & I/O page tables; **the DMA-reach crux proof** |
-| `arch-x86_64` | TCB (unsafe) | **Kani** + audit | All raw MMIO/MSR/port/asm; Verus-external quarantine |
-| `abi` | boundary | (typed, small) | Shared syscall/IPC layout; emits a C header for the driver |
-| `nucleus` (bin) | TCB glue | — | Links verified libs into the bootable kernel image |
-| `userland-rt` | untrusted | — | Rust userland runtime for `init` |
-| `init` (bin) | untrusted | — | Root task: load driver-host, grant caps, drive M0 |
-| `driver-host` (bin) | **untrusted** | — | Hosts the C++ `lite::` driver in its own address space |
-| `driver-shim` | untrusted | — | libc/POSIX subset → nucleus IPC, for the C++ driver |
+| `kernel` | TCB | 17 host properties + both QEMU boots | The generic nucleus: syscall dispatch, scheduler, grant tables, authority predicates |
+| `capabilities` | TCB | 11 host tests, exhaustive over rights | Capability slots; insert / lookup / revoke |
+| `deleg` | TCB | 18 host tests, exhaustive over ≤5-edge forests | Cross-space delegation ledger, transitive revocation |
+| `runstate` | TCB | 17 host tests, exhaustive to `MAX_PROCS` slots | Park / deadlock / all-done decision |
+| `regions` | TCB | 16 host tests, 10k configs | Shared-region lifetime as an ordered plan |
+| `mm` | TCB | 18 host tests incl. arbitrary map shapes | Physical frame allocation; the DMA/general partition |
+| `vspace`(+riscv) | TCB | 12 / 14 host tests | Page tables + address-space model |
+| `ipc` | TCB | 14 host tests | Endpoints, synchronous transfer |
+| `sched` | TCB | 10 host tests on any host, 13 on x86 (3 are `cfg(target_arch = "x86_64")`) | Round-robin run queue; per-arch context switch |
+| `arch-x86_64` / `arch-riscv64` | TCB (unsafe) | QEMU boot only | All raw MMIO/MSR/port/asm; no host tests |
+| `abi` | boundary | 5 host tests | Shared syscall/IPC layout and the rights lattice |
+| `nucleus` / `nucleus-riscv` (bin) | TCB glue | QEMU boot | Link the nucleus into a bootable image |
+| `init` / `riscv-init` (bin) | untrusted | QEMU boot (30 assertions/arch) | Root tasks: the demo that exercises the ABI |
+| `userland-rt` | untrusted | — | **Empty placeholder.** Intended: Rust userland runtime |
+| `driver-host` (bin) | **untrusted** | — | **Empty placeholder.** Intended: host the C++ `lite::` driver |
+| `driver-shim` | untrusted | — | **Empty placeholder.** Intended: libc/POSIX subset → nucleus IPC |
 
 ---
 

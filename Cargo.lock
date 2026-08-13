@@ -58,10 +58,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iommu-amdvi"
-version = "0.0.0"
-
-[[package]]
 name = "ipc"
 version = "0.0.0"
 dependencies = [
@@ -124,10 +120,6 @@ dependencies = [
  "arch-x86_64",
  "kernel",
 ]
-
-[[package]]
-name = "nucleus-core"
-version = "0.0.0"
 
 [[package]]
 name = "nucleus-riscv"
