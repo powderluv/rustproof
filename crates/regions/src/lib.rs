@@ -717,4 +717,72 @@ mod tests {
             }
         });
     }
+
+    /// The deployed `PLAN_STEPS` bound is SUFFICIENT — checked, not derived on paper.
+    ///
+    /// The kernel sizes its teardown plan as
+    /// `PLAN_STEPS = MAX_PROCS*SHARE_SLOTS + 2*MAX_REGIONS + SHARE_SLOTS` = 6*4 + 2*12 + 4 = 52
+    /// (crates/kernel/src/lib.rs) and treats a truncated plan as FATAL — it refuses to run a
+    /// half-teardown and exits, because releasing frames while a mapping survives is exactly
+    /// the cross-process use-after-free `well_ordered` exists to forbid. So an undersized bound
+    /// is fail-safe rather than memory-unsafe: it kills the machine at teardown instead of
+    /// corrupting it. That is still a boot-killer reachable from ordinary use, and nothing
+    /// checked it, because every search here runs with at most 2 regions.
+    ///
+    /// This builds the largest teardown the deployed constants permit: MAX_REGIONS live
+    /// regions all owned by the dying identity, and every one of the MAX_PROCS*SHARE_SLOTS
+    /// share slots naming one of them.
+    #[test]
+    fn a_worst_case_teardown_fits_the_deployed_plan() {
+        const MAX_REGIONS: usize = 12; // kernel's value
+        let regions: Vec<Region> = (1..=MAX_REGIONS as u64)
+            .map(|id| Region::new(id, A))
+            .collect();
+        // Every share slot in the system names a region: 24 slots over 12 regions, 2 each.
+        let mut holders: Vec<Holder<S>> = Vec::new();
+        let mut next = 0u64;
+        for _ in 0..P {
+            let mut slots = [0u64; S];
+            for slot in slots.iter_mut() {
+                *slot = (next % MAX_REGIONS as u64) + 1;
+                next += 1;
+            }
+            holders.push(Holder {
+                live: true,
+                id: A,
+                slots,
+            });
+        }
+
+        let plan: Plan<N> = teardown(&regions, &holders, 0, A);
+        assert!(
+            !plan.truncated,
+            "the worst-case teardown does not fit PLAN_STEPS = {N}: it needed more than {} steps",
+            plan.len()
+        );
+        assert!(
+            plan.well_ordered(),
+            "the worst-case plan releases a region before something unmaps it"
+        );
+        // Every region is released exactly once, and every naming slot is unmapped.
+        let releases = plan
+            .steps()
+            .filter(|s| matches!(s, Step::Release { .. }))
+            .count();
+        assert_eq!(releases, MAX_REGIONS, "not every owned region was released");
+        let unmaps = plan
+            .steps()
+            .filter(|s| matches!(s, Step::Unmap { .. }))
+            .count();
+        assert_eq!(unmaps, P * S, "not every naming slot was unmapped");
+
+        // And the flag is not decorative: the SAME configuration in a plan one step too small
+        // must report truncation rather than silently dropping a step. Without this the
+        // assertion above passes for a `Plan` that can never truncate at all.
+        let tight: Plan<{ 12 * 2 + 6 * 4 - 1 }> = teardown(&regions, &holders, 0, A);
+        assert!(
+            tight.truncated,
+            "an undersized plan did not report truncation — a step was dropped silently"
+        );
+    }
 }

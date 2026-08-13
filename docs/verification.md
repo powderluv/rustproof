@@ -107,9 +107,9 @@ repeatedly, and the searches below still hold real axes constant:
 | Crate | Search | Axis still held constant |
 |---|---|---|
 | `abi` | all 64 rights pairs over the 3-bit lattice, + `from_user` over every u8 | — (the mask that makes `0..8` exhaustive now lives in `abi::CapRights::from_user` and is pinned by its own test) |
-| `deleg` | all forests of ≤5 edges on 6 endpoints, in `Ledger<16>`; ≤3-edge forests in every insertion order | universe size (3 procs / 2 caps vs kernel 6 × 16) |
+| `deleg` | all forests of ≤5 edges on 6 endpoints, in `Ledger<16>`; ≤3-edge forests in every insertion order | universe size (3 procs / 2 caps vs kernel 6 × 16) — measured NOT to be a gap: both proc/cap-confusion mutants die on the current universe |
 | `runstate` | every state vector of length 1..=6 × 7 predicates | endpoint/line values ∈ {0,1}; 7 of the boolean functions over the reachable domain |
-| `regions` | 20,736 configs × 7 plans, at `P=6`/`S=4`/`N=52`, region tables both compacted AND with a dead entry first | region ARITY (≤2 live) — but measured: `take(1)`/`take(2)` on the teardown loop is already caught, so arity is covered and it was the COMPACTION that was not |
+| `regions` | 20,736 configs × 7 plans at `P=6`/`S=4`/`N=52` (tables both compacted and with a dead entry first), plus the worst-case teardown at `MAX_REGIONS=12` | region ARITY (≤2 live) — but measured: `take(1)`/`take(2)` on the teardown loop is already caught, so arity is covered and it was the COMPACTION that was not |
 | `capabilities` | rights bits, every slot of `CapSpace<16>`, occupancy under a NONE-rights slot, two slots on one object | cap TYPE is thin here (5 of 11 variants) — but measured: covered at the repo level by `kernel`'s Region tests |
 | `mm` | `partition_holds_for_every_dma_top` (1,040 configs), every **3**-region map shape over unaligned starts/lengths/kinds asserting the exact allocatable SET (110,592 configs), and 5×4000-step arbitrary alloc/free interleavings | maps are 3 regions, not arbitrary-length |
 | `kernel` | boot grant tables, every authority predicate, the PVH map bound (17 properties) | everything else in ~2400 lines — a foothold, not coverage |
