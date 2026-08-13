@@ -111,7 +111,7 @@ repeatedly, and the searches below still hold real axes constant:
 | `runstate` | every state vector of length 1..=6 × 7 predicates | endpoint/line values ∈ {0,1}; 7 of the boolean functions over the reachable domain |
 | `regions` | 20,736 configs × 7 plans, at `P=6`/`S=4`/`N=52`, region tables both compacted AND with a dead entry first | region ARITY (≤2 live) — but measured: `take(1)`/`take(2)` on the teardown loop is already caught, so arity is covered and it was the COMPACTION that was not |
 | `capabilities` | rights bits, every slot of `CapSpace<16>`, occupancy under a NONE-rights slot, two slots on one object | cap TYPE is thin here (5 of 11 variants) — but measured: covered at the repo level by `kernel`'s Region tests |
-| `mm` | `partition_holds_for_every_dma_top` (1,040 configs), every **3**-region map shape over unaligned starts/lengths/kinds (110,592 configs), and 5×4000-step arbitrary alloc/free interleavings | the map oracle is ONE-SIDED (see below); maps are 3 regions, not arbitrary-length |
+| `mm` | `partition_holds_for_every_dma_top` (1,040 configs), every **3**-region map shape over unaligned starts/lengths/kinds asserting the exact allocatable SET (110,592 configs), and 5×4000-step arbitrary alloc/free interleavings | maps are 3 regions, not arbitrary-length |
 | `kernel` | boot grant tables, every authority predicate, the PVH map bound (17 properties) | everything else in ~2400 lines — a foothold, not coverage |
 
 **Closed 2026-08-11 — the deployed-shape gap.** Every crate above is generic over an `N`, and the
@@ -135,12 +135,23 @@ Two candidate mutants were *rejected* as evidence because they died under the ol
 index 0. The widening did not buy those, and the first of them had already been written into a
 comment as justification before being run; the comment was corrected rather than kept.
 
-**A NEW AXIS, found 2026-08-13 and not closed.** `mm`'s map searches are ONE-SIDED oracles: they
-assert that every frame handed out is legitimate (fully inside a Usable region, touched by no
-non-Usable one) and never that a frame which SHOULD be allocatable actually is. An allocator that
-marked everything USED would satisfy them vacuously — the `frames_seen > 0` guard rules out only
-the totally-degenerate case. `alloc_until_exhausted_then_none` covers the count on ONE hardcoded
-map. Nobody had listed this; it is listed now.
+**A NEW AXIS, found 2026-08-13 and CLOSED the same day.** `mm`'s map search was a ONE-SIDED
+oracle: it asserted that every frame handed out is legitimate (fully inside a Usable region,
+touched by no non-Usable one) and never that a frame which SHOULD be allocatable actually is. An
+allocator that marked everything USED would have satisfied it — the `frames_seen > 0` guard rules
+out only the totally-degenerate case, and `alloc_until_exhausted_then_none` compares `free_count()`
+against the drained count, both derived from the SAME bitmap, so it is self-consistent under any
+uniform under-freeing.
+
+Demonstrated rather than argued, and it took three tries: the first two candidate defects were
+caught after all (by `construction_counts_are_correct` and
+`unaligned_region_bounds_only_yield_whole_frames`, which ARE two-sided on the shapes they use).
+The one that survived was `if end < PAGE_SIZE` -> `if end < 2 * PAGE_SIZE` in the Usable pass — a
+plausible off-by-one in the minimum-size guard that silently discards every Usable region under
+two pages. The hardcoded map's regions are megabytes wide; only the search has shapes small enough
+to notice, and it was not looking. The search now recomputes the expected allocatable SET from the
+region list with plain arithmetic and asserts set equality, so under- and over-freeing both fail.
+Three under-freeing mutants that previously survived now fail.
 
 **Some listed axes are gaps and some are not, and only measurement tells them apart.** Of six
 axes probed by applying a real single-expression mutation and running the existing suite:

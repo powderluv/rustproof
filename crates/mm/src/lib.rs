@@ -859,6 +859,60 @@ mod tests {
                                     );
                                                 frames_seen += 1;
                                             }
+                                            // TWO-SIDED. Everything above asserts only that what was handed out is
+                                            // LEGITIMATE; none of it asks whether a frame that SHOULD be allocatable
+                                            // actually was. An allocator that marked everything USED satisfies a
+                                            // one-sided oracle completely, and the `frames_seen > 0` guard below rules
+                                            // out only the totally degenerate case.
+                                            //
+                                            // Measured: `if end < PAGE_SIZE` -> `if end < 2 * PAGE_SIZE` in the Usable
+                                            // pass -- a plausible off-by-one in the minimum-size guard, which silently
+                                            // discards every Usable region under two pages -- left this suite fully
+                                            // GREEN. The hardcoded map's regions are megabytes wide, so only this search
+                                            // has shapes small enough to notice, and it was not looking.
+                                            //
+                                            // The expectation is recomputed here with plain arithmetic rather than by
+                                            // calling into the crate, so one defect cannot move both sides at once.
+                                            let mut top: Option<u64> = None;
+                                            for r in regions.iter() {
+                                                if r.kind != MemoryKind::Usable || r.len == 0 {
+                                                    continue;
+                                                }
+                                                let lo_f = (r.start + PAGE_SIZE - 1) / PAGE_SIZE;
+                                                let end_f = r.end() / PAGE_SIZE;
+                                                if end_f > lo_f {
+                                                    let last_f = end_f - 1;
+                                                    top =
+                                                        Some(top.map_or(last_f, |t: u64| {
+                                                            t.max(last_f)
+                                                        }));
+                                                }
+                                            }
+                                            let mut expected: Vec<u64> = Vec::new();
+                                            for f in 0..top.map_or(0, |t| t + 1) {
+                                                let lo = f * PAGE_SIZE;
+                                                let end = lo + PAGE_SIZE;
+                                                let backed = regions.iter().any(|r| {
+                                                    r.kind == MemoryKind::Usable
+                                                        && r.len > 0
+                                                        && r.start <= lo
+                                                        && end <= r.end()
+                                                });
+                                                let poisoned = regions.iter().any(|r| {
+                                                    r.kind != MemoryKind::Usable
+                                                        && r.len > 0
+                                                        && lo < r.end()
+                                                        && r.start < end
+                                                });
+                                                if backed && !poisoned {
+                                                    expected.push(lo);
+                                                }
+                                            }
+                                            seen.sort_unstable();
+                                            assert_eq!(
+                                                seen, expected,
+                                                "the set handed out is not the set that should be: {regions:?}"
+                                            );
                                             configs += 1;
                                         }
                                     }
