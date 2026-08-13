@@ -330,4 +330,70 @@ mod tests {
                 .unwrap();
         }
     }
+
+    /// A capability carrying NO rights still OCCUPIES its slot.
+    ///
+    /// Possession is not authority, but it is still possession — and the two are easy to
+    /// conflate in `first_free`, which asks only whether a slot is free. Measured: relaxing it
+    /// to `s.is_free() || s.rights == CapRights::NONE` leaves this crate at 11/11, the kernel at
+    /// 17/17, and the whole host suite green.
+    ///
+    /// It is reachable, not hypothetical. The kernel's worker role begins with
+    /// `NO_AUTHORITY = (Endpoint, NONE, 0)` at entry 0 precisely so that entry `i` becomes
+    /// `CapId(i)`, and `load_process` fills the space by inserting the table in order. Under
+    /// that mutation the placeholder's slot is handed to the NEXT insert — the worker's
+    /// `(Mmio, ALL, ...)` — so `CapId(0)` silently stops being the shared endpoint and becomes
+    /// full device authority. The kernel's own tests check the grant TABLE; none of them builds
+    /// a `CapSpace` from one, so nothing noticed.
+    ///
+    /// What this constructs that no other test here does: a live NONE-rights slot with a
+    /// SECOND insert behind it. The rights loop above makes a fresh space per iteration and
+    /// inserts exactly one capability, so it pins "a NONE-rights cap can be looked up" and
+    /// cannot pin "a NONE-rights cap keeps its slot".
+    #[test]
+    fn a_rights_less_capability_still_occupies_its_slot() {
+        let mut cs: CapSpace<4> = CapSpace::new();
+        let placeholder = cs.insert(CapType::Endpoint, CapRights::NONE, 0).unwrap();
+        assert_eq!(placeholder, CapId(0));
+        let device = cs
+            .insert(CapType::Mmio, CapRights::ALL, 0xE000_0000)
+            .unwrap();
+        assert_eq!(
+            device,
+            CapId(1),
+            "the next insert took the rights-less slot instead of the free one"
+        );
+        let kept = cs.lookup(placeholder).expect("placeholder was evicted");
+        assert_eq!(kept.cap_type, CapType::Endpoint);
+        assert_eq!(kept.rights, CapRights::NONE);
+        assert_eq!(cs.len(), 2);
+    }
+
+    /// `revoke` empties the slot it is NAMED, not every slot naming the same object.
+    ///
+    /// Measured: replacing it with "empty every slot whose `object` matches" leaves this crate
+    /// at 11/11 and the kernel at 17/17, because every hand-written scenario in this file gives
+    /// each slot a DISTINCT object — so nothing can tell "the named slot" from "everything
+    /// naming that object".
+    ///
+    /// Two capabilities on one object is the normal shape, not a corner case: the kernel's
+    /// worker holds an `Mmio` with ALL rights and a second `Mmio` on the SAME window with only
+    /// WRITE, and the whole point of the pair is that revoking one leaves the other. If revoke
+    /// took both, `holds_mmio` would go false at the first revocation and a mapping would be
+    /// torn down early.
+    #[test]
+    fn revoke_spares_a_sibling_naming_the_same_object() {
+        const WINDOW: u64 = 0xE000_0000;
+        let mut cs: CapSpace<4> = CapSpace::new();
+        let full = cs.insert(CapType::Mmio, CapRights::ALL, WINDOW).unwrap();
+        let weak = cs.insert(CapType::Mmio, CapRights::WRITE, WINDOW).unwrap();
+        cs.revoke(full);
+        assert!(cs.lookup(full).is_none(), "the named slot survived revoke");
+        let survivor = cs
+            .lookup(weak)
+            .expect("revoke took a sibling naming the same object");
+        assert_eq!(survivor.rights, CapRights::WRITE);
+        assert_eq!(survivor.object, WINDOW);
+        assert_eq!(cs.len(), 1);
+    }
 }

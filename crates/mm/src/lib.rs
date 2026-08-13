@@ -787,60 +787,82 @@ mod tests {
                     for s1 in STARTS {
                         for l1 in LENS {
                             for k1 in KINDS {
-                                let regions = [
-                                    MemoryRegion {
-                                        start: s0,
-                                        len: l0,
-                                        kind: k0,
-                                    },
-                                    MemoryRegion {
-                                        start: s1,
-                                        len: l1,
-                                        kind: k1,
-                                    },
-                                ];
-                                let words = BitmapAllocator::bitmap_words_needed(&regions);
-                                let mut a =
-                                    BitmapAllocator::new(&regions, leak_bitmap(words), 0, 0);
-                                let mut seen: Vec<u64> = Vec::new();
-                                while let Some(f) = a.alloc_frame() {
-                                    let lo = f.as_u64();
-                                    let hi = lo + PAGE_SIZE;
-                                    assert!(
-                                        lo % PAGE_SIZE == 0,
-                                        "unaligned frame {lo:#x} from {regions:?}"
-                                    );
-                                    assert!(
+                                // THREE regions, not two. With only two, the non-Usable re-mark
+                                // pass can never be asked to handle a region it has already
+                                // walked past: `.take(2)` on that loop, and `continue` -> `break`
+                                // in its bounds check, both left the 2-region suite fully GREEN
+                                // while handing Reserved frames to the general pool. A third
+                                // region is what makes "keep going after this one" decidable.
+                                for s2 in STARTS {
+                                    for l2 in LENS {
+                                        for k2 in KINDS {
+                                            let regions = [
+                                                MemoryRegion {
+                                                    start: s0,
+                                                    len: l0,
+                                                    kind: k0,
+                                                },
+                                                MemoryRegion {
+                                                    start: s1,
+                                                    len: l1,
+                                                    kind: k1,
+                                                },
+                                                MemoryRegion {
+                                                    start: s2,
+                                                    len: l2,
+                                                    kind: k2,
+                                                },
+                                            ];
+                                            let words =
+                                                BitmapAllocator::bitmap_words_needed(&regions);
+                                            let mut a = BitmapAllocator::new(
+                                                &regions,
+                                                leak_bitmap(words),
+                                                0,
+                                                0,
+                                            );
+                                            let mut seen: Vec<u64> = Vec::new();
+                                            while let Some(f) = a.alloc_frame() {
+                                                let lo = f.as_u64();
+                                                let hi = lo + PAGE_SIZE;
+                                                assert!(
+                                                    lo % PAGE_SIZE == 0,
+                                                    "unaligned frame {lo:#x} from {regions:?}"
+                                                );
+                                                assert!(
                                         !seen.contains(&lo),
                                         "frame {lo:#x} handed out twice from {regions:?}"
                                     );
-                                    seen.push(lo);
-                                    // Fully backed by some Usable region.
-                                    let backed = regions.iter().any(|r| {
-                                        r.kind == MemoryKind::Usable
-                                            && r.len > 0
-                                            && r.start <= lo
-                                            && hi <= r.end()
-                                    });
-                                    assert!(
+                                                seen.push(lo);
+                                                // Fully backed by some Usable region.
+                                                let backed = regions.iter().any(|r| {
+                                                    r.kind == MemoryKind::Usable
+                                                        && r.len > 0
+                                                        && r.start <= lo
+                                                        && hi <= r.end()
+                                                });
+                                                assert!(
                                         backed,
                                         "frame {lo:#x} is not fully inside any Usable region: \
                                          {regions:?}"
                                     );
-                                    // Touched by NO non-Usable region.
-                                    let poisoned = regions.iter().any(|r| {
-                                        r.kind != MemoryKind::Usable
-                                            && r.len > 0
-                                            && lo < r.end()
-                                            && r.start < hi
-                                    });
-                                    assert!(
+                                                // Touched by NO non-Usable region.
+                                                let poisoned = regions.iter().any(|r| {
+                                                    r.kind != MemoryKind::Usable
+                                                        && r.len > 0
+                                                        && lo < r.end()
+                                                        && r.start < hi
+                                                });
+                                                assert!(
                                         !poisoned,
                                         "frame {lo:#x} overlaps a non-Usable region: {regions:?}"
                                     );
-                                    frames_seen += 1;
+                                                frames_seen += 1;
+                                            }
+                                            configs += 1;
+                                        }
+                                    }
                                 }
-                                configs += 1;
                             }
                         }
                     }

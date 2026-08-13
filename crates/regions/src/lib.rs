@@ -419,6 +419,8 @@ mod tests {
         let mut out = Vec::new();
         for r1 in [None, Some(A), Some(B)] {
             for r2 in [None, Some(A), Some(B)] {
+                // COMPACTED: an absent region contributes no entry, so every live entry sits
+                // before every gap. This is what the table used to be, exclusively.
                 let mut t = Vec::new();
                 if let Some(o) = r1 {
                     t.push(Region::new(1, o));
@@ -427,6 +429,33 @@ mod tests {
                     t.push(Region::new(2, o));
                 }
                 out.push(t);
+
+                // NOT compacted: an absent region occupies its slot as a DEAD entry, so a
+                // `live: false` entry can PRECEDE a live one — which the kernel's table does,
+                // since `Region::EMPTY` is left in place when a region is released
+                // (`*r = Region::EMPTY` in the kernel's Release step) rather than the table
+                // being shuffled down.
+                //
+                // Without this, every walk over the table could stop at the first dead entry
+                // and no test would notice: `take_while(|r| r.live)` on `teardown`'s region
+                // loop left the whole suite green. The HOLDER universe below already varies a
+                // dead entry's position, with a comment saying exactly why; the same reasoning
+                // simply had not been applied here.
+                let dead = Region {
+                    live: false,
+                    id: 9,
+                    owner: C,
+                };
+                let mut d = Vec::new();
+                d.push(match r1 {
+                    Some(o) => Region::new(1, o),
+                    None => dead,
+                });
+                d.push(match r2 {
+                    Some(o) => Region::new(2, o),
+                    None => dead,
+                });
+                out.push(d);
             }
         }
         out

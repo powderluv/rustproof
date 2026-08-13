@@ -109,9 +109,9 @@ repeatedly, and the searches below still hold real axes constant:
 | `abi` | all 64 rights pairs over the 3-bit lattice, + `from_user` over every u8 | — (the mask that makes `0..8` exhaustive now lives in `abi::CapRights::from_user` and is pinned by its own test) |
 | `deleg` | all forests of ≤5 edges on 6 endpoints, in `Ledger<16>`; ≤3-edge forests in every insertion order | universe size (3 procs / 2 caps vs kernel 6 × 16) |
 | `runstate` | every state vector of length 1..=6 × 7 predicates | endpoint/line values ∈ {0,1}; 7 of the boolean functions over the reachable domain |
-| `regions` | 10,368 configs × 7 plans, at `P=6`/`S=4`/`N=52` | at most 2 regions vs kernel `MAX_REGIONS=12`; owners ⊂ {A,B,C} |
-| `capabilities` | rights bits (in `CapSpace<2>`) + every slot of `CapSpace<16>` | slot CONTENTS are still hand-picked, not enumerated |
-| `mm` | `partition_holds_for_every_dma_top` (1,040 configs), every 2-region map shape over unaligned starts/lengths/kinds, and 5×4000-step arbitrary alloc/free interleavings | maps are 2 regions, not arbitrary-length |
+| `regions` | 20,736 configs × 7 plans, at `P=6`/`S=4`/`N=52`, region tables both compacted AND with a dead entry first | region ARITY (≤2 live) — but measured: `take(1)`/`take(2)` on the teardown loop is already caught, so arity is covered and it was the COMPACTION that was not |
+| `capabilities` | rights bits, every slot of `CapSpace<16>`, occupancy under a NONE-rights slot, two slots on one object | cap TYPE is thin here (5 of 11 variants) — but measured: covered at the repo level by `kernel`'s Region tests |
+| `mm` | `partition_holds_for_every_dma_top` (1,040 configs), every **3**-region map shape over unaligned starts/lengths/kinds (110,592 configs), and 5×4000-step arbitrary alloc/free interleavings | the map oracle is ONE-SIDED (see below); maps are 3 regions, not arbitrary-length |
 | `kernel` | boot grant tables, every authority predicate, the PVH map bound (17 properties) | everything else in ~2400 lines — a foothold, not coverage |
 
 **Closed 2026-08-11 — the deployed-shape gap.** Every crate above is generic over an `N`, and the
@@ -134,6 +134,31 @@ Two candidate mutants were *rejected* as evidence because they died under the ol
 `revoke_from` fixpoint capped at two rounds, and `classify` collapsing per-process authority to
 index 0. The widening did not buy those, and the first of them had already been written into a
 comment as justification before being run; the comment was corrected rather than kept.
+
+**A NEW AXIS, found 2026-08-13 and not closed.** `mm`'s map searches are ONE-SIDED oracles: they
+assert that every frame handed out is legitimate (fully inside a Usable region, touched by no
+non-Usable one) and never that a frame which SHOULD be allocatable actually is. An allocator that
+marked everything USED would satisfy them vacuously — the `frames_seen > 0` guard rules out only
+the totally-degenerate case. `alloc_until_exhausted_then_none` covers the count on ONE hardcoded
+map. Nobody had listed this; it is listed now.
+
+**Some listed axes are gaps and some are not, and only measurement tells them apart.** Of six
+axes probed by applying a real single-expression mutation and running the existing suite:
+
+| Axis | Verdict | Evidence |
+|---|---|---|
+| `deleg` insertion order | NOT a gap | 3 order-dependence mutants, all already caught |
+| `mm` alloc/free sequencing | NOT a gap | 4 mutants incl. the cursor/floor interleaving, all already caught |
+| `mm` map length (2 regions) | **REAL** | `.take(2)`, `continue`→`break`, and a kind-filter on the non-Usable pass ALL survived |
+| `capabilities` occupancy | **REAL** | `first_free` reusing a NONE-rights slot survived; reachable via the kernel's `NO_AUTHORITY` placeholder |
+| `capabilities` revoke scope | **REAL** | revoke emptying every slot naming the same object survived |
+| `regions` table compaction | **REAL** | `take_while(\|r\| r.live)` on teardown AND destroy both survived |
+
+Note the shape of the two that were NOT gaps versus the four that were: the misses were about
+ORDER and SEQUENCE, dimensions the existing searches already varied incidentally. The real gaps
+were about a second entity existing at all — a third region, a second capability on one object, a
+dead entry before a live one. A search that varies one thing thoroughly does not thereby vary how
+many things there are.
 
 **Two of the listed axes turned out not to be gaps at all**, and the pattern is worth stating
 because this table is what makes them look like gaps. `deleg`'s insertion order and `mm`'s
@@ -288,7 +313,7 @@ These six are the honest edge of the guarantee. M5's assurance case states them 
 - Pin the **exact Z3** binary the release ships (historically the 4.12.x line; take whatever `tools/get-z3.*` fetches for your tag). Record its version and SHA-256 in `toolchain.lock`. Z3 patch bumps change proof search and can flip a green proof red (or, worse, mask a real failure).
 - Record all three (Verus SHA, rustc nightly, Z3 version+hash) in `docs/toolchain.lock` and assert them in CI. Upgrades are a deliberate, reviewed event with a full re-verify, never incidental.
 
-**CI job** (`.github/workflows/verus.yml`), runs on **every** PR touching `nucleus/`:
+**CI job** (planned as `.github/workflows/verus.yml`; DOES NOT EXIST — the only workflow is `ci.yml`, two jobs, no proof gate):
 
 ```yaml
 - run: cargo verus verify -p nucleus --release

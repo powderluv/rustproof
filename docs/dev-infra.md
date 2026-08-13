@@ -149,6 +149,31 @@ The nucleus image from §1.1 is the *same artifact* booted here — the only del
 
 ## 2. CI
 
+### WHAT ACTUALLY RUNS (corrected 2026-08-13)
+
+One workflow, `.github/workflows/ci.yml`, with **two** jobs. Everything else in this section is
+design intent for a system that does not exist yet; read it as a plan, not a description.
+
+| Job | Steps that actually run |
+|---|---|
+| `x86_64` | `cargo fmt --all --check`; `tools/host-tests.sh` (28 suites); `tools/run-qemu.sh`; `PROVOKE_FAULT=1 tools/run-qemu.sh` |
+| `riscv64` | `tools/run-qemu-riscv.sh` |
+
+There is **no proof job, no Kani job, no nightly hardware job**, and no `cargo xtask`. `tools/xtask`,
+`tools/mkimage`, `tools/run-vm` and `tools/verify` all exist as crates that print
+"not yet implemented (pre-M0 scaffold)" and exit — which is honest, and they are left alone.
+
+`ci/build.yml` and `ci/verify.yml` were **deleted on 2026-08-13**. They were not in
+`.github/workflows/`, so GitHub never ran either of them, yet they declared
+`on: [push, pull_request]` and `verify.yml` described itself as a "separate and required" proof
+gate. They invoked `cargo xtask verify` and `./toolchain/fetch-verus.sh` (which exits 1) over
+`crates/nucleus-core` and `crates/iommu-amdvi` — two crates deleted the day before for claiming to
+be a verified TCB over zero code. Prose that describes an unbuilt plan is fine when it says so; a
+YAML file in a directory called `ci/` is read as configuration, and this one was three layers of
+dead reference deep.
+
+### The plan below is NOT implemented
+
 Five jobs. Four run on ordinary GitHub-hosted (or self-hosted x86) Linux; one runs on the gpu-host self-hosted runner nightly. Fail-fast, no job silently degrades.
 
 ### 2.1 The rustc/Verus toolchain coupling (read this first)
