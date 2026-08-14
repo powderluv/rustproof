@@ -51,6 +51,37 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-14 (later) — `IommuDomain` has a referent, for the half that can fail
+
+`abi::CapType::IommuDomain` was a bare enum variant with nothing behind it. `crates/iommu` now
+holds the DECISION half of a domain: which frames a device may reach, with which rights, and
+whether the mappings it holds are covered by the capabilities that authorized them —
+`device_reachable ⊆ granted`, the crux stated at docs/nucleus-design.md.
+
+**It touches no hardware.** No Device Table Entry, no register, no invalidation. That is stated
+first in the crate's own doc comment, because a crate was deleted from this repo two days
+earlier for calling itself "VERIFIED TCB … the DMA-reach CRUX proof" over zero code, and the
+distinction between deciding and effecting is the whole difference.
+
+What makes it not theatre: the invariant is preserved by construction ONLY if the operations are
+right, and four mutants prove it can fail — a `revoke` that drops the grant while leaving the
+mapping (the V5 stale-mapping bug), a `map` that skips the rights check (amplification), a `map`
+that skips the grant check, and a grant narrowed without withdrawing the mapping it no longer
+covers. Each is caught by the exhaustive 3-op search.
+
+It is wired, not shelved: `make_region` grants each DMA frame with the minting capability's
+rights, the `Release` step withdraws them BEFORE the frames return to the pool, and the boot
+asserts the grant set tracks the live DMA regions exactly. Measured — deleting the withdrawal
+gives `[iommu] domain grants 13 frame(s) for 0 live DMA page(s)` and fails the boot, so 13 real
+frames pass through the grant path per run.
+
+What is still absent, plainly: no IOMMU driver, no DTE, no I/O page tables, no device. Nothing
+maps, so the containment half of the boot assertion is trivially satisfied there; only the
+crate's own search exercises it. The §1.2 revisit is NOT yet triggered — that needs
+`MAKE_REGION` minting from a constrained extent, which still does not happen.
+
+---
+
 ## DECISION 2026-08-14 — device discovery is DECLINED; the IOMMU is the blocker
 
 A design pass asked how a process should discover and map a REAL device (PCI enumeration in the
@@ -149,6 +180,7 @@ repeatedly, and the searches below still hold real axes constant:
 | `runstate` | every state vector of length 1..=6 × 7 predicates | endpoint/line values ∈ {0,1}; 7 of the boolean functions over the reachable domain |
 | `regions` | 20,736 configs × 7 plans at `P=6`/`S=4`/`N=52` (tables both compacted and with a dead entry first), plus the worst-case teardown at `MAX_REGIONS=12` | region ARITY (≤2 live) — but measured: `take(1)`/`take(2)` on the teardown loop is already caught, so arity is covered and it was the COMPACTION that was not |
 | `capabilities` | rights bits, every slot of `CapSpace<16>`, occupancy under a NONE-rights slot, two slots on one object | cap TYPE is thin here (5 of 11 variants) — but measured: covered at the repo level by `kernel`'s Region tests |
+| `iommu` | every 3-op sequence over grant/revoke/map/unmap (17,576 sequences, invariant checked after EVERY step) | there is no hardware half — nothing maps, so the containment side is satisfied trivially IN THE KERNEL (the crate's own search does exercise it) |
 | `mm` | `partition_holds_for_every_dma_top` (1,040 configs), every **3**-region map shape over unaligned starts/lengths/kinds asserting the exact allocatable SET (110,592 configs), and 5×4000-step arbitrary alloc/free interleavings | maps are 3 regions, not arbitrary-length |
 | `kernel` | boot grant tables, every authority predicate, the PVH map bound (17 properties) | everything else in ~2400 lines — a foothold, not coverage |
 

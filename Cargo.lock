@@ -58,6 +58,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "iommu"
+version = "0.0.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
 name = "ipc"
 version = "0.0.0"
 dependencies = [
@@ -75,6 +82,7 @@ dependencies = [
  "deleg",
  "hal",
  "hostcontract",
+ "iommu",
  "ipc",
  "loader",
  "loader-riscv",

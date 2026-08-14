@@ -16,6 +16,7 @@ HOST_CRATES=(
     vspace-riscv
     capabilities
     deleg
+    iommu
     runstate
     regions
     ipc

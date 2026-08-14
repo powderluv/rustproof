@@ -9,6 +9,7 @@ publish = false
 abi = { path = "../abi" }
 hal = { path = "../hal" }
 mm = { path = "../mm" }
+iommu = { path = "../iommu" }
 capabilities = { path = "../capabilities" }
 deleg = { path = "../deleg" }
 runstate = { path = "../runstate" }

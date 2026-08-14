@@ -5,6 +5,7 @@
 resolver = "2"
 members = [
     "crates/capabilities",
+    "crates/iommu",
     "crates/deleg",
     "crates/runstate",
     "crates/regions",

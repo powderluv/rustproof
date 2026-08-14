@@ -117,7 +117,7 @@ Eight typed capabilities, each a rights-decorated reference to a kernel object:
 | `Endpoint` | synchronous IPC port | send/recv (rights-gated) |
 | `Notification` | async signal word | signal/wait; IRQ target |
 | `Tcb` | thread control block | configure/resume a thread |
-| `IommuDomain` | AMD-Vi domain (DTE + I/O page tables) | map Frames for device DMA (M3+) |
+| `IommuDomain` | AMD-Vi domain (DTE + I/O page tables) — **decision half only**: `crates/iommu` tracks grants/mappings and enforces `reachable ⊆ granted`; NO DTE, NO I/O page tables, NO hardware yet | map Frames for device DMA (M3+) |
 | `Mmio` | a device register aperture (phys range) | map device regs into an AS |
 
 ```rust

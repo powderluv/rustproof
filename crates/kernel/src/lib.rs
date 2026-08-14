@@ -89,6 +89,27 @@ const REGION_QUOTA: usize = abi::REGION_QUOTA;
 /// Largest region, in pages. Bounds both the frames one process can tie up and the size of
 /// the per-process share window below.
 const REGION_MAX_PAGES: u64 = 4;
+
+/// Every DMA frame the nucleus has handed out, as the device domain would see it.
+///
+/// This is the BOOKKEEPING half of an `abi::CapType::IommuDomain`. It writes no Device Table
+/// Entry and pokes no register — there is no IOMMU in this tree and no device behind it, so
+/// nothing is mapped here and `contained()` is trivially satisfied on the mapping side. What
+/// it does buy TODAY, and what the boot asserts, is that the grant set tracks the live DMA
+/// regions exactly: a `Release` that frees frames without withdrawing their authorization
+/// would make the two diverge, and that divergence is precisely the stale-authorization bug
+/// the hardware half would turn into a device still writing reclaimed memory.
+///
+/// Sized for the worst case the kernel can reach: every region at its page limit.
+static mut DEVICE_DOMAIN: iommu::Domain<{ MAX_REGIONS * REGION_MAX_PAGES as usize }, 8> =
+    iommu::Domain::new();
+
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the domain.
+unsafe fn device_domain(
+) -> &'static mut iommu::Domain<{ MAX_REGIONS * REGION_MAX_PAGES as usize }, 8> {
+    &mut *core::ptr::addr_of_mut!(DEVICE_DOMAIN)
+}
 /// How many regions one process may have mapped at once. Each slot is a fixed span of the
 /// share window, so the kernel picks the address and the caller never supplies one.
 const SHARE_SLOTS: usize = 4;
@@ -684,6 +705,12 @@ unsafe fn run_region_plan<A: Arch>(plan: &regions::Plan<PLAN_STEPS>) {
             regions::Step::Release { region } => {
                 if let Some(i) = region_slot(region) {
                     let r = &mut *core::ptr::addr_of_mut!(REGIONS[i]);
+                    // Withdraw the device's authorization BEFORE the frames return to the
+                    // pool. The other order is the stale-authorization bug: a frame reissued
+                    // to someone else while the domain still names it.
+                    for k in 0..r.npages as usize {
+                        device_domain().revoke(r.frames[k].as_u64() >> abi::PAGE_SHIFT);
+                    }
                     if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
                         use abi::FrameAllocator as _;
                         for k in 0..r.npages as usize {
@@ -1138,6 +1165,44 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
         );
         A::exit(false);
     }
+    // The device domain must track the live DMA regions EXACTLY. Nothing is mapped (there is
+    // no IOMMU and no device), so the containment half is trivially satisfied and is not what
+    // this asserts. What it asserts is the half that can actually be wrong today: a `Release`
+    // that frees frames without withdrawing the domain's authorization leaves grants behind,
+    // and the two sets diverge. That divergence is exactly what the hardware half would turn
+    // into a device still writing memory the nucleus has reissued to someone else.
+    {
+        let dom = device_domain();
+        let expect: usize = (0..MAX_REGIONS)
+            .map(|i| {
+                let r = &*core::ptr::addr_of!(REGIONS[i]);
+                if r.live {
+                    r.npages as usize
+                } else {
+                    0
+                }
+            })
+            .sum();
+        let have = dom.grant_count();
+        let _ = writeln!(
+            con,
+            "[iommu] domain grants {} frame(s) for {} live DMA page(s)",
+            have, expect
+        );
+        if have != expect || !dom.contained() {
+            let _ = writeln!(
+                con,
+                "\n[iommu] the device domain disagrees with the region table: {} grant(s) for \
+                 {} live DMA page(s), contained={}\n      a region was released without \
+                 withdrawing its authorization, which is the stale-authorization bug.",
+                have,
+                expect,
+                dom.contained()
+            );
+            A::exit(false);
+        }
+    }
+
     // Report the free-frame count: with per-process reclamation on exit it should be back
     // near the pre-userland count (proving spawn/exit does not leak an address space).
     if let Some(fa) = (*core::ptr::addr_of!(FA)).as_ref() {
@@ -2248,6 +2313,12 @@ unsafe fn make_region<A: Arch>(owner: usize, pages: u64, rights: abi::CapRights)
         return abi::syserr::NO_MEM;
     };
     NEXT_REGION_ID = next;
+    // The frames are now device-reachable in principle, so the domain must say so. Rights come
+    // from the minting capability, never from the request — the same attenuation `caps_region`
+    // enforces on the CPU side.
+    for k in 0..pages as usize {
+        let _ = device_domain().grant(frames[k].as_u64() >> abi::PAGE_SHIFT, rights);
+    }
     *(&mut *core::ptr::addr_of_mut!(REGIONS[idx])) = Region {
         live: true,
         id,
