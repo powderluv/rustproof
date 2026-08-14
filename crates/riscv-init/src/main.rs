@@ -1170,12 +1170,6 @@ fn child(id: u64) -> ! {
             // `rdcycle` traps, so `scounteren` is being honoured and `rdtime` is simply
             // emulated above us. S-mode cannot deny it; only `mcounteren` could, and we
             // do not run in M-mode. x86 has no equivalent hole: `CR4.TSD` is ours to set.
-            tag(id);
-            debug_write(b"clock: rdtime is readable in U-mode (M-mode firmware emulates it)\n");
-            // SAFETY: deliberately privileged; the kernel is expected to kill us here.
-            unsafe { core::arch::asm!("rdcycle {t}", t = out(reg) _) };
-            tag(id);
-            debug_write(b"clock: U-mode read a hardware counter unpunished (bug)\n");
 
             // Owner-identity, isolated. FREE_REGION now also demands WRITE, so the READ-only
             // borrower below is refused by the RIGHTS gate and proves nothing about who owns
@@ -1187,6 +1181,23 @@ fn child(id: u64) -> ! {
             } else {
                 debug_write(b"share: a WRITABLE borrower DESTROYED a region it borrowed (bug)\n");
             }
+
+            // LAST in this process, and it must STAY last: reading the clock from ring 3
+            // is expected to KILL us, so nothing below here ever runs. This block sat
+            // ABOVE the FREE_REGION check until 2026-08-13, which silently made that
+            // check dead code — the boot kept passing while asserting strictly less,
+            // because an assertion that never executes never prints the "(bug)" line the
+            // runner greps for. The runner now REQUIRES the borrower line above, so the
+            // same mistake fails the run instead of quietly shrinking it.
+            //
+            // Being killed IS the assertion: a process that survives goes on to print
+            // the "unpunished" line, and the runner greps for the kill.
+            tag(id);
+            debug_write(b"clock: rdtime is readable in U-mode (M-mode firmware emulates it)\n");
+            // SAFETY: deliberately privileged; the kernel is expected to kill us here.
+            unsafe { core::arch::asm!("rdcycle {t}", t = out(reg) _) };
+            tag(id);
+            debug_write(b"clock: U-mode read a hardware counter unpunished (bug)\n");
             exit(id);
         }
         // A READ-only loan: now ASSERT the window is not writable. Probed through the

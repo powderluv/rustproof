@@ -15,31 +15,38 @@ A green proof is never "the system is safe." It is "safe *modulo*": a small **tr
 | M | Capability | Machine-checked property | Enforced by |
 |---|---|---|---|
 | **M0** | Boots as KVM guest; untrusted `lite::` dispatches one gfx1201 wave | none (feasibility gate) | host IOMMU (plain VFIO) |
-| **M1** | — | nucleus-core memory safety (V1) | host |
+| **M1** | — | nucleus memory safety (V1) | host |
 | **M2** | multiple address spaces | inter-AS isolation `reachable == capabilitied` (V2) + IPC no-amplification (V6) | host |
 | **M3** | emulated vIOMMU | **first load-bearing** DMA-reach `dma_reach ⊆ authorized` (V3) + DTE-config (V4) | nucleus (emulated) |
 | **M4** | bare-metal AMD-Vi | reclaim / stale-IOTLB safety (V5); V3/V4 on real silicon | nucleus (bare-metal) |
 | **M5** | — | composed confinement assurance case | nucleus (composed) |
 
-Under plain VFIO (M0–M2) the *host* programs the physical IOMMU, so the nucleus's IOMMU proof is present but **not load-bearing** — it does real work only from M3.
+Under plain VFIO (M0–M2) the *host* programs the physical IOMMU. The nucleus's IOMMU proof is **not present at all** — there is no IOMMU code in this tree; the crate that was to hold it was an empty stub and is gone. It first matters at M3.
 
 ## Repo layout
 
 ```
 rustproof/
 ├── crates/
-│   ├── nucleus-core/   capabilities/  vspace/  ipc/   # verified TCB (Verus, no_std)
-│   ├── iommu-amdvi/                                    # AMD-Vi tables + the DMA-reach crux proof
-│   ├── arch-x86_64/                                    # trusted unsafe stub (Kani-checked, Verus-external)
-│   ├── abi/                                            # shared syscall/IPC ABI (emits a C header)
-│   ├── nucleus/                                        # the bootable kernel image
-│   ├── init/  userland-rt/                             # untrusted root task + userland runtime
-│   └── driver-host/  driver-shim/                      # hosts the untrusted C++ lite:: driver
-├── vendor/rocr-lite/   vendor/limine/                  # untrusted driver source; pinned bootloader
-├── libvirt/                                            # gpu-host domain + boot script (forks start-gpu-vm.sh)
-├── tools/                                              # xtask, mkimage, run-vm, verify
+│   ├── kernel/                                         # the generic nucleus (one impl, both arches)
+│   ├── capabilities/ deleg/ regions/ runstate/ mm/     # TCB: host-tested, several exhaustive
+│   ├── vspace/ vspace-riscv/  ipc/  sched/  loader/    # TCB: page tables, IPC, run queue, ELF
+│   ├── arch-x86_64/  arch-riscv64/                     # trusted unsafe stubs (raw MMIO/MSR/asm)
+│   ├── abi/  hal/                                      # shared syscall/IPC ABI; the Arch trait
+│   ├── nucleus/  nucleus-riscv/                        # the bootable kernel images
+│   ├── init/  riscv-init/                              # untrusted root tasks (the demo)
+│   └── userland-rt/  driver-host/  driver-shim/        # EMPTY PLACEHOLDERS (see their doc comments)
+├── tools/                                              # host-tests.sh, run-qemu*.sh (+ unbuilt scaffolds)
 └── docs/                                               # design docs (below)
 ```
+
+**Status, plainly.** Nothing here is verified by Verus; the TCB crates are covered by host unit
+tests, several exhaustive over their whole state space, plus one scripted QEMU boot per arch.
+Verus was evaluated and DECLINED on 2026-08-11 with a written reversal condition — see
+docs/verification.md. This listing previously showed `nucleus-core/` and `iommu-amdvi/` as
+"verified TCB (Verus)"; both were empty crates and were deleted on 2026-08-12. There is no
+`vendor/`, no `libvirt/`, and no GPU driver in this tree yet — the milestone table above is the
+plan, not a description of the repo.
 
 The C++ `lite::` driver is **never linked into the nucleus** — it is a separate, untrusted process reached only over the capability/IPC ABI.
 

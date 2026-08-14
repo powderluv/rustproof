@@ -114,6 +114,22 @@ fi
 
 # A frame leak makes the kernel exit early, so check it BEFORE anything else: otherwise the
 # first unrelated check to fail gets the blame and the real cause scrolls past.
+# An assertion that never RUNS never prints its "(bug)" line, so the check above cannot see
+# a demo whose later half was silently disabled. That happened: a ring-3 clock probe — which is
+# expected to kill its process — was inserted ABOVE the FREE_REGION owner check, and every boot
+# went on passing while the owner check no longer executed. Require the lines that come LAST in
+# each process, so losing the tail of a demo fails the run.
+# Scoped off under PROVOKE_FAULT, which kills the guest long before the demo gets here —
+# the same scoping the clock gate above needs, and for the same reason.
+for want in 'share: a WRITABLE borrower still cannot destroy what it borrowed'; do
+    if [ "${PROVOKE_FAULT:-0}" != "1" ] && ! echo "$OUT" | grep -qF "$want"; then
+        echo "RESULT: FAIL — a required assertion never ran: $want"
+        echo "  (an assertion that does not execute prints no '(bug)' line; something above it"
+        echo "   probably killed or exited the process first)"
+        exit 1
+    fi
+done
+
 if echo "$OUT" | grep -q '\[mm\] LEAK:'; then
     echo "RESULT: FAIL — $(echo "$OUT" | grep '\[mm\] LEAK:' | head -1)"
     exit 1

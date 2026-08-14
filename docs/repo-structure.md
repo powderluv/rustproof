@@ -103,10 +103,10 @@ rustproof/
 │   │
 │   │  # ---------- KERNEL IMAGE (the bootable binary) ----------
 │   ├── nucleus/                  # bin: links the verified libs into the guest kernel ELF
-│   │   ├── Cargo.toml             #   [[bin]] name = "nucleus"; deps: nucleus-core, arch-x86_64, abi
+│   │   ├── Cargo.toml             #   [[bin]] name = "nucleus"; deps: kernel, arch-x86_64, abi
 │   │   ├── build.rs              #   emits linker script path
 │   │   ├── linker-kernel.ld       #   higher-half load address, ELF sections
-│   │   └── src/main.rs            #   #![no_std] #![no_main]; Limine entry -> init nucleus-core
+│   │   └── src/main.rs            #   #![no_std] #![no_main]; PVH entry -> kernel::run::<X86>
 │   │
 │   │  # ---------- UNTRUSTED USERLAND ----------
 │   ├── userland-rt/             # lib: EMPTY PLACEHOLDER (intended: userland runtime)
@@ -154,6 +154,12 @@ rustproof/
 
 **Crate responsibility summary**
 
+**Why this column names mechanisms and not counts.** It briefly held exact per-crate test
+numbers, written by reading them off `cargo test`. Two of them (`capabilities`, `regions`) were
+stale within two commits, because a number in prose that must track code drifts the moment the
+code moves and nothing checks it. The live counts are in `tools/host-tests.sh` output, which is
+generated; what a crate is CHECKED BY changes rarely, so that is what this says.
+
 The **"Verified by"** column of this table used to read `Verus` for five crates. Nothing in this
 tree is verified by Verus, which the paragraph at the top of this file already said — the prose was
 corrected and the table under it was not, so the document contradicted itself in the place readers
@@ -168,19 +174,19 @@ in this file and in docs/verification.md, which is where intent belongs.
 
 | Crate | Trust | Checked today by | Responsibility |
 |---|---|---|---|
-| `kernel` | TCB | 17 host properties + both QEMU boots | The generic nucleus: syscall dispatch, scheduler, grant tables, authority predicates |
-| `capabilities` | TCB | 11 host tests, exhaustive over rights | Capability slots; insert / lookup / revoke |
-| `deleg` | TCB | 18 host tests, exhaustive over ≤5-edge forests | Cross-space delegation ledger, transitive revocation |
-| `runstate` | TCB | 17 host tests, exhaustive to `MAX_PROCS` slots | Park / deadlock / all-done decision |
-| `regions` | TCB | 16 host tests, 10k configs | Shared-region lifetime as an ordered plan |
-| `mm` | TCB | 18 host tests incl. arbitrary map shapes | Physical frame allocation; the DMA/general partition |
-| `vspace`(+riscv) | TCB | 12 / 14 host tests | Page tables + address-space model |
-| `ipc` | TCB | 14 host tests | Endpoints, synchronous transfer |
-| `sched` | TCB | 10 host tests on any host, 13 on x86 (3 are `cfg(target_arch = "x86_64")`) | Round-robin run queue; per-arch context switch |
+| `kernel` | TCB | host properties over the grant tables + every authority predicate; both QEMU boots | The generic nucleus: syscall dispatch, scheduler, grant tables, authority predicates |
+| `capabilities` | TCB | host tests, exhaustive over rights; deployed width; occupancy and revoke scope | Capability slots; insert / lookup / revoke |
+| `deleg` | TCB | host tests, exhaustive over ≤5-edge forests in `Ledger<16>`, every insertion order to 3 edges | Cross-space delegation ledger, transitive revocation |
+| `runstate` | TCB | host tests, exhaustive over every state vector to `MAX_PROCS` slots | Park / deadlock / all-done decision |
+| `regions` | TCB | host tests over 20k configs at deployed `P`/`S`/`N`, plus the worst-case teardown | Shared-region lifetime as an ordered plan |
+| `mm` | TCB | host tests over every 3-region map shape (exact allocatable set) + arbitrary alloc/free interleavings | Physical frame allocation; the DMA/general partition |
+| `vspace`(+riscv) | TCB | host tests | Page tables + address-space model |
+| `ipc` | TCB | host tests | Endpoints, synchronous transfer |
+| `sched` | TCB | host tests; 3 are `cfg(target_arch = "x86_64")` and do not run off-x86 | Round-robin run queue; per-arch context switch |
 | `arch-x86_64` / `arch-riscv64` | TCB (unsafe) | QEMU boot only | All raw MMIO/MSR/port/asm; no host tests |
-| `abi` | boundary | 5 host tests | Shared syscall/IPC layout and the rights lattice |
+| `abi` | boundary | host tests, exhaustive over the rights lattice | Shared syscall/IPC layout and the rights lattice |
 | `nucleus` / `nucleus-riscv` (bin) | TCB glue | QEMU boot | Link the nucleus into a bootable image |
-| `init` / `riscv-init` (bin) | untrusted | QEMU boot (30 assertions/arch) | Root tasks: the demo that exercises the ABI |
+| `init` / `riscv-init` (bin) | untrusted | QEMU boot; ~30 assertions per arch | Root tasks: the demo that exercises the ABI |
 | `userland-rt` | untrusted | — | **Empty placeholder.** Intended: Rust userland runtime |
 | `driver-host` (bin) | **untrusted** | — | **Empty placeholder.** Intended: host the C++ `lite::` driver |
 | `driver-shim` | untrusted | — | **Empty placeholder.** Intended: libc/POSIX subset → nucleus IPC |
@@ -222,7 +228,7 @@ z3_sha256     = "<sha256 of the z3 binary>"
 **Verified crates depend on the Verus support crates**, pinned to the same release:
 
 ```toml
-# crates/nucleus-core/Cargo.toml (excerpt)
+# crates/kernel/Cargo.toml (excerpt) -- nucleus-core was deleted 2026-08-12
 [dependencies]
 vstd           = { path = "../../toolchain/verus/source/vstd" }
 builtin        = { path = "../../toolchain/verus/source/builtin" }
@@ -313,7 +319,7 @@ We do **not** touch that logic. We add a Rustproof domain and a thin wrapper:
 
 The guest's serial port is wired to a host file/pty in the domain XML; that serial is the only channel the M0 smoke test needs (`nucleus` prints, `init` prints, `driver-host` prints `M0: WAVE OK`).
 
-**M0–M2 isolation note (do not conflate):** under plain VFIO the *host* programs the physical IOMMU, so guest isolation at M0–M2 is host-enforced; our `iommu-amdvi` proof is present but **not yet load-bearing**. It first matters at **M3** (emulated vIOMMU inside the guest) and **M4** (bare-metal, nucleus programs real AMD-Vi). The repo is structured so that turning the crux proof load-bearing is a milestone flag flip in `iommu-amdvi`, not a restructure.
+**M0–M2 isolation note (do not conflate):** under plain VFIO the *host* programs the physical IOMMU, so guest isolation at M0–M2 is host-enforced; there is NO IOMMU code in this tree at all (the `iommu-amdvi` stub was deleted 2026-08-12), so nothing here is load-bearing. It first matters at **M3** (emulated vIOMMU inside the guest) and **M4** (bare-metal, nucleus programs real AMD-Vi). When that work starts it needs a real crate written from scratch; the deleted stub reserved a name and nothing else.
 
 ---
 

@@ -774,10 +774,18 @@ mod tests {
         // covers a single byte, so a region can now touch a frame without filling it.
         const STARTS: [u64; 4] = [0, 4096, 6000, 8192];
         const LENS: [u64; 4] = [0, 1, 4096, 12288];
-        const KINDS: [MemoryKind; 3] = [
+        // EVERY `MemoryKind`, not a sample. With `AcpiReclaimable` and `Unusable` missing, a
+        // pass that treated either as allocatable was invisible: adding `AcpiReclaimable` to
+        // the "skip" arm of the non-Usable re-mark loop — so its frames are never taken back —
+        // left this suite fully green. The firmware supplies the kind byte, and
+        // `pvh::kind_of` maps anything it does not recognise to `Unusable`, so both of the
+        // omitted variants are reachable from outside the TCB.
+        const KINDS: [MemoryKind; 5] = [
             MemoryKind::Usable,
             MemoryKind::Reserved,
+            MemoryKind::AcpiReclaimable,
             MemoryKind::AcpiNvs,
+            MemoryKind::Unusable,
         ];
         let mut configs = 0u64;
         let mut frames_seen = 0u64;

@@ -2704,6 +2704,27 @@ mod tests {
             !caps_hold_irq(&no_read, IRQ_TIMER),
             "an Irq capability without READ credited its line"
         );
+
+        // A capability of the WRONG TYPE whose object collides with a line. This is not a
+        // contrived shape: endpoint objects are 0 and 1 and the interrupt lines are 0 (timer)
+        // and 1 (console), so they collide EXACTLY — the worker holds an Endpoint on object 1
+        // and an Irq on line 1 at the same time. Without the type check, its endpoint
+        // capability would confer console-interrupt authority. Deleting `s.cap_type ==
+        // CapType::Irq` left the whole kernel suite green until this case existed.
+        for wrong in [
+            abi::CapType::Endpoint,
+            abi::CapType::Region,
+            abi::CapType::Mmio,
+            abi::CapType::Untyped,
+        ] {
+            let decoy = space(&[(wrong, abi::CapRights::ALL, IRQ_CONSOLE)]);
+            assert!(
+                !caps_hold_irq(&decoy, IRQ_CONSOLE),
+                "a {:?} capability on object {} counted as interrupt authority",
+                wrong,
+                IRQ_CONSOLE
+            );
+        }
     }
 
     /// Endpoint resolution must enforce type and rights, and must return the capability's
@@ -2752,6 +2773,23 @@ mod tests {
             !caps_hold_endpoint(&cs, 3, abi::CapRights::WRITE),
             "a receive-only capability answered a send query"
         );
+
+        // Wrong TYPE, right object and rights — the same collision as above, from the other
+        // side: an `Irq` capability for line 3 must not answer "holds endpoint 3". Deleting
+        // the type check here also left the suite green.
+        for wrong in [
+            abi::CapType::Irq,
+            abi::CapType::Region,
+            abi::CapType::Mmio,
+            abi::CapType::Untyped,
+        ] {
+            let decoy = space(&[(wrong, abi::CapRights::ALL, 3)]);
+            assert!(
+                !caps_hold_endpoint(&decoy, 3, abi::CapRights::READ),
+                "a {:?} capability on object 3 answered an endpoint query",
+                wrong
+            );
+        }
     }
 
     /// The two Region gates, both of which the boot cannot see (measured: deleting either
