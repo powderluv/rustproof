@@ -365,7 +365,23 @@ Client-side typed-cap signatures are shown as comments for readability; the wire
   3. the target VA range in the driver AS is **currently unmapped** — no aliasing over an existing
      mapping (the AS/cap invariant forbids a frame being reachable via two caps of differing rights);
   4. the window is installed **uncached / device-memory** (matching the tri-OS `pgprot_noncached`
-     mapping).
+     mapping). **NOT EXPRESSIBLE TODAY** — `vspace::PageFlags` has PRESENT/WRITABLE/USER/HUGE/
+     NO_EXEC and no PCD/PWT (crates/vspace/src/lib.rs), and `vspace_riscv::PageFlags` has
+     V/R/W/X/U/G/A/D and no PBMT (crates/vspace-riscv/src/lib.rs). Any BAR mapped by this tree
+     right now is a CACHED mapping, and QEMU TCG cannot tell the difference — so this is the
+     precondition most likely to be silently false on real silicon, and the one the only
+     available test rig cannot falsify. Adding the flag is a prerequisite for mapping a real
+     BAR, not a detail of it.
+  5. **the function is not a bus master unless an IOMMU domain bounds its DMA.** Added
+     2026-08-14. docs/nucleus-design.md states the premise this whole contract rests on: the
+     nucleus grants the driver an `Mmio` capability for the GPU aperture but never for the
+     IOMMU aperture, so "the driver can command arbitrary DMA; it cannot touch the tables that
+     bound that DMA." There is no IOMMU in this tree — `CapType::IommuDomain` is a bare enum
+     variant with no referent. Until one exists, mapping a real bus-mastering BAR into an
+     untrusted process hands it a DMA engine that can write the process table, the capability
+     spaces and the delegation ledger, at which point every other gate here is advisory. This
+     is why `DEVICE_PHYS` is deliberately a kernel-allocated RAM frame with no bus master
+     behind it, and why that stand-in stays until the IOMMU lands.
   A fresh `Cap<Mmio>` recording `(phys_base+offset, len, vaddr, rights)` is derived from the device
   cap and inserted in slot 0.
 - **Tag: VERIFIED** for the *mapping decision* — the choice of which physical frames become reachable

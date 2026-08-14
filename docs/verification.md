@@ -51,6 +51,44 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## DECISION 2026-08-14 — device discovery is DECLINED; the IOMMU is the blocker
+
+A design pass asked how a process should discover and map a REAL device (PCI enumeration in the
+kernel, a config-space capability for userland, or a boot-protocol device list). The verdict was
+BUILD NO PCI CODE, for a reason that is not caution:
+
+**There is no IOMMU.** `docs/nucleus-design.md` states the premise the untrusted-driver story
+rests on — the nucleus grants the driver an `Mmio` capability for the GPU aperture but never for
+the IOMMU aperture, so it can command arbitrary DMA but cannot touch the tables that bound it.
+Grep finds exactly one referent for `IommuDomain`: a bare `abi::CapType` variant. So on a
+bus-mastering function **MMIO is unbounded DMA authority** — one store programs the device to
+write the process table, the capability spaces and the delegation ledger. Discovery is not the
+blocker; it is the step after the blocker.
+
+That is why `DEVICE_PHYS` is a kernel-allocated RAM frame with no bus master behind it. The
+stand-in is load-bearing, not laziness, and it stays.
+
+Second, independent reason: MAP_BAR's "uncached / device-memory" precondition is not expressible
+in this tree (no PCD/PWT in `vspace::PageFlags`, no PBMT in `vspace_riscv::PageFlags`), so any
+real BAR mapped today would be a CACHED mapping — and QEMU TCG cannot tell. The property that
+matters most on real silicon is the one the only available rig cannot falsify.
+
+**Ruling on `Untyped`.** Real device DMA DOES force `Untyped` to name an extent, but there is no
+real device DMA and cannot be until an IOMMU exists — so §1.2 may be inherited now, on a stated
+principle rather than by luck, and must be revisited at the IOMMU commit. The tripwire and the
+IOMMU blocker fire together. What was built instead is the generalization of that tripwire from
+the TYPE `Untyped` to the PROPERTY `is_mint_source`, so a second mint source cannot slip past it.
+
+Explicitly NOT built: no config-space accessor on either arch, no bus scan, no BAR decode, no BAR
+sizing in the kernel (that needs config WRITES with decode disabled — a standing ruling, not a
+deferral), no new syscalls, no referent for `IommuDomain`, no FDT/DTB or RSDP/MCFG parsing.
+
+Also recorded: neither runner can answer a PCI question as invoked — `tools/run-qemu.sh` passes
+no `-machine`, so it gets the default i440fx with no ECAM, and `tools/run-qemu-riscv.sh` boots
+`-machine virt` with no `-device` at all.
+
+---
+
 ## 0. What is actually checked today (and how to prove the checks can fail)
 
 **The kernel was exempt from all of this until 2026-08-11**, and not by decision.

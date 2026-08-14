@@ -204,9 +204,27 @@ return only when their holder terminates, and frame conservation checks that the
 **Reversal condition**, stated so it is inherited rather than re-derived: the moment this
 nucleus needs DMA memory from a SPECIFIC extent — a contiguity constraint, an IOMMU domain
 window, memory below a device's addressing limit — an `Untyped` must name a range, and this
-decision must be revisited rather than assumed. A `debug_assert!` in the grant loop
-(`load_process`) fires if an `Untyped` ever acquires a nonzero object, which is where that
-change will announce itself.
+decision must be revisited rather than assumed.
+
+The guard that announces it (corrected 2026-08-14 — this paragraph described a `debug_assert!`,
+which was compiled out of every build the runners and CI produce, since both default to
+`--release` and the profile enables no debug assertions):
+
+- a real `assert!` in the grant loop (`load_process`), live in release builds; and
+- a host test, `no_role_grants_a_mint_source_that_names_an_extent`, which cannot be compiled
+  out and needs no boot.
+
+**Scope, stated so it is not inherited more broadly than it holds.** This argument is about
+MINT SOURCES — capabilities a process can create new authority FROM — and it survives only
+while every mint source names no extent. Both guards are keyed on the PROPERTY
+(`is_mint_source`), not on the type `Untyped`, because a type-keyed check would still pass the
+day a second mint source appeared. The two mint gates are `SPAWN` and `MAKE_REGION`.
+
+The known future case that RE-OPENS this is `Cap<Device>` (docs/host-contract.md §"MAP_BAR"):
+it owns a physical extent AND is a mint source for `Mmio`, `DmaMem` and `Irq` at once. When it
+arrives, this decision is void by construction and must be re-argued — including Alternative
+(A), whose containment argument becomes available for the first time and must be rejected on
+its merits rather than on "ours owns nothing".
 
 **What this does not do.** It does not close a threat-model gap: a compromised process whose
 capability has been revoked keeps its mapped DMA frames for as long as it runs, and nothing

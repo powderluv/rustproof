@@ -817,6 +817,25 @@ fn caps_hold_endpoint(
     })
 }
 
+/// Is this capability type a MINT SOURCE — something a process can create new authority FROM?
+///
+/// docs/nucleus-design.md §1.2's revocation argument (revoking a mint source does NOT reclaim
+/// what was already minted from it) holds only while every mint source names NO EXTENT. An
+/// extent-owning mint source can be revoked while its derivations still hold that extent, and
+/// the argument stops applying.
+///
+/// The guard used to be keyed on the TYPE `Untyped` rather than on the PROPERTY, which made it
+/// silently narrow: it would still pass the day a second mint source appeared. The two mint
+/// gates are `SPAWN` and `MAKE_REGION`, both `Untyped` + WRITE, and both are written in terms
+/// of this predicate so that adding a third has to come here.
+///
+/// The known future case is `Cap<Device>` (docs/host-contract.md): extent-owning AND a mint
+/// source for `Mmio`, `DmaMem` and `Irq` at once. It re-opens §1.2 by construction, which is
+/// why this is a property and not a list.
+const fn is_mint_source(t: abi::CapType) -> bool {
+    matches!(t, abi::CapType::Untyped)
+}
+
 /// Resolve one capability id to the REGION it names, enforcing type AND rights.
 ///
 /// Returns the region id AND the rights the holder actually carries, because the caller maps
@@ -1243,8 +1262,8 @@ unsafe fn load_process<A: Arch>(
                 // (`no_role_grants_an_untyped_that_names_an_extent`) so a bad TABLE fails the
                 // suite without needing a boot at all.
                 assert!(
-                    cap_type != abi::CapType::Untyped || object == 0,
-                    "an Untyped acquired an extent; revisit the revocation decision"
+                    !is_mint_source(cap_type) || object == 0,
+                    "a mint source acquired an extent; revisit the revocation decision"
                 );
                 let _ = s.caps.insert(cap_type, rights, object);
             }
@@ -1872,7 +1891,7 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             // names no extent. And the frames come from the GENERAL pool via `alloc_frame`,
             // not the DMA arena `make_region` draws from, which `mm` keeps strictly disjoint.
             let authorized = proc_at(cur).caps.lookup(cap).is_some_and(|s| {
-                s.cap_type == abi::CapType::Untyped && s.rights.contains(abi::CapRights::WRITE)
+                is_mint_source(s.cap_type) && s.rights.contains(abi::CapRights::WRITE)
             });
             // Optional capability delegation: `a1` = one of the CALLER's capabilities to
             // hand to the child (or NO_DELEGATE), `a2` = the rights to hand over.
@@ -2006,9 +2025,10 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             // allocating VRAM does: an `Untyped` capability carrying WRITE.
             let cap = abi::CapId(A::frame_arg(&f, 0) as usize);
             let pages = A::frame_arg(&f, 1);
-            let untyped = proc_at(cur).caps.lookup(cap).filter(|s| {
-                s.cap_type == abi::CapType::Untyped && s.rights.contains(abi::CapRights::WRITE)
-            });
+            let untyped = proc_at(cur)
+                .caps
+                .lookup(cap)
+                .filter(|s| is_mint_source(s.cap_type) && s.rights.contains(abi::CapRights::WRITE));
             let ret = match untyped {
                 None => abi::syserr::NO_CAP,
                 Some(u) if pages >= 1 && pages <= REGION_MAX_PAGES => {
@@ -2989,14 +3009,16 @@ mod tests {
     /// has to be revisited, because an `Untyped` that names a range can be revoked while its
     /// derivations still hold that range.
     #[test]
-    fn no_role_grants_an_untyped_that_names_an_extent() {
+    fn no_role_grants_a_mint_source_that_names_an_extent() {
         for role in ROLES {
             for &(cap_type, _, object) in grants_for(role) {
                 assert!(
-                    cap_type != abi::CapType::Untyped || object == 0,
-                    "the {} role grants an Untyped naming {:#x}; see docs/nucleus-design.md \
-                     §1.2 — the revocation argument does not survive an Untyped with an extent",
+                    !is_mint_source(cap_type) || object == 0,
+                    "the {} role grants a MINT SOURCE ({:?}) naming {:#x}; see \
+                     docs/nucleus-design.md §1.2 — the revocation argument does not survive a \
+                     mint source with an extent",
                     role_name(role),
+                    cap_type,
                     object
                 );
             }
