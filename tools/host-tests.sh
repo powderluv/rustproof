@@ -58,6 +58,12 @@ if [ ${#missing[@]} -ne 0 ]; then
     exit 1
 fi
 
+# A source-shape check, not a cargo test, but it belongs here: it needs no QEMU, so it gates
+# every CI run. It refuses a demo that puts a live assertion behind a deliberately-fatal
+# instruction — the defect that made the FREE_REGION owner-identity check dead code for
+# fifteen commits while the boot kept reporting PASS.
+python3 tools/check-demo-order.py
+
 args=()
 for c in "${HOST_CRATES[@]}"; do args+=(-p "$c"); done
 exec cargo test "${args[@]}" "$@"
