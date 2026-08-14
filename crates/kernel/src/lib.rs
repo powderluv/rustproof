@@ -1233,7 +1233,16 @@ unsafe fn load_process<A: Arch>(
                 // contiguity constraint, an IOMMU window, a below-4G limit), that argument
                 // stops holding and the decision must be revisited rather than inherited.
                 // This is where you find out.
-                debug_assert!(
+                //
+                // This was a `debug_assert!` until 2026-08-14, which means it was compiled out
+                // of every build anyone runs: both runners default to `--release`
+                // (tools/run-qemu.sh:15) and `[profile.release]` sets no `debug-assertions`.
+                // A tripwire that cannot trip is the thing this project calls theatre, and
+                // this one guards a load-bearing design argument. It is a real assertion now,
+                // and the static half of the same property is a host test
+                // (`no_role_grants_an_untyped_that_names_an_extent`) so a bad TABLE fails the
+                // suite without needing a boot at all.
+                assert!(
                     cap_type != abi::CapType::Untyped || object == 0,
                     "an Untyped acquired an extent; revisit the revocation decision"
                 );
@@ -2967,5 +2976,30 @@ mod tests {
         // Exactly one entry of room.
         assert_eq!(pvh::walkable_entries(pvh::IDENTITY_LIMIT - 24, 9), 1);
         assert_eq!(pvh::walkable_entries(pvh::IDENTITY_LIMIT - 23, 9), 0);
+    }
+
+    /// The TRIPWIRE, checked statically as well as at load time.
+    ///
+    /// docs/nucleus-design.md §1.2 — why revoking an `Untyped` does NOT reclaim regions or
+    /// processes already created from it — rests entirely on an `Untyped` naming no extent.
+    /// The load-time guard was a `debug_assert!`, i.e. absent from every release build, which
+    /// is every build the runners and CI produce. This half cannot be compiled out.
+    ///
+    /// If this fails, do not "fix" it by zeroing the object: the design decision it protects
+    /// has to be revisited, because an `Untyped` that names a range can be revoked while its
+    /// derivations still hold that range.
+    #[test]
+    fn no_role_grants_an_untyped_that_names_an_extent() {
+        for role in ROLES {
+            for &(cap_type, _, object) in grants_for(role) {
+                assert!(
+                    cap_type != abi::CapType::Untyped || object == 0,
+                    "the {} role grants an Untyped naming {:#x}; see docs/nucleus-design.md \
+                     §1.2 — the revocation argument does not survive an Untyped with an extent",
+                    role_name(role),
+                    object
+                );
+            }
+        }
     }
 }
