@@ -78,9 +78,18 @@ Firmware normally assigns it; this nucleus boots `-kernel`/PVH with none, so not
 obvious composition of those halves yields `0xfed800000000` — a plausible-looking address that is
 not where anything lives, and exactly what the code reported until the enable bit was consulted.
 
-The obvious next move — read IVRS through the PVH `rsdp_paddr` — was tried on 2026-08-15 and
-**does not work: there is no ACPI on this boot path at all.** `rsdp_paddr` is `0x0`, not merely
-out of the identity window. QEMU does build the tables, but delivers them over **fw_cfg**
+The obvious next move — read IVRS through the PVH `rsdp_paddr` — was tried on 2026-08-15, and the
+first conclusion drawn from it was WRONG and is corrected here.
+
+**Availability is a property of the QEMU BUILD, not of PVH.** Same nucleus, same flags:
+QEMU 8.2.1 (homebrew, macOS) gives `rsdp_paddr = 0x0` and no ACPI at all; QEMU 8.2.2 (Ubuntu,
+shark-a) gives `rsdp_paddr = 0xf52c0` on q35 and `0xf5290` on i440fx. It was recorded as "there
+is no ACPI on this boot path" on the strength of one host. A negative result from a single
+environment is a claim about that environment, and this project keeps two on purpose.
+
+So the IVRS route IS available on shark-a — the x86 validation host, the one with real AMD-Vi
+silicon — and is not available on the macOS dev box. Below is what the missing-ACPI case means
+where it does apply. QEMU does build the tables, but delivers them over **fw_cfg**
 (`etc/acpi/tables`, `etc/table-loader`, `etc/acpi/rsdp` appear as fw_cfg ROMs) for FIRMWARE to
 fetch, link and place. A `-kernel`/PVH boot runs no firmware, so nobody ever places them and no
 RSDP exists in memory.

@@ -23,6 +23,9 @@ mod arch_x86;
 // are host-testable anywhere. Only x86 ever calls the config cycles.
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 mod pci;
+// Same reasoning as `pci`: compiled everywhere so its pure validation rules are host-tested.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+mod acpi;
 
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 mod pvh;
@@ -1463,13 +1466,32 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
         // SAFETY: dereferences the boot-info pointer, same as the memory map does.
         match unsafe { pvh::rsdp(a0) } {
             Some(p) => {
-                let _ = writeln!(con, "[acpi] RSDP at {p:#x}");
+                // SAFETY: `pvh::rsdp` bounded it to the identity-mapped window.
+                let buf = unsafe { core::slice::from_raw_parts(p as *const u8, 36) };
+                match acpi::parse_rsdp(buf) {
+                    Ok(r) => {
+                        let _ = writeln!(
+                            con,
+                            "[acpi] RSDP at {p:#x} rev {} xsdt={:#x} rsdt={:#x}",
+                            r.revision,
+                            r.xsdt.unwrap_or(0),
+                            r.rsdt
+                        );
+                    }
+                    Err(e) => {
+                        let _ = writeln!(
+                            con,
+                            "[acpi] RSDP at {p:#x} REFUSED: {e:?} — not trusting a structure \
+                             that does not check out"
+                        );
+                    }
+                }
             }
             None => {
                 let raw = unsafe { pvh::rsdp_raw(a0) };
                 let _ = writeln!(
                     con,
-                    "[acpi] no RSDP (rsdp_paddr={raw:#x}) — this boot has no ACPI at all"
+                    "[acpi] no RSDP (rsdp_paddr={raw:#x}) — no ACPI on THIS host's QEMU build"
                 );
                 let _ = writeln!(
                     con,
@@ -1478,12 +1500,12 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
                 );
                 let _ = writeln!(
                     con,
-                    "       a -kernel/PVH boot runs none, so nothing ever placed them. The \
-                     AMD-Vi base is not"
+                    "       a -kernel/PVH boot runs none. QEMU 8.2.2 on shark-a DOES supply \
+                     one, so this is a"
                 );
                 let _ = writeln!(
                     con,
-                    "       discoverable this way; see docs/verification.md for the options."
+                    "       property of the QEMU build, not of PVH. See docs/verification.md."
                 );
             }
         }
