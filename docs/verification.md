@@ -72,6 +72,19 @@ that ruling was about handing config authority to a DRIVER, which is authority o
 function's BARs. There is deliberately no config WRITE — BAR sizing needs writes with the decode
 bit cleared, which remains a standing no in the kernel.
 
+The capability block is read too, and it produced the first real hardware finding: **the AMD-Vi
+register base is UNPROGRAMMED on this rig.** `lo=0x00000000, hi=0x0000fed8`, enable bit clear.
+Firmware normally assigns it; this nucleus boots `-kernel`/PVH with none, so nothing has. The
+obvious composition of those halves yields `0xfed800000000` — a plausible-looking address that is
+not where anything lives, and exactly what the code reported until the enable bit was consulted.
+
+So the register base must come from the ACPI IVRS table, reachable through the PVH `rsdp_paddr`
+the boot info already carries and nothing yet reads — or the nucleus must program the capability
+itself, which would be the first config WRITE in this tree and needs its own decision.
+
+The composition rule is now a pure function with host tests covering the case that produced the
+wrong answer, so a mistake made once against real hardware is checked forever after without one.
+
 Still absent: no Device Table Entry, no I/O page tables, nothing programmed. The unit is located
 and reported, and the boot line says so in as many words.
 

@@ -19,8 +19,11 @@ mod arch_x86;
 // Compiled on EVERY host, not just x86, so the bound it puts on the hypervisor-supplied
 // memory map can be host-tested anywhere — same reasoning as crates/sched's off-target
 // `Context`. Only x86 ever calls it.
-#[cfg(target_arch = "x86_64")]
+// Compiled on every host, like `pvh`, so its pure decisions (the register-base composition)
+// are host-testable anywhere. Only x86 ever calls the config cycles.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 mod pci;
+
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 mod pvh;
 #[cfg(target_arch = "x86_64")]
@@ -1470,6 +1473,37 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
                     f.device,
                     f.bdf()
                 );
+                // SAFETY: as above — single-CPU boot path, no concurrent config cycle.
+                match unsafe { pci::amd_vi_cap(&f) } {
+                    Some(c) => match c.base {
+                        Some(base) => {
+                            let _ = writeln!(
+                                con,
+                                "        registers at {base:#x} (aperture enabled), hdr={:#010x}",
+                                c.header
+                            );
+                        }
+                        None => {
+                            let _ = writeln!(
+                                con,
+                                "        capability found (hdr={:#010x}) but its base register \
+                                 is UNPROGRAMMED",
+                                c.header
+                            );
+                            let _ = writeln!(
+                                con,
+                                "        firmware normally assigns it; this boot is -kernel/PVH \
+                                 with none, so the base must come from ACPI IVRS"
+                            );
+                        }
+                    },
+                    None => {
+                        let _ = writeln!(
+                            con,
+                            "        no AMD-Vi capability block — cannot reach its registers"
+                        );
+                    }
+                }
                 let _ = writeln!(
                     con,
                     "        (located only; NO Device Table, NO I/O page tables, NOT programmed)"
