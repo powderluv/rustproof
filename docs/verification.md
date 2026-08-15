@@ -78,9 +78,29 @@ Firmware normally assigns it; this nucleus boots `-kernel`/PVH with none, so not
 obvious composition of those halves yields `0xfed800000000` — a plausible-looking address that is
 not where anything lives, and exactly what the code reported until the enable bit was consulted.
 
-So the register base must come from the ACPI IVRS table, reachable through the PVH `rsdp_paddr`
-the boot info already carries and nothing yet reads — or the nucleus must program the capability
-itself, which would be the first config WRITE in this tree and needs its own decision.
+The obvious next move — read IVRS through the PVH `rsdp_paddr` — was tried on 2026-08-15 and
+**does not work: there is no ACPI on this boot path at all.** `rsdp_paddr` is `0x0`, not merely
+out of the identity window. QEMU does build the tables, but delivers them over **fw_cfg**
+(`etc/acpi/tables`, `etc/table-loader`, `etc/acpi/rsdp` appear as fw_cfg ROMs) for FIRMWARE to
+fetch, link and place. A `-kernel`/PVH boot runs no firmware, so nobody ever places them and no
+RSDP exists in memory.
+
+That leaves four routes to the AMD-Vi register base, none free:
+
+1. **Implement a fw_cfg client and the ACPI table-loader in the nucleus.** This is precisely
+   what SeaBIOS/OVMF do; it makes the nucleus into firmware, in ring 0, parsing an
+   externally-supplied linker script. Large, and the wrong shape for a microkernel.
+2. **Boot under real firmware** (SeaBIOS) instead of direct `-kernel`, so ACPI exists. Changes
+   the whole boot path, which every gate in both runners was calibrated against.
+3. **Have the nucleus program the capability's base register itself** — firmware's job, and the
+   register is writable. This would be the first config WRITE in this tree, and it needs an
+   address known not to collide, which means trusting the PVH memory map for something it was
+   not written to answer.
+4. **Hardcode QEMU's AMD-Vi base for the rig only**, clearly marked as rig-scaffolding and never
+   a discovery mechanism.
+
+Recorded rather than chosen: picking one is a decision, and the evidence for it is now in place
+instead of being rediscovered.
 
 The composition rule is now a pure function with host tests covering the case that produced the
 wrong answer, so a mistake made once against real hardware is checked forever after without one.

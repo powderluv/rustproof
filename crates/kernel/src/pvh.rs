@@ -102,3 +102,47 @@ pub fn memory_map(start_info: u64, out: &mut [MemoryRegion]) -> usize {
     }
     count
 }
+
+/// The ACPI RSDP the hypervisor placed, or `None` if this boot has no ACPI.
+///
+/// `hvm_start_info` has carried this field since the struct was written and nothing has ever
+/// read it. It is the only route to the AMD-Vi register base on a `-kernel`/PVH boot: the
+/// unit's PCI capability leaves that base UNPROGRAMMED because no firmware ran, so the address
+/// has to come from the IVRS table this pointer leads to.
+///
+/// # Safety
+/// Dereferences the boot-info pointer the loader supplied in `%ebx`, same as [`memory_map`].
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rsdp(start_info: u64) -> Option<u64> {
+    if start_info == 0 {
+        return None;
+    }
+    let si = &*(start_info as *const HvmStartInfo);
+    if si.magic != PVH_MAGIC || si.version < 1 {
+        return None;
+    }
+    // Must be inside the window the trampoline identity-maps, for the same reason the memory
+    // map must be: dereferencing outside it is not merely a fault, low physical memory holds
+    // device MMIO and a read there can have side effects.
+    match si.rsdp_paddr {
+        0 => None,
+        p if p >= IDENTITY_LIMIT => None,
+        p => Some(p),
+    }
+}
+
+/// The raw `rsdp_paddr` field, for diagnosing why [`rsdp`] refused it.
+///
+/// # Safety
+/// See [`rsdp`].
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rsdp_raw(start_info: u64) -> u64 {
+    if start_info == 0 {
+        return 0;
+    }
+    let si = &*(start_info as *const HvmStartInfo);
+    if si.magic != PVH_MAGIC {
+        return 0;
+    }
+    si.rsdp_paddr
+}

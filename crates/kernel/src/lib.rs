@@ -1460,6 +1460,33 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
     // rather than reading as "this machine has no IOMMU".
     #[cfg(target_arch = "x86_64")]
     {
+        // SAFETY: dereferences the boot-info pointer, same as the memory map does.
+        match unsafe { pvh::rsdp(a0) } {
+            Some(p) => {
+                let _ = writeln!(con, "[acpi] RSDP at {p:#x}");
+            }
+            None => {
+                let raw = unsafe { pvh::rsdp_raw(a0) };
+                let _ = writeln!(
+                    con,
+                    "[acpi] no RSDP (rsdp_paddr={raw:#x}) — this boot has no ACPI at all"
+                );
+                let _ = writeln!(
+                    con,
+                    "       QEMU builds the tables but delivers them over fw_cfg for FIRMWARE \
+                     to fetch and place;"
+                );
+                let _ = writeln!(
+                    con,
+                    "       a -kernel/PVH boot runs none, so nothing ever placed them. The \
+                     AMD-Vi base is not"
+                );
+                let _ = writeln!(
+                    con,
+                    "       discoverable this way; see docs/verification.md for the options."
+                );
+            }
+        }
         // SAFETY: single-CPU boot path; nothing else performs a config cycle.
         match unsafe { pci::find_iommu() } {
             Some(f) => {
