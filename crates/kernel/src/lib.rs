@@ -1417,6 +1417,98 @@ extern "C" fn thread_b<A: Arch>() -> ! {
 }
 
 /// The generic kmain. `a0`/`a1` are the arch boot args (x86 PVH `start_info`; RISC-V
+/// Follow an RSDT to the IVRS table and report the AMD-Vi register base it names.
+///
+/// Every pointer here comes from a structure the hypervisor placed, so each is bounded to the
+/// identity-mapped window before it is followed: reading outside it is not merely a fault, low
+/// physical memory holds device MMIO and a read there can have side effects. Tables are also
+/// re-read at their DECLARED length before their checksum is believed, because a 36-byte header
+/// read cannot validate a whole-table checksum and the body is the half that gets parsed.
+#[cfg(target_arch = "x86_64")]
+fn report_ivrs<A: Arch>(con: &mut Console<A>, rsdt_addr: u64) {
+    /// # Safety
+    /// Caller has bounded `[at, at+len)` to the identity-mapped window.
+    unsafe fn table_at<'a>(at: u64, len: usize) -> &'a [u8] {
+        core::slice::from_raw_parts(at as *const u8, len)
+    }
+
+    let reachable = |at: u64, len: u64| at != 0 && len >= 36 && at + len < pvh::IDENTITY_LIMIT;
+
+    if !reachable(rsdt_addr, 36) {
+        let _ = writeln!(
+            con,
+            "[acpi] RSDT at {rsdt_addr:#x} is outside the mapped window"
+        );
+        return;
+    }
+    // SAFETY: bounded above; single-CPU boot path.
+    let head = unsafe { table_at(rsdt_addr, 36) };
+    let len = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as u64;
+    if !reachable(rsdt_addr, len) {
+        let _ = writeln!(
+            con,
+            "[acpi] RSDT claims {len} bytes, which is not reachable"
+        );
+        return;
+    }
+    // SAFETY: as above, at the declared length.
+    let rsdt = unsafe { table_at(rsdt_addr, len as usize) };
+    if acpi::parse_table(rsdt).is_err() {
+        let _ = writeln!(con, "[acpi] RSDT failed its checksum — not walking it");
+        return;
+    }
+
+    let mut tables = 0usize;
+    for ptr in acpi::rsdt_entries(rsdt) {
+        tables += 1;
+        let p = ptr as u64;
+        if !reachable(p, 36) {
+            continue;
+        }
+        // SAFETY: bounded above.
+        let h = unsafe { table_at(p, 36) };
+        if &h[0..4] != b"IVRS" {
+            continue;
+        }
+        let l = u32::from_le_bytes([h[4], h[5], h[6], h[7]]) as u64;
+        if !reachable(p, l) {
+            let _ = writeln!(con, "[acpi] IVRS at {p:#x} claims {l} bytes, not reachable");
+            return;
+        }
+        // SAFETY: as above, at the declared length.
+        let ivrs = unsafe { table_at(p, l as usize) };
+        if acpi::parse_table(ivrs).is_err() {
+            let _ = writeln!(
+                con,
+                "[acpi] IVRS at {p:#x} failed its checksum — refusing it"
+            );
+            return;
+        }
+        match acpi::ivrs_first_base(ivrs) {
+            Some((base, n)) => {
+                let _ = writeln!(
+                    con,
+                    "[iommu] IVRS names {n} IOMMU(s); AMD-Vi register base {base:#x}"
+                );
+                if n > 1 {
+                    let _ = writeln!(
+                        con,
+                        "        (only the first is used; no story here for more than one)"
+                    );
+                }
+            }
+            None => {
+                let _ = writeln!(con, "[acpi] IVRS at {p:#x} carries no IVHD block");
+            }
+        }
+        return;
+    }
+    let _ = writeln!(
+        con,
+        "[acpi] {tables} table(s), no IVRS — no AMD-Vi on this machine"
+    );
+}
+
 /// `hartid`/`dtb`); `user_elf` is the embedded user program. Never returns.
 pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
     use abi::FrameAllocator as _;
@@ -1477,6 +1569,7 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
                             r.xsdt.unwrap_or(0),
                             r.rsdt
                         );
+                        report_ivrs::<A>(&mut con, r.rsdt as u64);
                     }
                     Err(e) => {
                         let _ = writeln!(

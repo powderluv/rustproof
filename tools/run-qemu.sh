@@ -146,6 +146,20 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ]; then
     fi
 fi
 
+# Conditional, so it is host-independent: ACPI availability turns out to be a property of the
+# QEMU BUILD (8.2.1 on macOS supplies no RSDP; 8.2.2 on Ubuntu does). Requiring IVRS outright
+# would fail on the former for no fault of the nucleus. But WHERE an RSDP exists and the IOMMU
+# rig is up, the walk must reach a base — otherwise a silently broken parse reads exactly like
+# a machine without an IOMMU.
+if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${IOMMU:-0}" = "1" ] &&
+    echo "$OUT" | grep -q '\[acpi\] RSDP at'; then
+    if ! echo "$OUT" | grep -qE '\[iommu\] IVRS names [0-9]+ IOMMU\(s\); AMD-Vi register base 0x[0-9a-f]+'; then
+        echo "RESULT: FAIL — ACPI is present and the IOMMU rig is up, but the IVRS walk found"
+        echo "  no AMD-Vi register base. A broken walk is indistinguishable from no IOMMU."
+        exit 1
+    fi
+fi
+
 # Scoped off under PROVOKE_FAULT, which kills the guest long before the demo gets here —
 # the same scoping the clock gate above needs, and for the same reason.
 for want in 'share: a WRITABLE borrower still cannot destroy what it borrowed'; do
