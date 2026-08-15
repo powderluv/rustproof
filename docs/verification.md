@@ -51,6 +51,30 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-14 (later still) — the nucleus can SEE an IOMMU
+
+The effect half starts with locating the unit, which the nucleus must do itself and no one else
+may: the untrusted-driver story turns on the driver never holding an `Mmio` capability for the
+IOMMU aperture.
+
+`tools/run-qemu.sh` gained an OPT-IN rig — `IOMMU=1` boots q35 with an emulated AMD-Vi unit
+(`-device amd-iommu`, matching the design's target rather than VT-d). The default path is
+untouched, so a regression in the rig cannot become a regression in the boot everyone runs. The
+nucleus reports `[iommu] AMD-Vi at 00:03.0 vendor=1022 …` on the rig and `no IOMMU on this
+machine` otherwise, and the runner REQUIRES the line matching the rig it launched — both
+directions, because either failure reads as success on its own: a scan that silently finds
+nothing looks like a machine without an IOMMU, and a scan that matches anything "finds" one
+where there is none. Both gates were mutation-checked.
+
+`crates/kernel/src/pci.rs` is read-only, kernel-only, scans bus 0, and looks for exactly one
+thing. The 2026-08-14 ruling against a config-space accessor stands and is not contradicted:
+that ruling was about handing config authority to a DRIVER, which is authority over every
+function's BARs. There is deliberately no config WRITE — BAR sizing needs writes with the decode
+bit cleared, which remains a standing no in the kernel.
+
+Still absent: no Device Table Entry, no I/O page tables, nothing programmed. The unit is located
+and reported, and the boot line says so in as many words.
+
 ## 2026-08-14 (later) — `IommuDomain` has a referent, for the half that can fail
 
 `abi::CapType::IommuDomain` was a bare enum variant with nothing behind it. `crates/iommu` now

@@ -20,3 +20,14 @@ pub unsafe fn inb(port: u16) -> u8 {
 pub unsafe fn outl(port: u16, val: u32) {
     asm!("out dx, eax", in("dx") port, in("eax") val, options(nomem, nostack, preserves_flags));
 }
+
+/// Read a dword from an I/O port.
+///
+/// The counterpart to [`outl`], and the missing half of a PCI config-space read: the address
+/// goes out to 0xCF8 with `outl`, the data comes back from 0xCFC with this.
+#[inline]
+pub unsafe fn inl(port: u16) -> u32 {
+    let val: u32;
+    asm!("in eax, dx", out("eax") val, in("dx") port, options(nomem, nostack, preserves_flags));
+    val
+}

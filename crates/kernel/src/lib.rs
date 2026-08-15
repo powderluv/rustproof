@@ -19,6 +19,8 @@ mod arch_x86;
 // Compiled on EVERY host, not just x86, so the bound it puts on the hypervisor-supplied
 // memory map can be host-tested anywhere — same reasoning as crates/sched's off-target
 // `Context`. Only x86 ever calls it.
+#[cfg(target_arch = "x86_64")]
+mod pci;
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 mod pvh;
 #[cfg(target_arch = "x86_64")]
@@ -1447,6 +1449,37 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
         "  irq delivery mask {:#x} — every granted line is credited",
         DELIVERED_IRQ_LINES
     );
+
+    // Locate the IOMMU. The nucleus must do this itself and no one else may: the whole
+    // untrusted-driver story turns on the driver never holding an `Mmio` capability for this
+    // aperture (docs/nucleus-design.md). Reported either way — the runner requires the line
+    // that matches the rig it launched, so a scan that silently found nothing fails the run
+    // rather than reading as "this machine has no IOMMU".
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: single-CPU boot path; nothing else performs a config cycle.
+        match unsafe { pci::find_iommu() } {
+            Some(f) => {
+                let _ = writeln!(
+                    con,
+                    "[iommu] AMD-Vi at {:02x}:{:02x}.{} vendor={:04x} device={:04x} bdf={:#06x}",
+                    f.bus,
+                    f.dev,
+                    f.func,
+                    f.vendor,
+                    f.device,
+                    f.bdf()
+                );
+                let _ = writeln!(
+                    con,
+                    "        (located only; NO Device Table, NO I/O page tables, NOT programmed)"
+                );
+            }
+            None => {
+                let _ = writeln!(con, "[iommu] no IOMMU on this machine");
+            }
+        }
+    }
 
     // The share window is the one mapping whose address the kernel picks, so its geometry is
     // checked rather than commented. Not because a collision would corrupt silently — both

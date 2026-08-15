@@ -21,6 +21,8 @@ jobs:
         run: tools/run-qemu.sh          # boots, loads init into ring 3, runs the host contract
       - name: Fault-dump smoke (forced #PF -> exception handler dumps cleanly)
         run: PROVOKE_FAULT=1 tools/run-qemu.sh
+      - name: IOMMU rig (q35 + emulated AMD-Vi; the nucleus must locate the unit)
+        run: IOMMU=1 tools/run-qemu.sh
 
   riscv64:
     name: riscv64 — build + boot under QEMU (OpenSBI)

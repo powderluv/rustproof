@@ -79,7 +79,19 @@ LOG=$(mktemp)
 trap 'rm -f "$LOG"' EXIT
 
 set +e
+# Optional rig for IOMMU work. Default is unchanged — the i440fx `pc` machine with no IOMMU —
+# because that is what every gate in this file was calibrated against. `IOMMU=1` switches to q35
+# (which has ECAM) and attaches an emulated AMD-Vi unit, matching the design's target rather
+# than VT-d. Opt-in, so a regression in the IOMMU rig cannot silently become a regression in the
+# boot everyone runs.
+MACHINE=()
+if [ "${IOMMU:-0}" = "1" ]; then
+    MACHINE=(-machine q35 -device amd-iommu)
+    echo "== IOMMU rig: q35 + emulated AMD-Vi =="
+fi
+
 feed_console_byte | timeout 30 qemu-system-x86_64 \
+    "${MACHINE[@]}" \
     -kernel "$KERNEL" \
     -m 512M \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
@@ -119,6 +131,21 @@ fi
 # expected to kill its process — was inserted ABOVE the FREE_REGION owner check, and every boot
 # went on passing while the owner check no longer executed. Require the lines that come LAST in
 # each process, so losing the tail of a demo fails the run.
+# The IOMMU scan is asserted in BOTH directions, because either failure reads as success
+# otherwise: a scan that silently finds nothing is indistinguishable from a machine that has no
+# IOMMU, and a scan that matches anything would "find" one on a machine without.
+if [ "${PROVOKE_FAULT:-0}" != "1" ]; then
+    if [ "${IOMMU:-0}" = "1" ]; then
+        if ! echo "$OUT" | grep -qE '\[iommu\] AMD-Vi at [0-9a-f]{2}:[0-9a-f]{2}\.[0-9] vendor=1022'; then
+            echo "RESULT: FAIL — the IOMMU rig was launched but the nucleus found no AMD-Vi unit"
+            exit 1
+        fi
+    elif ! echo "$OUT" | grep -qF '[iommu] no IOMMU on this machine'; then
+        echo "RESULT: FAIL — an IOMMU was reported on a machine launched without one"
+        exit 1
+    fi
+fi
+
 # Scoped off under PROVOKE_FAULT, which kills the guest long before the demo gets here —
 # the same scoping the clock gate above needs, and for the same reason.
 for want in 'share: a WRITABLE borrower still cannot destroy what it borrowed'; do
