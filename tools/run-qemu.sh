@@ -165,6 +165,17 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${IOMMU:-0}" = "1" ] &&
         echo "RESULT: FAIL — the AMD-Vi aperture was located but not readable (EFR zero or absent)"
         exit 1
     fi
+    # The Device Table base must WRITE and read back. A blind write has no oracle: a store into
+    # an unmapped hole looks exactly like a store the unit accepted, so the read-back is the
+    # only thing that distinguishes them.
+    if ! echo "$OUT" | grep -qE 'device table 0x[0-9a-f]+ \(2 MiB, 64K BDFs\) installed; DTBR reads back 0x[0-9a-f]+'; then
+        echo "RESULT: FAIL — the AMD-Vi device table was not installed (or its DTBR did not read back)"
+        exit 1
+    fi
+    if echo "$OUT" | grep -q 'DTBR write did NOT take'; then
+        echo "RESULT: FAIL — the DTBR write did not stick"
+        exit 1
+    fi
 fi
 
 # Scoped off under PROVOKE_FAULT, which kills the guest long before the demo gets here —

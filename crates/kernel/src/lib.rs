@@ -1855,10 +1855,61 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
                             "[iommu] aperture mapped uncached at {base:#x}: EFR={efr:#018x} \
                              CTRL={ctrl:#018x}"
                         );
+                        // ---- first WRITE to the IOMMU: install a Device Table ----
+                        //
+                        // AMD-Vi indexes this table by BDF, and its base register names ONE
+                        // physical address plus a size, so the memory must be contiguous —
+                        // which is why `mm::alloc_contiguous` had to exist first. 2 MiB covers
+                        // the full 64K-BDF space at 32 bytes per entry.
+                        //
+                        // Allocated HERE, before `FREE_AT_START` is captured, because it is
+                        // never freed: taking it afterwards would read as a 512-frame leak to
+                        // the conservation check at exit.
+                        const DT_PAGES: usize = 512;
+                        match fa.alloc_contiguous(DT_PAGES) {
+                            Some(dt) => {
+                                // Every entry zero = V=0 = no device is described yet. The
+                                // table must be quiescent before its base is published,
+                                // because the unit may fetch from it the moment it is enabled.
+                                for i in 0..DT_PAGES {
+                                    let _ = zero_frame(abi::PhysAddr(
+                                        dt.as_u64() + (i as u64) * abi::PAGE_SIZE,
+                                    ));
+                                }
+                                // Size field is (entries*32/4096)-1; 2 MiB -> 511.
+                                let val =
+                                    (dt.as_u64() & 0x000F_FFFF_FFFF_F000) | (DT_PAGES as u64 - 1);
+                                core::ptr::write_volatile(base as *mut u64, val);
+                                // READ BACK. A blind write has no oracle — this is the only
+                                // thing that distinguishes "the unit accepted it" from "the
+                                // store went into a hole and nothing happened".
+                                let got = core::ptr::read_volatile(base as *const u64);
+                                if got == val {
+                                    let _ = writeln!(
+                                        con,
+                                        "[iommu] device table {:#x} (2 MiB, 64K BDFs) \
+                                         installed; DTBR reads back {got:#018x}",
+                                        dt.as_u64()
+                                    );
+                                } else {
+                                    let _ = writeln!(
+                                        con,
+                                        "[iommu] DTBR write did NOT take: wrote {val:#018x}, \
+                                         read {got:#018x}"
+                                    );
+                                }
+                            }
+                            None => {
+                                let _ = writeln!(
+                                    con,
+                                    "[iommu] no 2 MiB contiguous run for a device table"
+                                );
+                            }
+                        }
                         let _ = writeln!(
                             con,
-                            "        (read only; the unit is NOT enabled and NOTHING is \
-                             programmed)"
+                            "        (table is EMPTY and the unit is NOT enabled — no \
+                             translation is in effect)"
                         );
                     } else {
                         let _ = writeln!(
