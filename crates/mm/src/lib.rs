@@ -160,6 +160,60 @@ impl BitmapAllocator {
         alloc
     }
 
+    /// Allocate `pages` PHYSICALLY CONTIGUOUS frames from the general pool.
+    ///
+    /// Needed because some structures the hardware walks are one object, not a list of frames:
+    /// an AMD-Vi Device Table is indexed by BDF and its base register names a single physical
+    /// address with a size, so it cannot be a scatter list. Nothing else in this nucleus has
+    /// needed contiguity, which is why the allocator did not offer it.
+    ///
+    /// Returns the base of the run, or `None`. **Allocation is all-or-nothing**: a run that
+    /// turns out to be too short must leave the bitmap exactly as it found it. The obvious
+    /// implementation — mark frames used as you scan, give up when the run breaks — leaks
+    /// every frame of every rejected candidate, and leaks them silently, since a leak looks
+    /// like memory pressure rather than a bug.
+    ///
+    /// Serves the general pool only: `general_floor` is the arena boundary, and a table the
+    /// IOMMU walks has no reason to sit in device-reachable memory.
+    pub fn alloc_contiguous(&mut self, pages: usize) -> Option<PhysAddr> {
+        if pages == 0 || pages > self.total {
+            return None;
+        }
+        let mut start = self
+            .general_floor
+            .max((self.reserve_below >> PAGE_SHIFT) as usize);
+        while start + pages <= self.total {
+            // Find the first used frame in the candidate window and restart just past it,
+            // rather than stepping one frame at a time.
+            match (start..start + pages).find(|&f| self.is_used(f)) {
+                Some(bad) => start = bad + 1,
+                None => {
+                    for f in start..start + pages {
+                        self.set_used(f);
+                    }
+                    self.free -= pages;
+                    if self.cursor < start + pages {
+                        self.cursor = start + pages;
+                    }
+                    return Some(Self::frame_addr(start));
+                }
+            }
+        }
+        None
+    }
+
+    /// Test-only: is the frame containing `addr` marked used?
+    #[cfg(test)]
+    pub fn free_frame_is_used_for_test(&self, addr: u64) -> bool {
+        self.is_used((addr >> PAGE_SHIFT) as usize)
+    }
+
+    /// Test-only: tracked frame count.
+    #[cfg(test)]
+    pub fn total_for_test(&self) -> usize {
+        self.total
+    }
+
     /// Number of `u64` words a bitmap must have to track `regions` — i.e. one bit per
     /// frame from 0 through the highest fully-`Usable` frame. Zero if nothing is usable.
     /// The integrator uses this to size the static bitmap before calling [`new`](Self::new).
@@ -728,6 +782,89 @@ mod tests {
     /// Measured before the fix: this map handed out all 256 reserved frames. The firmware map
     /// is not ours on x86 — it comes from the PVH `hvm_start_info` the hypervisor supplies —
     /// and nothing validated that its regions are disjoint.
+
+    /// Contiguity is the whole point, and "all-or-nothing" is the part that is easy to get
+    /// wrong: a scan that marks frames as it goes leaks every rejected candidate, and a leak
+    /// reads as memory pressure rather than as a bug.
+    #[test]
+    fn a_contiguous_run_is_contiguous_and_allocation_is_all_or_nothing() {
+        let regions = synthetic_regions();
+        let words = BitmapAllocator::bitmap_words_needed(&regions);
+        let mut a = BitmapAllocator::new(&regions, leak_bitmap(words), RESERVE_BELOW, DMA_TOP);
+        let before = a.free_count();
+
+        let base = a
+            .alloc_contiguous(8)
+            .expect("8 contiguous frames must be available");
+        assert_eq!(base.as_u64() % PAGE_SIZE, 0, "run base is not page-aligned");
+        assert!(
+            base.as_u64() >= DMA_TOP,
+            "a general run came from the DMA arena"
+        );
+        assert_eq!(
+            a.free_count(),
+            before - 8,
+            "free count must drop by exactly the run length"
+        );
+
+        // Every frame of the run is now USED, so no single-frame allocation can return one.
+        for i in 0..8u64 {
+            let f = base.as_u64() + i * PAGE_SIZE;
+            assert!(
+                a.free_frame_is_used_for_test(f),
+                "frame {f:#x} of the run was not marked used"
+            );
+        }
+
+        // A request larger than anything left must change NOTHING.
+        let mid = a.free_count();
+        assert_eq!(a.alloc_contiguous(usize::MAX), None);
+        assert_eq!(a.alloc_contiguous(a.total_for_test() + 1), None);
+        assert_eq!(a.free_count(), mid, "a refused request consumed frames");
+    }
+
+    /// The refusal path over a FRAGMENTED pool, which is where a leaking scan shows up: many
+    /// candidate windows are examined and rejected before the request fails.
+    #[test]
+    fn a_refused_contiguous_request_leaks_nothing_even_when_fragmented() {
+        let regions = synthetic_regions();
+        let words = BitmapAllocator::bitmap_words_needed(&regions);
+        let mut a = BitmapAllocator::new(&regions, leak_bitmap(words), RESERVE_BELOW, DMA_TOP);
+
+        // Punch holes: take every frame, then give back every other one, so no run of 2
+        // exists anywhere in the general pool.
+        let mut taken = std::vec::Vec::new();
+        while let Some(f) = a.alloc_frame() {
+            taken.push(f);
+        }
+        for (i, f) in taken.iter().enumerate() {
+            if i % 2 == 0 {
+                a.free_frame(*f);
+            }
+        }
+        let before = a.free_count();
+        assert!(
+            before > 0,
+            "the fragmented pool must still hold free frames"
+        );
+        assert_eq!(
+            a.alloc_contiguous(2),
+            None,
+            "no run of 2 can exist in an alternating pool"
+        );
+        assert_eq!(
+            a.free_count(),
+            before,
+            "the refused request consumed {} frame(s)",
+            before - a.free_count()
+        );
+        // A run of ONE is still possible, which proves the pool was not simply empty.
+        assert!(
+            a.alloc_contiguous(1).is_some(),
+            "a 1-frame run must succeed"
+        );
+    }
+
     #[test]
     fn a_reserved_span_inside_a_usable_one_is_never_handed_out() {
         let regions = [
