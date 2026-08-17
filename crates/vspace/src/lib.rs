@@ -44,6 +44,13 @@ impl PageFlags {
     pub const HUGE: PageFlags = PageFlags(1 << 7);
     /// Execution is forbidden (requires EFER.NXE).
     pub const NO_EXEC: PageFlags = PageFlags(1 << 63);
+    /// Uncached: PWT (bit 3) + PCD (bit 4) together.
+    ///
+    /// Both, not just PCD: with the default PAT, PCD alone selects UC- which a later PAT
+    /// change can weaken, while PWT+PCD selects strong UC. For a register aperture the
+    /// difference is between "the device sees the stores it was sent, in order" and a fault
+    /// that reproduces on silicon and never under QEMU TCG.
+    pub const NO_CACHE: PageFlags = PageFlags((1 << 3) | (1 << 4));
 
     /// No flags set.
     #[inline]

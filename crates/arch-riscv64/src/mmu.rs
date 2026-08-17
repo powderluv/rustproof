@@ -3,6 +3,18 @@
 use crate::csr;
 use core::arch::asm;
 
+/// Invalidate every cached translation.
+///
+/// Needed once the kernel edits its OWN address space: every other mapping this kernel
+/// installs goes into a space that is not current, so nothing needed a flush before.
+///
+/// # Safety
+/// Always safe in itself — `sfence.vma` with no operands invalidates everything. Callers must
+/// have finished the page-table writes they want visible.
+pub unsafe fn sfence() {
+    asm!("sfence.vma", options(nostack, preserves_flags));
+}
+
 /// Turn on (or switch) Sv39 translation: load `satp` and flush the TLB. Execution
 /// continues in the new address space, which MUST map the currently-running kernel.
 pub unsafe fn enable_paging(satp: u64) {

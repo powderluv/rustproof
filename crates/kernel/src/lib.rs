@@ -366,6 +366,13 @@ const fn delivers_irq(line: u64) -> bool {
 /// through `MAP_BAR` can prove it really reached that physical memory — the same path a
 /// driver process would use for a real BAR, without needing the hardware.
 static mut DEVICE_PHYS: u64 = 0;
+
+/// The AMD-Vi register base IVRS named, or 0 if this machine has no IOMMU (or no ACPI).
+///
+/// Discovery happens before paging is enabled, and the aperture sits above the identity map,
+/// so the address has to be carried from one boot phase to the other.
+#[cfg(target_arch = "x86_64")]
+static mut AMDVI_BASE: u64 = 0;
 /// Pages of that window. One page for now: the frame allocator makes no contiguity
 /// promise, and a real BAR is a contiguous physical range, so a larger stand-in would
 /// have to reserve one deliberately.
@@ -1490,6 +1497,8 @@ fn report_ivrs<A: Arch>(con: &mut Console<A>, rsdt_addr: u64) {
                     con,
                     "[iommu] IVRS names {n} IOMMU(s); AMD-Vi register base {base:#x}"
                 );
+                // SAFETY: single-CPU boot path, before any process exists.
+                unsafe { AMDVI_BASE = base };
                 if n > 1 {
                     let _ = writeln!(
                         con,
@@ -1823,6 +1832,42 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
         unsafe {
             USER_ELF = user_elf;
             KTOKEN = ktoken;
+            // The aperture is above the identity map, so it is unreachable until now, and it
+            // must be UNCACHED — the first mapping in this tree that needs `Perms::device`.
+            #[cfg(target_arch = "x86_64")]
+            {
+                let base = *core::ptr::addr_of!(AMDVI_BASE);
+                if base != 0 {
+                    let mut space = A::Space::from_token(ktoken);
+                    if space.map_page(
+                        abi::VirtAddr(base),
+                        abi::PhysAddr(base),
+                        Perms::KERNEL_DEVICE,
+                        &mut fa,
+                    ) {
+                        // Editing the ACTIVE space: without this the mapping silently does
+                        // not take effect and the reads below return whatever was cached.
+                        A::flush_tlb();
+                        let efr = core::ptr::read_volatile((base + 0x30) as *const u64);
+                        let ctrl = core::ptr::read_volatile((base + 0x18) as *const u64);
+                        let _ = writeln!(
+                            con,
+                            "[iommu] aperture mapped uncached at {base:#x}: EFR={efr:#018x} \
+                             CTRL={ctrl:#018x}"
+                        );
+                        let _ = writeln!(
+                            con,
+                            "        (read only; the unit is NOT enabled and NOTHING is \
+                             programmed)"
+                        );
+                    } else {
+                        let _ = writeln!(
+                            con,
+                            "[iommu] could not map the AMD-Vi aperture at {base:#x}"
+                        );
+                    }
+                }
+            }
         }
         // Baseline BEFORE any process exists: everything allocated from here on belongs to a
         // process or a region, and every one of those is destroyed by teardown, so the pool

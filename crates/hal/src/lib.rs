@@ -13,6 +13,16 @@ pub struct Perms {
     pub write: bool,
     pub exec: bool,
     pub user: bool,
+    /// Device memory: the mapping must be UNCACHED.
+    ///
+    /// Not a permission, but it travels with them because it is a property of the mapping the
+    /// page tables must carry, and there is nowhere else to put it. Getting this wrong is
+    /// invisible under QEMU TCG and wrong on silicon: a cached mapping of a register aperture
+    /// reorders and coalesces stores the device is supposed to see in order.
+    ///
+    /// docs/host-contract.md lists "installed uncached / device-memory" as a MAP_BAR
+    /// precondition and this tree could not express it until now.
+    pub device: bool,
 }
 
 impl Perms {
@@ -20,11 +30,13 @@ impl Perms {
         write: true,
         exec: false,
         user: false,
+        device: false,
     };
     pub const USER_RW: Perms = Perms {
         write: true,
         exec: false,
         user: true,
+        device: false,
     };
     /// User-readable only: no write, no execute. What a device window mapped through a
     /// capability that carries `READ` but not `WRITE` must get.
@@ -32,20 +44,34 @@ impl Perms {
         write: false,
         exec: false,
         user: true,
+        device: false,
     };
     pub const USER_RX: Perms = Perms {
         write: false,
         exec: true,
         user: true,
+        device: false,
     };
 
     /// Permissions for a loaded ELF segment (`PF_W` / `PF_X`), always user + readable.
     #[inline]
+    /// A kernel-only mapping of a device register aperture: writable, never executable,
+    /// never user-reachable, and uncached.
+    pub const KERNEL_DEVICE: Perms = Perms {
+        write: true,
+        exec: false,
+        user: false,
+        device: true,
+    };
+
     pub const fn from_elf(pf_w: bool, pf_x: bool) -> Perms {
         Perms {
             write: pf_w,
             exec: pf_x,
             user: true,
+            // An ELF segment is ordinary memory; a loader that mapped one uncached would be
+            // correct but ruinously slow, and one that mapped a device cached would be wrong.
+            device: false,
         }
     }
 }
@@ -143,6 +169,14 @@ pub trait Arch {
     fn dma_top() -> u64;
     /// Ensure paging is on (build+enable it if needed) and return the kernel space token.
     fn setup_paging(fa: &mut dyn FrameAllocator) -> u64;
+
+    /// Invalidate stale translations after editing the ACTIVE address space.
+    ///
+    /// Every other mapping this kernel installs goes into a space that is not current — a
+    /// process's, before it is switched to — so nothing needed a flush until the kernel began
+    /// mapping device registers into its OWN space. A stale TLB entry there reads as the
+    /// mapping silently not taking effect.
+    fn flush_tlb();
     /// Load a user ELF into `space` (via the arch's loader), returning its entry VA.
     fn load_user(elf: &[u8], space: &mut Self::Space, fa: &mut dyn FrameAllocator) -> Option<u64>;
 

@@ -43,6 +43,9 @@ impl Space for X86Space {
         if !perms.exec {
             f = f | vspace::PageFlags::NO_EXEC;
         }
+        if perms.device {
+            f = f | vspace::PageFlags::NO_CACHE;
+        }
         self.0.map(va, pa, f, fa).is_ok()
     }
 
@@ -155,6 +158,12 @@ impl Arch for X86 {
 
     fn dma_top() -> u64 {
         0x100_0000 // 16 MiB
+    }
+
+    fn flush_tlb() {
+        // Reloading CR3 drops every non-global entry, which is enough here and needs no new
+        // primitive: `invlpg` would be narrower but this runs once at boot.
+        unsafe { cpu::write_cr3(cpu::read_cr3()) }
     }
 
     fn setup_paging(_fa: &mut dyn FrameAllocator) -> u64 {

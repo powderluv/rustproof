@@ -34,6 +34,16 @@ impl Space for RiscvSpace {
         perms: Perms,
         fa: &mut dyn FrameAllocator,
     ) -> bool {
+        // REFUSED, not silently downgraded. Uncached memory on riscv needs Svpbmt (PTE bits
+        // 62:61), which this tree does not implement and QEMU's `virt` does not require. A
+        // cached mapping of a register aperture is wrong in a way that reproduces only on
+        // silicon, so returning `false` costs a caller an error path and saves a bug that
+        // cannot be found here. There is no riscv IOMMU work yet; when there is, this is the
+        // line that has to change first.
+        if perms.device {
+            return false;
+        }
+
         // Sv39 leaf: V + R always; +W/+X/+U per perms (no negative NX bit).
         let mut f = PageFlags::V | PageFlags::R;
         if perms.write {
@@ -170,6 +180,11 @@ impl Arch for Riscv {
 
     fn dma_top() -> u64 {
         0x8800_0000
+    }
+
+    fn flush_tlb() {
+        // SAFETY: `sfence.vma` with no operands invalidates every translation; always safe.
+        unsafe { arch_riscv64::mmu::sfence() }
     }
 
     fn setup_paging(fa: &mut dyn FrameAllocator) -> u64 {

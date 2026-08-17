@@ -158,6 +158,13 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${IOMMU:-0}" = "1" ] &&
         echo "  no AMD-Vi register base. A broken walk is indistinguishable from no IOMMU."
         exit 1
     fi
+    # Having found the aperture, the kernel must reach it. EFR is a feature bitmap and is
+    # never zero on a real unit, so requiring non-zero catches a mapping that silently did not
+    # take effect — which otherwise reads as a device that happens to report nothing.
+    if ! echo "$OUT" | grep -qE 'aperture mapped uncached at 0x[0-9a-f]+: EFR=0x0*[1-9a-f][0-9a-f]*'; then
+        echo "RESULT: FAIL — the AMD-Vi aperture was located but not readable (EFR zero or absent)"
+        exit 1
+    fi
 fi
 
 # Scoped off under PROVOKE_FAULT, which kills the guest long before the demo gets here —
