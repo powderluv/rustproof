@@ -51,6 +51,33 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## OPEN DECISION 2026-08-17 — proving containment needs the first PCI config WRITE
+
+The AMD-Vi unit is enabled with a DTE for a real device and an event log armed, so a refused
+DMA would be recorded. What is missing is a DMA to refuse, and getting one has hit a decision
+that must not be crossed silently.
+
+**PCI BARs are unassigned on this boot path.** Measured with QEMU's monitor on shark-a: the
+`edu` device (1234:11e8, a trivial register-driven DMA engine) sits at 00:02.0 with
+`BAR0: 32 bit memory at 0xffffffffffffffff` — i.e. unmapped, exactly like the AMD-Vi capability
+base was. Assigning BARs is firmware's job and this boot runs none.
+
+So triggering a DMA requires WRITING a BAR, and a config write is the thing the 2026-08-14
+ruling deferred with "it needs its own decision rather than being smuggled in here". The options:
+
+1. **Assign the BAR from the nucleus at a hardcoded address**, marked rig-scaffolding. Needs the
+   size, which is only discoverable by SIZING (write all-ones, read the mask back) — itself a
+   config write with the decode bit cleared, which is a standing no in the kernel. Hardcoding
+   `edu`'s known 1 MiB avoids the sizing but is a constant that is true of one device on one rig.
+2. **Do proper BAR sizing in the kernel.** Previously ruled out, and the reasons have not
+   changed: it transiently unmaps a live device.
+3. **Boot under firmware** so BARs are assigned before the nucleus runs. Changes the boot path
+   every gate in both runners was calibrated against.
+4. **Have the DMA come from something already addressable.** Nothing qualifies: a device needs
+   its registers reachable to be told to transfer.
+
+Not chosen here. The evidence is in place so the choice is made on facts rather than rediscovered.
+
 ## 2026-08-14 (later still) — the nucleus can SEE an IOMMU
 
 The effect half starts with locating the unit, which the nucleus must do itself and no one else

@@ -378,6 +378,11 @@ static mut AMDVI_BASE: u64 = 0;
 /// 0000:00.0 is distinguishable from "no device".
 #[cfg(target_arch = "x86_64")]
 static mut TARGET_BDF: u32 = 0;
+
+/// Physical base of the AMD-Vi event log, or 0 if none is armed. The log is how a REFUSED DMA
+/// reports itself; with none, a blocked transfer is silent.
+#[cfg(target_arch = "x86_64")]
+static mut EVENT_LOG: u64 = 0;
 /// Pages of that window. One page for now: the frame allocator makes no contiguity
 /// promise, and a real BAR is a contiguous physical range, so a larger stand-in would
 /// have to reserve one deliberately.
@@ -1585,8 +1590,35 @@ unsafe fn program_dte<A: Arch>(
     const IOMMU_EN: u64 = 1 << 0;
     let ctrl = base + 0x18;
     let before = core::ptr::read_volatile(ctrl as *const u64);
-    core::ptr::write_volatile(ctrl as *mut u64, before | IOMMU_EN);
+    core::ptr::write_volatile(ctrl as *mut u64, before | IOMMU_EN | EVENT_LOG_EN);
     let after = core::ptr::read_volatile(ctrl as *const u64);
+
+    // ---- event log: without it, a refused DMA is SILENT ----
+    //
+    // The unit reports IO_PAGE_FAULT (and friends) by appending 16-byte entries to a ring in
+    // memory. With no log armed, a blocked transfer produces no record anywhere — the device
+    // simply does not get its data, which is indistinguishable from a device that was never
+    // asked. Arming it is what makes "refused" observable rather than assumed.
+    //
+    // 4 KiB = 256 entries; the EventLen field encodes 256 as 8.
+    const EVENT_ENTRIES_LOG2: u64 = 8;
+    const EVENT_LOG_EN: u64 = 1 << 2;
+    if let Some(log) = fa.alloc_frame().map(|f| zero_frame(f)) {
+        let val = (log.as_u64() & 0x000F_FFFF_FFFF_F000) | (EVENT_ENTRIES_LOG2 << 56);
+        core::ptr::write_volatile((base + 0x10) as *mut u64, val);
+        let back = core::ptr::read_volatile((base + 0x10) as *const u64);
+        if back == val {
+            let _ = writeln!(
+                con,
+                "[iommu] event log {:#x} (256 entries) armed; ELBR reads back {back:#018x}",
+                log.as_u64()
+            );
+            // SAFETY: single-CPU boot path.
+            EVENT_LOG = log.as_u64();
+        } else {
+            let _ = writeln!(con, "[iommu] event log base did not take: {back:#018x}");
+        }
+    }
 
     if after & IOMMU_EN != 0 {
         let _ = writeln!(

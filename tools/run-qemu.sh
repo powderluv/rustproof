@@ -190,6 +190,16 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${IOMMU:-0}" = "1" ] &&
         echo "RESULT: FAIL — the AMD-Vi unit did not report IommuEn"
         exit 1
     fi
+    # EventLogEn (CTRL bit 2) as well as IommuEn (bit 0): without the log a refused DMA is
+    # silent, so an enabled unit with no log can never demonstrate that it refused anything.
+    if ! echo "$OUT" | grep -qE 'event log 0x[0-9a-f]+ \(256 entries\) armed'; then
+        echo "RESULT: FAIL — the AMD-Vi event log was not armed"
+        exit 1
+    fi
+    if ! echo "$OUT" | grep -qE 'unit ENABLED, CTRL=0x[0-9a-f]*[4567cdef]'; then
+        echo "RESULT: FAIL — CTRL does not report EventLogEn"
+        exit 1
+    fi
 fi
 
 # Scoped off under PROVOKE_FAULT, which kills the guest long before the demo gets here —
