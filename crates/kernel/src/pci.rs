@@ -30,6 +30,11 @@ const CONFIG_ADDRESS: u16 = 0xCF8;
 #[cfg(target_arch = "x86_64")]
 const CONFIG_DATA: u16 = 0xCFC;
 
+/// PCI base class 0x02 (network), subclass 0x00 (ethernet) — a DMA-capable function to
+/// program a DTE for.
+#[cfg(target_arch = "x86_64")]
+const CLASS_ETHERNET: u16 = 0x0200;
+
 /// PCI base class 0x08 (system peripheral), subclass 0x06 (IOMMU).
 #[cfg(target_arch = "x86_64")]
 const CLASS_IOMMU: u16 = 0x0806;
@@ -220,4 +225,48 @@ mod tests {
         // A genuine 64-bit base uses the high half.
         assert_eq!(compose_base(0xfed8_0001, 0x0000_0007), Some(0x7_fed8_0000));
     }
+}
+
+/// Find the first function of `class` on bus 0.
+///
+/// Same walk as [`find_iommu`], parameterised. Kept separate rather than merged because the
+/// IOMMU lookup is load-bearing for the isolation story and this one is a convenience for
+/// choosing a device to bound; conflating them would invite "find any device" to grow rights
+/// the IOMMU lookup must never have.
+///
+/// # Safety
+/// See [`read32`].
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn find_class(class: u16) -> Option<Function> {
+    for dev in 0..32u8 {
+        for func in 0..8u8 {
+            let id = read32(0, dev, func, 0x00);
+            let vendor = (id & 0xFFFF) as u16;
+            if vendor == 0xFFFF {
+                if func == 0 {
+                    break;
+                }
+                continue;
+            }
+            if (read32(0, dev, func, 0x08) >> 16) as u16 == class {
+                return Some(Function {
+                    bus: 0,
+                    dev,
+                    func,
+                    vendor,
+                    device: (id >> 16) as u16,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The DMA-capable function this nucleus will bound, if the machine has one.
+///
+/// # Safety
+/// See [`read32`].
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn find_dma_device() -> Option<Function> {
+    find_class(CLASS_ETHERNET)
 }

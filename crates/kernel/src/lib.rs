@@ -373,6 +373,11 @@ static mut DEVICE_PHYS: u64 = 0;
 /// so the address has to be carried from one boot phase to the other.
 #[cfg(target_arch = "x86_64")]
 static mut AMDVI_BASE: u64 = 0;
+
+/// BDF of the device whose DMA will be bounded, with bit 16 as a "found" flag so that
+/// 0000:00.0 is distinguishable from "no device".
+#[cfg(target_arch = "x86_64")]
+static mut TARGET_BDF: u32 = 0;
 /// Pages of that window. One page for now: the frame allocator makes no contiguity
 /// promise, and a real BAR is a contiguous physical range, so a larger stand-in would
 /// have to reserve one deliberately.
@@ -1518,6 +1523,87 @@ fn report_ivrs<A: Arch>(con: &mut Console<A>, rsdt_addr: u64) {
     );
 }
 
+/// Program a Device Table Entry for the target device, then enable translation.
+///
+/// The I/O page-table root is allocated EMPTY on purpose. An empty root means no IOVA
+/// translates, so every DMA the device attempts is refused — which is the strictest possible
+/// containment and the only configuration whose correctness needs no map/unmap logic to be
+/// right first. Loosening it is the next step, not this one.
+///
+/// # Safety
+/// Single-CPU boot path; `base` is the mapped AMD-Vi aperture and `dt` the device table.
+#[cfg(target_arch = "x86_64")]
+unsafe fn program_dte<A: Arch>(
+    con: &mut Console<A>,
+    fa: &mut mm::BitmapAllocator,
+    base: u64,
+    dt: u64,
+) {
+    let bdf = *core::ptr::addr_of!(TARGET_BDF);
+    if bdf & 0x1_0000 == 0 {
+        let _ = writeln!(con, "[iommu] no target device — leaving the unit disabled");
+        return;
+    }
+    let bdf = (bdf & 0xFFFF) as u64;
+
+    use abi::FrameAllocator as _;
+    let Some(root) = fa.alloc_frame().map(|f| zero_frame(f)) else {
+        let _ = writeln!(con, "[iommu] no frame for an I/O page-table root");
+        return;
+    };
+
+    // DTE word 0: V | TV | Mode (bits 11:9) | root (bits 51:12) | IR | IW.
+    // Mode 3 = a three-level table. Mode 0 would mean "translation disabled", i.e. the device
+    // DMAs untranslated — the opposite of the intent, and a plausible typo, so it is named.
+    const MODE_3_LEVEL: u64 = 3 << 9;
+    const V: u64 = 1 << 0;
+    const TV: u64 = 1 << 1;
+    const IR: u64 = 1 << 61;
+    const IW: u64 = 1 << 62;
+    let w0 = V | TV | MODE_3_LEVEL | (root.as_u64() & 0x000F_FFFF_FFFF_F000) | IR | IW;
+    let w1: u64 = 0; // domain 0
+
+    let dte = (dt + bdf * 32) as *mut u64;
+    core::ptr::write_volatile(dte, w0);
+    core::ptr::write_volatile(dte.add(1), w1);
+    core::ptr::write_volatile(dte.add(2), 0);
+    core::ptr::write_volatile(dte.add(3), 0);
+
+    let back = core::ptr::read_volatile(dte);
+    if back != w0 {
+        let _ = writeln!(
+            con,
+            "[iommu] DTE write did NOT take: {back:#018x} != {w0:#018x}"
+        );
+        return;
+    }
+
+    // Enable translation. Safe here for a specific reason rather than by luck: nothing in this
+    // guest does DMA — the demo touches the serial port and debug-exit only — so a unit that
+    // refuses every transfer cannot break the boot. On a machine that WAS doing DMA this line
+    // would need the command buffer and an invalidation first.
+    const IOMMU_EN: u64 = 1 << 0;
+    let ctrl = base + 0x18;
+    let before = core::ptr::read_volatile(ctrl as *const u64);
+    core::ptr::write_volatile(ctrl as *mut u64, before | IOMMU_EN);
+    let after = core::ptr::read_volatile(ctrl as *const u64);
+
+    if after & IOMMU_EN != 0 {
+        let _ = writeln!(
+            con,
+            "[iommu] DTE[{bdf:#06x}] = {w0:#018x} (V TV mode=3 root={:#x}); unit ENABLED, \
+             CTRL={after:#018x}",
+            root.as_u64()
+        );
+        let _ = writeln!(
+            con,
+            "        the I/O page table is EMPTY, so every DMA from that device is refused"
+        );
+    } else {
+        let _ = writeln!(con, "[iommu] CTRL write did not take: {after:#018x}");
+    }
+}
+
 /// `hartid`/`dtb`); `user_elf` is the embedded user program. Never returns.
 pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
     use abi::FrameAllocator as _;
@@ -1609,6 +1695,28 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
                     con,
                     "       property of the QEMU build, not of PVH. See docs/verification.md."
                 );
+            }
+        }
+        // Finding the device to bound is a PCI scan and does not depend on ACPI, so it is
+        // reported on every machine — including the one with no ACPI, which is the only place
+        // a scan bug would otherwise go unseen.
+        // SAFETY: single-CPU boot path; nothing else performs a config cycle.
+        match unsafe { pci::find_dma_device() } {
+            Some(d) => {
+                let _ = writeln!(
+                    con,
+                    "[iommu] target {:02x}:{:02x}.{} vendor={:04x} bdf={:#06x} (DMA-capable)",
+                    d.bus,
+                    d.dev,
+                    d.func,
+                    d.vendor,
+                    d.bdf()
+                );
+                // SAFETY: as above.
+                unsafe { TARGET_BDF = d.bdf() as u32 | 0x1_0000 };
+            }
+            None => {
+                let _ = writeln!(con, "[iommu] no DMA-capable device to bound");
             }
         }
         // SAFETY: single-CPU boot path; nothing else performs a config cycle.
@@ -1891,6 +1999,7 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
                                          installed; DTBR reads back {got:#018x}",
                                         dt.as_u64()
                                     );
+                                    program_dte::<A>(&mut con, &mut fa, base, dt.as_u64());
                                 } else {
                                     let _ = writeln!(
                                         con,

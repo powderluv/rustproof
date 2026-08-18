@@ -86,7 +86,10 @@ set +e
 # boot everyone runs.
 MACHINE=()
 if [ "${IOMMU:-0}" = "1" ]; then
-    MACHINE=(-machine q35 -device amd-iommu)
+    # A DMA-capable function to program a DTE for. The guest never drives it — the demo
+    # touches only the serial port and debug-exit, neither of which does DMA — so enabling
+    # translation cannot break the boot. That is exactly why it is safe to enable at all.
+    MACHINE=(-machine q35 -device amd-iommu -device e1000,bus=pcie.0)
     echo "== IOMMU rig: q35 + emulated AMD-Vi =="
 fi
 
@@ -174,6 +177,17 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${IOMMU:-0}" = "1" ] &&
     fi
     if echo "$OUT" | grep -q 'DTBR write did NOT take'; then
         echo "RESULT: FAIL — the DTBR write did not stick"
+        exit 1
+    fi
+    # The unit must actually come up. V|TV must be set in the DTE and IommuEn in CTRL —
+    # checking the log line alone would pass for a DTE of all zeros, which is a device the
+    # IOMMU ignores entirely rather than one it bounds.
+    if ! echo "$OUT" | grep -qE 'DTE\[0x[0-9a-f]+\] = 0x[0-9a-f]*[37bf] \(V TV mode=3'; then
+        echo "RESULT: FAIL — no DTE with V|TV was programmed"
+        exit 1
+    fi
+    if ! echo "$OUT" | grep -qE 'unit ENABLED, CTRL=0x[0-9a-f]*[13579bdf]'; then
+        echo "RESULT: FAIL — the AMD-Vi unit did not report IommuEn"
         exit 1
     fi
 fi
