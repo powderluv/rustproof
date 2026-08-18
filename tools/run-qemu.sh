@@ -31,9 +31,24 @@ RUSTFLAGS="-C relocation-model=static -C code-model=large" \
 cp "target/$TARGET/$PROFILE/init" crates/nucleus/user.elf
 
 echo "== building nucleus ($PROFILE, mode=$MODE) for $TARGET =="
+if [ "${FIRMWARE:-0}" = "1" ]; then
+    FEATURES+=(--features firmware-boot)
+fi
 cargo build -p nucleus --target "$TARGET" "${BUILD_FLAG[@]}" "${FEATURES[@]}"
 
 KERNEL="target/$TARGET/$PROFILE/nucleus"
+
+# The firmware path needs a FLAT image: QEMU's multiboot loader refuses a 64-bit ELF ("give a
+# 32bit one"), so the a.out kludge in the header describes an objcopy'd binary instead. Booting
+# through SeaBIOS is what assigns PCI BARs, which is what a DMA-capable device needs before it
+# can be told to transfer.
+if [ "${FIRMWARE:-0}" = "1" ]; then
+    OBJCOPY=$(command -v llvm-objcopy || command -v objcopy || ls "$HOME"/.rustup/toolchains/*/lib/rustlib/*/bin/llvm-objcopy 2>/dev/null | head -1)
+    [ -n "$OBJCOPY" ] || { echo "FIRMWARE=1 needs llvm-objcopy or objcopy" >&2; exit 1; }
+    "$OBJCOPY" -O binary "$KERNEL" "$KERNEL.bin"
+    KERNEL="$KERNEL.bin"
+    echo "== firmware path: flat image $KERNEL (SeaBIOS + multiboot) =="
+fi
 echo "== image: $(file "$KERNEL") =="
 
 echo "== booting under QEMU (TCG) =="

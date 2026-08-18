@@ -67,12 +67,28 @@ loader then refuses a 64-bit image outright ("Cannot load x86-64 image, give a 3
 the header carries the a.out KLUDGE and the rig feeds it an objcopy'd flat binary. With that,
 SeaBIOS runs, loads the image, jumps to `_start`, and the kernel reaches its own banner.
 
-What does not: it faults immediately after, while formatting `Arch::NAME` into that banner —
-the format string prints, the value does not. `init_traps()` has not run at that point, so the
-fault is a silent triple fault with no dump, which is the least informative failure this kernel
-has. The suspicion is the loaded extent: `objcopy` emits `.bss` as zeros, so the flat file is
-larger than `__data_end` suggested, and declaring `load_end_addr = __data_end` truncated the
-load before `.rodata`. Setting it to `__bss_end` did not fix it, so the diagnosis is incomplete.
+What does not: it hangs while formatting `Arch::NAME` into that banner — the format string
+prints, the value does not. Confirmed THROUGH THE RUNNER on 2026-08-18, not by hand: the
+firmware image times out there while the PVH ELF passes the same harness.
+
+The fault, captured with `-d int,cpu_reset`: `RIP=0x159000`, which is `__bss_end` (0x158bd8)
+rounded up to a page — i.e. execution jumped off the end of the image and ran zeros. `IDT` is
+still `0` because `init_traps()` has not run, so it is #GP -> #DF -> **triple fault** with no
+dump. That is a garbage function pointer, which fits `core::fmt` reaching for a formatter
+through a value that did not load correctly.
+
+NOT the cause, ruled out: the loaded extent. `objcopy` emits `.bss` as zeros (it is PROGBITS
+here, not NOBITS), so the flat file is larger than `__data_end` implies; setting
+`load_end_addr = __bss_end` covers the whole file and does not fix it.
+
+TWO MEASUREMENT ERRORS COST MOST OF A SESSION HERE, both worth naming:
+- The first WIP diagnosis was of the WRONG BINARY. `cargo build --features firmware-boot`
+  reported `Finished in 0.00s` — a cache hit — so the image tested had no multiboot header at
+  all (verified after: the flat file began with the Xen note, and the multiboot magic was
+  absent from it entirely). A clean rebuild produces the header at offset 0.
+- Comparing images with `grep -o` "proved" that the PVH ELF failed too, because `grep -o`
+  prints only the matched substring. It does not fail. Bare `qemu -kernel` invocations also
+  truncate output where the runner does not, because closing stdin ends the run early.
 
 The default boot path is untouched and every existing gate is green, on both hosts. The feature
 is off unless asked for, and nothing claims it works.
