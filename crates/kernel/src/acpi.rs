@@ -170,6 +170,28 @@ pub fn ivrs_first_base(buf: &[u8]) -> Option<(u64, usize)> {
     first.map(|b| (b, count))
 }
 
+/// Where the BIOS RSDP lives when firmware placed it: the last 128 KiB below 1 MiB.
+pub const BIOS_SCAN_START: u64 = 0x000E_0000;
+pub const BIOS_SCAN_END: u64 = 0x0010_0000;
+
+/// Offset of the first validly-checksummed RSDP in `buf`, if any.
+///
+/// Needed by the FIRMWARE boot path: multiboot carries no `rsdp_paddr` the way PVH does, so
+/// with firmware in play the pointer has to be found rather than handed over. ACPI puts it on
+/// a 16-byte boundary in this window, and the checksum is what separates a real one from the
+/// eight bytes `RSD PTR ` appearing by chance — which is exactly why this reuses
+/// [`parse_rsdp`] rather than matching a signature.
+pub fn scan_for_rsdp(buf: &[u8]) -> Option<usize> {
+    let mut off = 0usize;
+    while off + 20 <= buf.len() {
+        if &buf[off..off + 8] == b"RSD PTR " && parse_rsdp(&buf[off..]).is_ok() {
+            return Some(off);
+        }
+        off += 16;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +298,22 @@ mod tests {
         let t = table(b"RSDT", &body);
         let got: std::vec::Vec<u32> = rsdt_entries(&t).collect();
         assert_eq!(got, std::vec![0x1000, 0x2000, 0x3000]);
+    }
+
+    #[test]
+    fn the_scan_finds_a_checksummed_rsdp_and_ignores_a_bare_signature() {
+        let good = rsdp_v2(0x7fff_1000);
+        let mut buf = std::vec![0u8; 512];
+        // A DECOY first: the right eight bytes with a wrong checksum, on a 16-byte boundary.
+        // A signature match alone would stop here and hand back a structure that is not an
+        // RSDP, which is the whole reason the scan validates rather than matches.
+        buf[16..16 + 8].copy_from_slice(b"RSD PTR ");
+        buf[16 + 15] = 2;
+        buf[128..128 + 36].copy_from_slice(&good);
+        assert_eq!(scan_for_rsdp(&buf), Some(128));
+        // Nothing valid anywhere.
+        let empty = std::vec![0u8; 512];
+        assert_eq!(scan_for_rsdp(&empty), None);
     }
 
     #[test]

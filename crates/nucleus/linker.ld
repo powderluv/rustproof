@@ -29,6 +29,15 @@ SECTIONS {
 
     . = ALIGN(4K);
     .data : { *(.data .data.*) } :data
+    /* The GOT is an ORPHAN unless it is named here, and an orphan is placed AFTER everything
+       the script mentions — i.e. past `__bss_end`. That is invisible to the ELF boot path,
+       whose program headers cover it anyway, and fatal to the flat one: `load_end_addr` was
+       computed from `__bss_end` and stopped exactly where `.got` began, so the GOT was never
+       loaded. Associated consts like `Arch::NAME` resolve through it, so the first one used
+       jumped through a zeroed slot; string literals compile to PC-relative `lea` and worked,
+       which is what made the failure look like a formatting bug. */
+    .got  : { *(.got .got.plt) } :data
+
     __data_end = .;
     .bss  : {
         *(.bss .bss.*)

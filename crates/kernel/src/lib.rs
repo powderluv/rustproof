@@ -1686,8 +1686,20 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
     // rather than reading as "this machine has no IOMMU".
     #[cfg(target_arch = "x86_64")]
     {
+        // Under FIRMWARE (multiboot) there is no `rsdp_paddr` field to read: the pointer was
+        // never handed to us, because firmware placed the tables itself. Scan the BIOS window
+        // for it instead, validating rather than signature-matching.
+        #[cfg(feature = "firmware-boot")]
+        let found = {
+            let n = (acpi::BIOS_SCAN_END - acpi::BIOS_SCAN_START) as usize;
+            // SAFETY: the window is below 1 MiB and inside the identity map.
+            let win = unsafe { core::slice::from_raw_parts(acpi::BIOS_SCAN_START as *const u8, n) };
+            acpi::scan_for_rsdp(win).map(|off| acpi::BIOS_SCAN_START + off as u64)
+        };
         // SAFETY: dereferences the boot-info pointer, same as the memory map does.
-        match unsafe { pvh::rsdp(a0) } {
+        #[cfg(not(feature = "firmware-boot"))]
+        let found = unsafe { pvh::rsdp(a0) };
+        match found {
             Some(p) => {
                 // SAFETY: `pvh::rsdp` bounded it to the identity-mapped window.
                 let buf = unsafe { core::slice::from_raw_parts(p as *const u8, 36) };

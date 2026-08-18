@@ -27,10 +27,10 @@ mb_header:
     .long -(0x1BADB002 + 0x00010002)        /* checksum: the three must sum to zero */
     .long mb_header                         /* header_addr */
     .long __image_start                     /* load_addr */
-    .long __bss_end                         /* load_end_addr: the FLAT image objcopy emits
-                                               includes .bss as zeros, so the loadable extent
-                                               runs to bss_end. Declaring __data_end here made
-                                               the loader stop short of .rodata/.data, and the
-                                               kernel faulted formatting its own banner. */
+    .long __data_end                        /* load_end_addr: the last byte the loader reads
+                                               FROM THE FILE. `.got` is placed explicitly ahead
+                                               of it in linker.ld — left as an orphan the linker
+                                               puts it past `.bss`, outside this extent, and the
+                                               GOT is silently never loaded. */
     .long __bss_end                         /* bss_end_addr */
     .long _start                            /* entry_addr */

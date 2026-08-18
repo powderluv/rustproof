@@ -51,47 +51,33 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
-## 2026-08-17 (later) — DECIDED: firmware for the proof rig. WIP, does not boot yet.
+## 2026-08-18 — the firmware rig BOOTS. The hang was an orphan `.got`.
 
-The decision was made: boot the proof rig under firmware so SeaBIOS assigns BARs, rather than
-teaching the nucleus to assign them. Verified first, before building anything — with no kernel
-at all, SeaBIOS brings `edu`'s BAR0 up at `0xfea00000` (and assigns IRQ 10), against
-`0xffffffffffffffff` under PVH. So the premise holds.
+`IOMMU=1 FIRMWARE=1 tools/run-qemu.sh` now boots through SeaBIOS end to end, on both hosts:
+RSDP found, IVRS walked, AMD-Vi located and mapped, device table installed, event log armed.
 
-**Status: the mechanism works, the boot does not. This is unfinished and opt-in.**
+**The bug was a linker-script orphan.** `.got` was never named in linker.ld, so the linker
+placed it AFTER everything the script mentions — at `0x158BD8`, exactly `__bss_end`, which is
+where `load_end_addr` stopped. The GOT was therefore never loaded. Associated consts like
+`Arch::NAME` resolve through it, so the first one used jumped through a zeroed slot to
+`0x159000` — one page past the image — and ran zeros into a triple fault before `init_traps()`
+could produce a dump.
 
-What works: QEMU takes the PVH path whenever the ELF carries a PVH note, and that path skips
-firmware — so the image must advertise multiboot INSTEAD (never both, or PVH wins again). A
-`firmware-boot` feature swaps the `.note.Xen` for a Multiboot 1 header. QEMU's multiboot ELF
-loader then refuses a 64-bit image outright ("Cannot load x86-64 image, give a 32bit one"), so
-the header carries the a.out KLUDGE and the rig feeds it an objcopy'd flat binary. With that,
-SeaBIOS runs, loads the image, jumps to `_start`, and the kernel reaches its own banner.
+It is invisible on the ELF path because the program headers cover `.got` regardless, which is
+why the same kernel boots fine under PVH. Naming `.got` in the script and setting
+`load_end_addr = __data_end` fixes it, and that is also the textbook multiboot arrangement:
+the loader reads to the end of the FILE and zeroes `.bss` itself.
 
-What does not: it hangs while formatting `Arch::NAME` into that banner — the format string
-prints, the value does not. Confirmed THROUGH THE RUNNER on 2026-08-18, not by hand: the
-firmware image times out there while the PVH ELF passes the same harness.
+**What made it findable was bisecting a symptom, not reading the spec harder.** A string
+literal formats fine (PC-relative `lea`, no GOT entry) while `Arch::NAME` faults — that
+asymmetry is what pointed at the GOT. Three earlier hypotheses were all wrong and all
+plausible: the loaded extent, the em-dash in the format string, and `core::fmt` itself. Each
+was killed by an experiment rather than by argument.
 
-The fault, captured with `-d int,cpu_reset`: `RIP=0x159000`, which is `__bss_end` (0x158bd8)
-rounded up to a page — i.e. execution jumped off the end of the image and ran zeros. `IDT` is
-still `0` because `init_traps()` has not run, so it is #GP -> #DF -> **triple fault** with no
-dump. That is a garbage function pointer, which fits `core::fmt` reaching for a formatter
-through a value that did not load correctly.
-
-NOT the cause, ruled out: the loaded extent. `objcopy` emits `.bss` as zeros (it is PROGBITS
-here, not NOBITS), so the flat file is larger than `__data_end` implies; setting
-`load_end_addr = __bss_end` covers the whole file and does not fix it.
-
-TWO MEASUREMENT ERRORS COST MOST OF A SESSION HERE, both worth naming:
-- The first WIP diagnosis was of the WRONG BINARY. `cargo build --features firmware-boot`
-  reported `Finished in 0.00s` — a cache hit — so the image tested had no multiboot header at
-  all (verified after: the flat file began with the Xen note, and the multiboot magic was
-  absent from it entirely). A clean rebuild produces the header at offset 0.
-- Comparing images with `grep -o` "proved" that the PVH ELF failed too, because `grep -o`
-  prints only the matched substring. It does not fail. Bare `qemu -kernel` invocations also
-  truncate output where the runner does not, because closing stdin ends the run early.
-
-The default boot path is untouched and every existing gate is green, on both hosts. The feature
-is off unless asked for, and nothing claims it works.
+The firmware path also cannot use PVH's `rsdp_paddr`, because multiboot never hands one over —
+firmware placed the tables itself. `acpi::scan_for_rsdp` looks in the BIOS window and VALIDATES
+rather than signature-matches; its test plants a decoy with the right eight bytes and a wrong
+checksum ahead of the real one, because a signature match alone would return the decoy.
 
 ## OPEN DECISION 2026-08-17 — proving containment needs the first PCI config WRITE
 
