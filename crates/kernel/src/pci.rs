@@ -262,11 +262,88 @@ pub unsafe fn find_class(class: u16) -> Option<Function> {
     None
 }
 
-/// The DMA-capable function this nucleus will bound, if the machine has one.
+/// QEMU's `edu` test device: a register-driven DMA engine.
+const EDU_VENDOR: u16 = 0x1234;
+const EDU_DEVICE: u16 = 0x11e8;
+
+/// The DMA-capable function this nucleus will bound.
+///
+/// Matched by VENDOR:DEVICE rather than by class, and the difference is not pedantry. Class
+/// 0x0200 also matches the rig's e1000, and targeting that instead wrote DMA commands into a
+/// NIC's registers — caught only because the caller checks an identification register before
+/// trusting the mapping (`ident=0x00140241`, an e1000, not edu's `0x010000ed`). A device is
+/// driven by its programming model, and only its exact identity implies that.
+///
+/// Falls back to any Ethernet function so a machine without `edu` still reports a bounded
+/// device; it just cannot be driven into a transfer.
 ///
 /// # Safety
 /// See [`read32`].
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn find_dma_device() -> Option<Function> {
+    for dev in 0..32u8 {
+        for func in 0..8u8 {
+            let id = read32(0, dev, func, 0x00);
+            if (id & 0xFFFF) as u16 == EDU_VENDOR && (id >> 16) as u16 == EDU_DEVICE {
+                return Some(Function {
+                    bus: 0,
+                    dev,
+                    func,
+                    vendor: EDU_VENDOR,
+                    device: EDU_DEVICE,
+                });
+            }
+        }
+    }
     find_class(CLASS_ETHERNET)
+}
+
+/// Is this function the one we know how to drive into a DMA?
+#[cfg(target_arch = "x86_64")]
+pub fn is_edu(f: &Function) -> bool {
+    f.vendor == EDU_VENDOR && f.device == EDU_DEVICE
+}
+
+/// The physical base of `func`'s BAR0, or `None` if unassigned.
+///
+/// Only meaningful once FIRMWARE has run: a `-kernel`/PVH boot leaves every BAR at all-ones,
+/// which is why the proof rig boots through SeaBIOS. Memory BARs carry flags in the low four
+/// bits; masking them off is the difference between a base and a base plus its type bits.
+///
+/// # Safety
+/// See [`read32`].
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn bar0(func: &Function) -> Option<u64> {
+    let raw = read32(func.bus, func.dev, func.func, 0x10);
+    // All-ones means unassigned; bit 0 set means an I/O-space BAR, which is not a mapping.
+    if raw == 0xFFFF_FFFF || raw == 0 || raw & 1 != 0 {
+        return None;
+    }
+    Some((raw & 0xFFFF_FFF0) as u64)
+}
+
+/// Enable memory decoding and bus mastering for `func`.
+///
+/// A device cannot DMA with bus mastering off, and firmware leaves it off for anything it did
+/// not itself drive. This is a config WRITE — the first in this tree — and it is deliberately
+/// the narrowest one that exists: it sets two bits in the command register and touches no BAR,
+/// so it cannot move a device's registers or resize a window. Assigning BARs remains firmware's
+/// job, which is the whole reason the proof rig boots through SeaBIOS.
+///
+/// # Safety
+/// See [`read32`]. Single-CPU, kernel-only.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn enable_bus_master(func: &Function) -> u32 {
+    const MEMORY_SPACE: u32 = 1 << 1;
+    const BUS_MASTER: u32 = 1 << 2;
+    let cmd = read32(func.bus, func.dev, func.func, 0x04);
+    let want = cmd | MEMORY_SPACE | BUS_MASTER;
+    let addr = 0x8000_0000
+        | ((func.bus as u32) << 16)
+        | ((func.dev as u32) << 11)
+        | ((func.func as u32) << 8)
+        | 0x04;
+    port::outl(CONFIG_ADDRESS, addr);
+    port::outl(CONFIG_DATA, want);
+    read32(func.bus, func.dev, func.func, 0x04)
 }

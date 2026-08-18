@@ -104,7 +104,10 @@ if [ "${IOMMU:-0}" = "1" ]; then
     # A DMA-capable function to program a DTE for. The guest never drives it — the demo
     # touches only the serial port and debug-exit, neither of which does DMA — so enabling
     # translation cannot break the boot. That is exactly why it is safe to enable at all.
-    MACHINE=(-machine q35 -device amd-iommu -device e1000,bus=pcie.0)
+    # `edu` is a register-driven DMA engine (source/dest/count/command) — the device the
+    # containment proof drives. The e1000 stays as a second DMA-capable function so the scan
+    # has to distinguish them rather than take whatever it finds first.
+    MACHINE=(-machine q35 -device amd-iommu -device e1000,bus=pcie.0 -device edu,bus=pcie.0)
     echo "== IOMMU rig: q35 + emulated AMD-Vi =="
 fi
 
@@ -214,6 +217,20 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${IOMMU:-0}" = "1" ] &&
     if ! echo "$OUT" | grep -qE 'unit ENABLED, CTRL=0x[0-9a-f]*[4567cdef]'; then
         echo "RESULT: FAIL — CTRL does not report EventLogEn"
         exit 1
+    fi
+    # Containment, on the firmware rig where a device can actually be driven. The oracle is the
+    # PAYLOAD: the same two transfers land when the unit is not translating and do not when it
+    # is, so "CONTAINED" means nothing reached memory rather than nothing was attempted — the
+    # transfers are separately required to have completed at the device.
+    if [ "${FIRMWARE:-0}" = "1" ] && echo "$OUT" | grep -q 'edu ident='; then
+        if ! echo "$OUT" | grep -q 'transfers: RAM->dev done dev->RAM done'; then
+            echo "RESULT: FAIL — the device did not complete its transfers; containment untested"
+            exit 1
+        fi
+        if ! echo "$OUT" | grep -q '\[iommu\] CONTAINED:'; then
+            echo "RESULT: FAIL — a bounded device's DMA reached memory"
+            exit 1
+        fi
     fi
 fi
 

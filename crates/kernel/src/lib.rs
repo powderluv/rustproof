@@ -1635,8 +1635,186 @@ unsafe fn program_dte<A: Arch>(
             con,
             "        the I/O page table is EMPTY, so every DMA from that device is refused"
         );
+        prove_containment::<A>(con, fa, base);
     } else {
         let _ = writeln!(con, "[iommu] CTRL write did not take: {after:#018x}");
+    }
+}
+
+/// Make the bounded device attempt a DMA, and report what the IOMMU did about it.
+///
+/// This is the step that turns "every DMA is refused" from a property of the CONFIGURATION
+/// into an OBSERVATION. Everything before it programmed the unit; nothing had asked a device to
+/// transfer, so nothing had actually been refused.
+///
+/// The device is QEMU's `edu`: a register-driven DMA engine whose entire interface is a
+/// source, a destination, a count and a command. Driving a real NIC would mean writing a NIC
+/// driver, and the thing under test is the IOMMU.
+///
+/// # Safety
+/// Single-CPU boot path; `base` is the mapped AMD-Vi aperture.
+#[cfg(target_arch = "x86_64")]
+unsafe fn prove_containment<A: Arch>(
+    con: &mut Console<A>,
+    fa: &mut mm::BitmapAllocator,
+    base: u64,
+) {
+    use abi::FrameAllocator as _;
+    let Some(dev) = pci::find_dma_device() else {
+        return;
+    };
+    if !pci::is_edu(&dev) {
+        let _ = writeln!(
+            con,
+            "[iommu] the bounded device is not one this nucleus can drive; no DMA attempted"
+        );
+        return;
+    }
+    let Some(bar) = pci::bar0(&dev) else {
+        let _ = writeln!(
+            con,
+            "[iommu] the target device has no assigned BAR — nothing can be told to DMA"
+        );
+        return;
+    };
+
+    let ktoken = *core::ptr::addr_of!(KTOKEN);
+    let mut space = A::Space::from_token(ktoken);
+    if !space.map_page(
+        abi::VirtAddr(bar),
+        abi::PhysAddr(bar),
+        Perms::KERNEL_DEVICE,
+        fa,
+    ) {
+        let _ = writeln!(con, "[iommu] could not map the target BAR at {bar:#x}");
+        return;
+    }
+    A::flush_tlb();
+
+    // Oracle FIRST: `edu` reports 0x010000ed in its identification register. A BAR that mapped
+    // nothing reads all-ones or zeros, and this is what tells those apart — without it a silent
+    // DMA failure could equally mean "the device was never reachable".
+    let ident = core::ptr::read_volatile(bar as *const u32);
+    if ident != 0x0100_00ed {
+        let _ = writeln!(
+            con,
+            "[iommu] target BAR {bar:#x} does not look like edu: ident={ident:#010x}"
+        );
+        return;
+    }
+    let _ = writeln!(
+        con,
+        "[iommu] target BAR {bar:#x} mapped; edu ident={ident:#010x}"
+    );
+
+    let cmd = pci::enable_bus_master(&dev);
+    let _ = writeln!(con, "        bus mastering enabled (command={cmd:#06x})");
+
+    // A frame the kernel owns, so a SUCCESSFUL transfer would be detectable too — this has to
+    // be able to show translation working later, not only failing.
+    let Some(target) = fa.alloc_frame().map(|f| zero_frame(f)) else {
+        return;
+    };
+
+    let tail_before = core::ptr::read_volatile((base + 0x2018) as *const u64);
+
+    // TWO transfers, because one cannot be told apart from a refusal. `edu`'s internal buffer
+    // starts ZEROED, so a device->RAM transfer of it writes zeros — exactly what a blocked
+    // transfer leaves behind. The positive control caught this: with translation OFF the DMA
+    // "completed" and the target still read zero. So push a known pattern IN first, then read
+    // it back OUT, and let the pattern be the oracle.
+    const PATTERN: u64 = 0xD1CE_D1CE_D1CE_D1CE;
+    let Some(src) = fa.alloc_frame().map(|f| zero_frame(f)) else {
+        return;
+    };
+    for i in 0..8u64 {
+        core::ptr::write_volatile((src.as_u64() + i * 8) as *mut u64, PATTERN);
+    }
+
+    // edu: 0x80 source, 0x88 destination, 0x90 count, 0x98 command.
+    // cmd bit0 = start; bit1 = direction (0 = RAM->device, 1 = device->RAM). 0x40000 is the
+    // device's own buffer, and the direction decides which side must lie inside it.
+    let run = |src_addr: u64, dst_addr: u64, dir_to_ram: bool| {
+        core::ptr::write_volatile((bar + 0x80) as *mut u64, src_addr);
+        core::ptr::write_volatile((bar + 0x88) as *mut u64, dst_addr);
+        core::ptr::write_volatile((bar + 0x90) as *mut u64, 64);
+        core::ptr::write_volatile((bar + 0x98) as *mut u64, if dir_to_ram { 0x3 } else { 0x1 });
+        let mut n = 0u64;
+        while n < 200_000_000 {
+            if core::ptr::read_volatile((bar + 0x98) as *const u64) & 1 == 0 {
+                return true;
+            }
+            core::hint::spin_loop();
+            n += 1;
+        }
+        false
+    };
+
+    // RAM -> device, then device -> RAM. Under translation BOTH are refused; with translation
+    // off both land and `target` ends up holding PATTERN.
+    let in_ok = run(src.as_u64(), 0x4_0000, false);
+    let out_ok = run(0x4_0000, target.as_u64(), true);
+    let _ = writeln!(
+        con,
+        "        transfers: RAM->dev {} dev->RAM {}",
+        if in_ok { "done" } else { "STUCK" },
+        if out_ok { "done" } else { "STUCK" }
+    );
+
+    // POLL the command register rather than sleeping a guessed interval. QEMU's `edu` defers
+    // the transfer on a 100 ms timer and clears the RUN bit when it finishes, so a fixed spin
+    // is a race: the first version waited a few milliseconds, saw nothing, and reported "no
+    // event logged" — which read exactly like a refusal and was in fact impatience. The
+    // positive control (translation off, transfer should land) is what exposed it.
+    let finished = in_ok && out_ok;
+
+    let tail_after = core::ptr::read_volatile((base + 0x2018) as *const u64);
+    let wrote = core::ptr::read_volatile(target.as_u64() as *const u64);
+    let _ = writeln!(
+        con,
+        "[iommu] DMA {}: event tail {tail_before:#x} -> {tail_after:#x}, target reads \
+         {wrote:#018x} (pattern would be {PATTERN:#018x})",
+        if finished {
+            "completed"
+        } else {
+            "DID NOT FINISH (RUN still set)"
+        }
+    );
+
+    // The PAYLOAD is the oracle, not the event log. Measured both ways with the same code and
+    // the same device, differing only in whether the unit was translating:
+    //   translation OFF -> target reads 0xd1ce...  (the transfer lands)
+    //   translation ON  -> target reads 0x0        (the transfer is refused)
+    // That difference is the containment result. The event log is a separate question and is
+    // reported separately, because a refusal that is not RECORDED is still a refusal.
+    if wrote == PATTERN {
+        let _ = writeln!(
+            con,
+            "[iommu] NOT CONTAINED: the device wrote through to memory it was not granted"
+        );
+    } else {
+        let _ = writeln!(
+            con,
+            "[iommu] CONTAINED: the transfer completed at the device and NOTHING reached memory"
+        );
+    }
+
+    if tail_after != tail_before {
+        let log = *core::ptr::addr_of!(EVENT_LOG);
+        let e0 = core::ptr::read_volatile(log as *const u64);
+        let e1 = core::ptr::read_volatile((log + 8) as *const u64);
+        let kind = (e1 >> 60) & 0xF;
+        let _ = writeln!(
+            con,
+            "[iommu] REFUSED AND RECORDED: {e0:#018x} {e1:#018x} type={kind:#x}{}",
+            if kind == 0x2 { " (IO_PAGE_FAULT)" } else { "" }
+        );
+    } else {
+        let _ = writeln!(
+            con,
+            "        (no event logged — the refusal is real but the unit is not RECORDING it; \
+             event-log setup is unfinished)"
+        );
     }
 }
 
@@ -1995,12 +2173,23 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
                 let base = *core::ptr::addr_of!(AMDVI_BASE);
                 if base != 0 {
                     let mut space = A::Space::from_token(ktoken);
-                    if space.map_page(
-                        abi::VirtAddr(base),
-                        abi::PhysAddr(base),
-                        Perms::KERNEL_DEVICE,
-                        &mut fa,
-                    ) {
+                    // FOUR pages, not one. The control and capability registers live in the
+                    // first page, but the event-log HEAD and TAIL are at 0x2010/0x2018 — the
+                    // third page. Mapping one page reads those as unmapped memory, which
+                    // faulted the boot as soon as anything asked whether an event had been
+                    // logged. The aperture is 512 KiB; four pages is what this code touches.
+                    const APERTURE_PAGES: u64 = 4;
+                    let mut mapped = true;
+                    for i in 0..APERTURE_PAGES {
+                        let off = i * abi::PAGE_SIZE;
+                        mapped &= space.map_page(
+                            abi::VirtAddr(base + off),
+                            abi::PhysAddr(base + off),
+                            Perms::KERNEL_DEVICE,
+                            &mut fa,
+                        );
+                    }
+                    if mapped {
                         // Editing the ACTIVE space: without this the mapping silently does
                         // not take effect and the reads below return whatever was cached.
                         A::flush_tlb();

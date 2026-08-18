@@ -51,6 +51,43 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-18 — CONTAINMENT PROVEN ON HARDWARE
+
+A bounded device's DMA is refused, and it is refused in the only way that means anything: the
+SAME code, the SAME device and the SAME two transfers, differing only in whether the unit was
+translating.
+
+| translation | target frame reads |
+|---|---|
+| OFF (control) | `0xd1ced1ced1ced1ce` — the transfer lands |
+| ON | `0x0000000000000000` — nothing reaches memory |
+
+Both runs report `transfers: RAM->dev done dev->RAM done`, so the device really did perform
+them; "contained" means nothing arrived, not that nothing was attempted. That distinction is the
+whole result, and it took three attempts to be able to state it:
+
+1. First run reported "no event logged", which reads like a refusal. It was IMPATIENCE — QEMU's
+   `edu` defers its transfer on a 100 ms timer and the code spun for a few milliseconds. Now it
+   polls the RUN bit.
+2. Then the transfer completed and the target still read zero WITH TRANSLATION OFF. `edu`'s
+   internal buffer starts zeroed, so a successful device->RAM transfer writes zeros — identical
+   to a blocked one. Now a known pattern is pushed in first and read back out, and the pattern
+   is the oracle.
+3. The device targeted at first was the rig's e1000, not `edu`, because the scan matched on
+   CLASS. Caught by an identification-register check before trusting the mapping
+   (`ident=0x00140241`, an e1000, not `edu`'s `0x010000ed`) — without which DMA commands would
+   have gone into a NIC's registers and produced silent nonsense.
+
+Every one of those three would have produced a confident "contained" that measured nothing. The
+positive control is what turned each of them up.
+
+**What is NOT proven: the event log records nothing.** Tail stays at 0 across a refused
+transfer, so the unit is not reporting the refusal even though it is performing it. Event-log
+setup is unfinished, and the boot line says so rather than leaving the silence to be read as
+"no faults occurred".
+
+The runner gates on the payload: the transfers must complete AND `CONTAINED:` must appear.
+
 ## 2026-08-18 — the firmware rig BOOTS. The hang was an orphan `.got`.
 
 `IOMMU=1 FIRMWARE=1 tools/run-qemu.sh` now boots through SeaBIOS end to end, on both hosts:
