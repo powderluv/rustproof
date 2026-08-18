@@ -387,6 +387,10 @@ static mut TARGET_BDF: u32 = 0;
 /// reports itself; with none, a blocked transfer is silent.
 #[cfg(target_arch = "x86_64")]
 static mut EVENT_LOG: u64 = 0;
+
+/// Physical base of the device domain's I/O page-table root, or 0 if none is programmed.
+#[cfg(target_arch = "x86_64")]
+static mut IOMMU_PT_ROOT: u64 = 0;
 /// Pages of that window. One page for now: the frame allocator makes no contiguity
 /// promise, and a real BAR is a contiguous physical range, so a larger stand-in would
 /// have to reserve one deliberately.
@@ -1570,6 +1574,8 @@ unsafe fn program_dte<A: Arch>(
     const IR: u64 = 1 << 61;
     const IW: u64 = 1 << 62;
     let w0 = V | TV | MODE_3_LEVEL | (root.as_u64() & 0x000F_FFFF_FFFF_F000) | IR | IW;
+    // SAFETY: single-CPU boot path.
+    IOMMU_PT_ROOT = root.as_u64();
     let w1: u64 = 0; // domain 0
 
     let dte = (dt + bdf * 32) as *mut u64;
@@ -1780,6 +1786,88 @@ unsafe fn prove_containment<A: Arch>(
             "DID NOT FINISH (RUN still set)"
         }
     );
+
+    // ---- now MAP an IOVA and show the same transfer succeed through translation ----
+    //
+    // Blocking everything is the easy half: an empty table refuses by having nothing in it, and
+    // a unit that was simply broken would look identical. Translating something is what
+    // distinguishes "the IOMMU is enforcing a policy" from "the IOMMU is enforcing a wall".
+    //
+    // AMD-Vi's I/O page tables are a radix tree like the CPU's, with one difference that
+    // matters: each entry carries a NEXT LEVEL field in bits [11:9], and a LEAF is next-level
+    // 0. Writing the level number of the table you are pointing AT (rather than of the table
+    // you are in) is the obvious mistake, so the levels are named.
+    const PR: u64 = 1 << 0; // present
+    const IR: u64 = 1 << 61; // device may read
+    const IW: u64 = 1 << 62; // device may write
+    const NEXT_LEVEL_2: u64 = 2 << 9;
+    const NEXT_LEVEL_1: u64 = 1 << 9;
+    const LEAF: u64 = 0 << 9;
+    const IOVA: u64 = 0x1000;
+    const IOVA_SRC: u64 = 0x2000;
+
+    // BOTH directions need a mapping. The first attempt mapped only the destination and got
+    // "NOT TRANSLATED" — because the inbound RAM->device transfer that loads the pattern was
+    // itself refused, so the device faithfully delivered an EMPTY buffer. Same oracle trap as
+    // the zeroed buffer earlier, one level up: the payload has to be able to reach the device
+    // before its arrival back in memory can mean anything.
+    let translated = (|| {
+        let l2 = fa.alloc_frame().map(|f| zero_frame(f))?;
+        let l1 = fa.alloc_frame().map(|f| zero_frame(f))?;
+        let dst = fa.alloc_frame().map(|f| zero_frame(f))?;
+        // Mode 3 walks root -> L2 -> L1 -> page, indexed by IOVA[38:30], [29:21], [20:12].
+        let root = *core::ptr::addr_of!(IOMMU_PT_ROOT);
+        let i3 = ((IOVA >> 30) & 0x1FF) as u64;
+        let i2 = ((IOVA >> 21) & 0x1FF) as u64;
+        let i1 = ((IOVA >> 12) & 0x1FF) as u64;
+        core::ptr::write_volatile(
+            (root + i3 * 8) as *mut u64,
+            (l2.as_u64() & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | NEXT_LEVEL_2,
+        );
+        core::ptr::write_volatile(
+            (l2.as_u64() + i2 * 8) as *mut u64,
+            (l1.as_u64() & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | NEXT_LEVEL_1,
+        );
+        core::ptr::write_volatile(
+            (l1.as_u64() + i1 * 8) as *mut u64,
+            (dst.as_u64() & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | LEAF,
+        );
+        // A second leaf for the SOURCE frame, one IOVA higher.
+        let i1_src = ((IOVA_SRC >> 12) & 0x1FF) as u64;
+        core::ptr::write_volatile(
+            (l1.as_u64() + i1_src * 8) as *mut u64,
+            (src.as_u64() & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | LEAF,
+        );
+        // No invalidation is issued because nothing was ever cached for this domain: the unit
+        // has refused every transfer so far, so there is no stale entry to flush. The moment a
+        // mapping is CHANGED rather than added, this needs the command buffer.
+        // Load the pattern through the SOURCE mapping, then read it back through the
+        // destination one. Both legs now go through translation, which is the point.
+        let in_ok = run(IOVA_SRC, 0x4_0000, false);
+        let ok = in_ok && run(0x4_0000, IOVA, true);
+        let landed = core::ptr::read_volatile(dst.as_u64() as *const u64);
+        Some((ok, landed, dst.as_u64()))
+    })();
+
+    if let Some((ok, landed, dst)) = translated {
+        let _ = writeln!(
+            con,
+            "[iommu] mapped IOVA {IOVA:#x} -> {dst:#x}; transfer {} and that frame reads \
+             {landed:#018x}",
+            if ok { "completed" } else { "STUCK" }
+        );
+        if landed == PATTERN {
+            let _ = writeln!(
+                con,
+                "[iommu] TRANSLATED: the same device reached exactly the frame it was granted"
+            );
+        } else {
+            let _ = writeln!(
+                con,
+                "[iommu] NOT TRANSLATED: a granted IOVA did not reach its frame"
+            );
+        }
+    }
 
     // The PAYLOAD is the oracle, not the event log. Measured both ways with the same code and
     // the same device, differing only in whether the unit was translating:

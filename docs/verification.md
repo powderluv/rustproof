@@ -51,6 +51,37 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-18 — THE LOOP IS CLOSED: refused where unmapped, delivered where granted
+
+In one boot, on one unit, with one device:
+
+```
+[iommu] CONTAINED:  the transfer completed at the device and NOTHING reached memory
+[iommu] TRANSLATED: the same device reached exactly the frame it was granted
+```
+
+The second line is what makes the first mean anything. Blocking every transfer is also what a
+broken IOMMU does; delivering exactly the granted frame — the pattern `0xd1ce…` arriving at the
+frame behind IOVA `0x1000` and nowhere else — is what distinguishes enforcing a POLICY from
+enforcing a WALL. This is `dma_reach ⊆ authorized` demonstrated on hardware rather than argued,
+and it is the property `crates/iommu` has been host-testing in the abstract since it was written.
+
+The I/O page table is built by hand for now: a 3-level walk (root -> L2 -> L1 -> page) with each
+entry carrying its NEXT LEVEL in bits [11:9] and a leaf marked next-level 0. Writing the level
+of the table you point AT rather than the one you are IN is the obvious error, so the levels are
+named constants.
+
+**Both directions had to be mapped, and finding that out was the fourth oracle failure in this
+sequence.** The first attempt mapped only the destination and reported NOT TRANSLATED — because
+the inbound RAM->device transfer that loads the pattern was itself refused, so the device
+faithfully delivered an empty buffer. Exactly the zeroed-buffer trap one level up.
+
+No invalidation is issued, and that is only sound because nothing was ever cached for this
+domain: the unit had refused every transfer, so there is no stale entry. The moment a mapping is
+CHANGED rather than added, this needs the command buffer.
+
+The runner gates on both lines.
+
 ## 2026-08-18 — CONTAINMENT PROVEN ON HARDWARE
 
 A bounded device's DMA is refused, and it is refused in the only way that means anything: the

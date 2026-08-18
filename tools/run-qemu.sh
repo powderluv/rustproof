@@ -231,6 +231,14 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${IOMMU:-0}" = "1" ] &&
             echo "RESULT: FAIL — a bounded device's DMA reached memory"
             exit 1
         fi
+        # BOTH halves, and the second is what makes the first mean something: blocking
+        # everything is what a broken unit also does. A granted IOVA must reach exactly its
+        # frame, or the "containment" above is indistinguishable from a wall.
+        if ! echo "$OUT" | grep -q '\[iommu\] TRANSLATED:'; then
+            echo "RESULT: FAIL — a GRANTED IOVA did not reach its frame; the unit is refusing"
+            echo "  everything rather than enforcing a policy"
+            exit 1
+        fi
     fi
 fi
 
