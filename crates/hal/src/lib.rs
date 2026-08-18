@@ -53,8 +53,6 @@ impl Perms {
         device: false,
     };
 
-    /// Permissions for a loaded ELF segment (`PF_W` / `PF_X`), always user + readable.
-    #[inline]
     /// A kernel-only mapping of a device register aperture: writable, never executable,
     /// never user-reachable, and uncached.
     pub const KERNEL_DEVICE: Perms = Perms {
@@ -64,6 +62,8 @@ impl Perms {
         device: true,
     };
 
+    /// Permissions for a loaded ELF segment (`PF_W` / `PF_X`), always user + readable.
+    #[inline]
     pub const fn from_elf(pf_w: bool, pf_x: bool) -> Perms {
         Perms {
             write: pf_w,
