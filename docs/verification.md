@@ -51,6 +51,32 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-17 (later) — DECIDED: firmware for the proof rig. WIP, does not boot yet.
+
+The decision was made: boot the proof rig under firmware so SeaBIOS assigns BARs, rather than
+teaching the nucleus to assign them. Verified first, before building anything — with no kernel
+at all, SeaBIOS brings `edu`'s BAR0 up at `0xfea00000` (and assigns IRQ 10), against
+`0xffffffffffffffff` under PVH. So the premise holds.
+
+**Status: the mechanism works, the boot does not. This is unfinished and opt-in.**
+
+What works: QEMU takes the PVH path whenever the ELF carries a PVH note, and that path skips
+firmware — so the image must advertise multiboot INSTEAD (never both, or PVH wins again). A
+`firmware-boot` feature swaps the `.note.Xen` for a Multiboot 1 header. QEMU's multiboot ELF
+loader then refuses a 64-bit image outright ("Cannot load x86-64 image, give a 32bit one"), so
+the header carries the a.out KLUDGE and the rig feeds it an objcopy'd flat binary. With that,
+SeaBIOS runs, loads the image, jumps to `_start`, and the kernel reaches its own banner.
+
+What does not: it faults immediately after, while formatting `Arch::NAME` into that banner —
+the format string prints, the value does not. `init_traps()` has not run at that point, so the
+fault is a silent triple fault with no dump, which is the least informative failure this kernel
+has. The suspicion is the loaded extent: `objcopy` emits `.bss` as zeros, so the flat file is
+larger than `__data_end` suggested, and declaring `load_end_addr = __data_end` truncated the
+load before `.rodata`. Setting it to `__bss_end` did not fix it, so the diagnosis is incomplete.
+
+The default boot path is untouched and every existing gate is green, on both hosts. The feature
+is off unless asked for, and nothing claims it works.
+
 ## OPEN DECISION 2026-08-17 — proving containment needs the first PCI config WRITE
 
 The AMD-Vi unit is enabled with a DTE for a real device and an event log armed, so a refused

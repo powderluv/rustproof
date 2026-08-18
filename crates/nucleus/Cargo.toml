@@ -11,3 +11,6 @@ arch-x86_64 = { path = "../arch-x86_64" }
 
 [features]
 provoke-fault = ["kernel/provoke-fault"]
+# Boot via SeaBIOS (multiboot) instead of PVH, so FIRMWARE assigns PCI BARs. Only the IOMMU
+# proof rig needs it; the default boot path is untouched.
+firmware-boot = ["kernel/firmware-boot"]

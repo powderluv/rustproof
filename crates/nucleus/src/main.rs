@@ -10,7 +10,15 @@ use kernel::CurrentArch;
 /// guarantees the file exists so include_bytes! compiles).
 static USER_ELF: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/user.elf"));
 
-// The 32->64-bit boot trampoline + PVH note. Provides `_start`; calls `kmain`.
+// Exactly ONE boot protocol is advertised. QEMU prefers PVH whenever the note is present, so
+// advertising both would silently keep the firmware-less path and defeat the `firmware-boot`
+// feature entirely.
+#[cfg(not(feature = "firmware-boot"))]
+core::arch::global_asm!(include_str!("boot_pvh.s"), options(att_syntax));
+#[cfg(feature = "firmware-boot")]
+core::arch::global_asm!(include_str!("boot_multiboot.s"), options(att_syntax));
+
+// The 32->64-bit boot trampoline. Provides `_start`; calls `kmain`.
 core::arch::global_asm!(include_str!("boot.s"), options(att_syntax));
 
 #[no_mangle]

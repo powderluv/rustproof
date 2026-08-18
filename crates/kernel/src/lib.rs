@@ -26,6 +26,10 @@ mod pci;
 // Same reasoning as `pci`: compiled everywhere so its pure validation rules are host-tested.
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 mod acpi;
+// The firmware (multiboot) boot path's info parsing. Compiled everywhere so its pure decisions
+// are host-tested; only x86 ever boots this way.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+mod multiboot;
 
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 mod pvh;

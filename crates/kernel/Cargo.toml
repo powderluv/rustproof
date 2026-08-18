@@ -29,5 +29,7 @@ vspace-riscv = { path = "../vspace-riscv" }
 loader-riscv = { path = "../loader-riscv" }
 
 [features]
+# Parse a Multiboot info struct instead of PVH hvm_start_info (see crates/nucleus).
+firmware-boot = []
 # Force a fault after trap setup to exercise the exception dump (x86 CI smoke).
 provoke-fault = []

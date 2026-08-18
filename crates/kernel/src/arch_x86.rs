@@ -149,7 +149,19 @@ impl Arch for X86 {
     }
 
     fn memory_map(a0: u64, _a1: u64, out: &mut [MemoryRegion]) -> usize {
-        crate::pvh::memory_map(a0, out)
+        // Which protocol placed `a0` is decided at BUILD time, because the image advertises
+        // exactly one: a PVH note or a multiboot header, never both (QEMU would pick PVH and
+        // firmware would be skipped). Sniffing at run time would be guessing about the one
+        // thing the build already knows.
+        #[cfg(feature = "firmware-boot")]
+        {
+            // SAFETY: the loader supplied this pointer in %ebx; the parser bounds it.
+            unsafe { crate::multiboot::memory_map(a0, out) }
+        }
+        #[cfg(not(feature = "firmware-boot"))]
+        {
+            crate::pvh::memory_map(a0, out)
+        }
     }
 
     fn reserve_below() -> u64 {

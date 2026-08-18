@@ -12,8 +12,14 @@ PHDRS {
 
 SECTIONS {
     . = 1M;
+    /* Multiboot's a.out kludge needs the image extent as absolute addresses: QEMU's ELF64
+       loader refuses a 64-bit multiboot image ("give a 32bit one"), so the firmware path
+       hands it a FLAT binary described by these. */
+    __image_start = .;
 
     .note.Xen : { KEEP(*(.note.Xen)) } :note
+    /* Multiboot header must lie in the first 8 KiB of the image, so it goes first. */
+    .multiboot : { KEEP(*(.multiboot)) } :text
 
     . = ALIGN(4K);
     .text : { *(.text .text.*) } :text
@@ -23,10 +29,12 @@ SECTIONS {
 
     . = ALIGN(4K);
     .data : { *(.data .data.*) } :data
+    __data_end = .;
     .bss  : {
         *(.bss .bss.*)
         *(COMMON)
     } :data
+    __bss_end = .;
 
     /DISCARD/ : {
         *(.eh_frame)
