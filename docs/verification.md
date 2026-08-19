@@ -53,9 +53,12 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ## 2026-08-18 (later) — the adversarial review, and the checker that could not fail
 
-Six defects, all of the same family: a mechanism whose check could not fail, or a claim written
+Six items, mostly of the same family: a mechanism whose check could not fail, or a claim written
 into a comment instead of measured. Two were found before the review returned, four by it. Every
-fix below is mutation-tested — the mutant is named, and it died.
+fix below is mutation-tested — the mutant is named, and it died. The review's refute phase earned
+its keep in both directions: it confirmed four, correctly downgraded one to hardening, and got
+one wrong (see 4), which is why a refuter that cannot run the rig does not get the last word over
+a measurement that can.
 
 **1. `contained()` was never verified at all.** `fn contained() -> bool { true }` passed all 221
 tests in the repository, the 21,952-sequence exhaustive search included. The invariant is only
@@ -82,15 +85,22 @@ from the grant, and a read-only page is proved unwritable on the rig: the device
 it, reports the transfer complete, and the page still reads its sentinel.
 
 **4. Withdrawal did not withdraw.** Clearing a page-table entry is not revocation while the unit
-still holds a cached translation. The comment licensing the omission — "nothing was ever cached
-for this domain: the unit has refused every transfer so far" — was true where it was written and
-false forty lines below it, where it was relied upon, because two transfers had succeeded in
-between. Measured, not argued: re-aiming the device at the withdrawn IOVA returned `0xd1ce…`.
+still holds a cached translation. Two independent refuters argued this one away on the reasoning
+that the unit populates its cache only from a successful walk — correct, and beside the point,
+since two walks HAD succeeded by then. Both said they could not run the rig. Measured rather than
+argued: re-aiming the device at the withdrawn IOVA returned `0xd1ce…`. Correction to an earlier
+draft of this entry: the code's own comment had called this exactly right — "the moment a mapping
+is CHANGED rather than added, this needs the command buffer" — so it was a warning that went
+unheeded, not a false justification. Describing it as licensing the omission was wrong.
 Fixed by implementing the command buffer (INVALIDATE_IOMMU_PAGES + INVALIDATE_DEVTAB_ENTRY +
 COMPLETION_WAIT with a store, so completion is observed rather than assumed). The same probe now
 reads back the sentinel, and removing the invalidation puts `0xd1ce…` back.
 
-**5. "CONTAINED" could not distinguish a blocked write from a write of zeros.** The verdict was
+**5. "CONTAINED" could not distinguish a blocked write from a write of zeros.** HARDENING, not a
+live defect — the refuter established that the failure is unreachable in the current structure,
+because the measurement is deliberately taken against a freshly-zeroed root before any leaf
+exists, so both legs are refused by the same absent entry and no allowed write is possible at
+that instant. The oracle's discrimination is still weak on its own terms. The verdict was
 `wrote != PATTERN` over a pre-zeroed frame — but the inbound leg is refused too, so the device's
 buffer is empty and a transfer the unit ALLOWED would deposit zeros into a frame already reading
 zero. The line claimed "NOTHING reached memory"; what it established was "the pattern did not

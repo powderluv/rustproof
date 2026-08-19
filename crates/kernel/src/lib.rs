@@ -2072,11 +2072,12 @@ unsafe fn prove_containment<A: Arch>(
         if !refused || !dst_ok || !src_ok {
             return None;
         }
-        // Adding a mapping needs no invalidation: the unit cannot hold a stale translation
-        // for an address it has never successfully translated. Withdrawal is the other case,
-        // and it is handled where the withdrawal happens — this note used to claim nothing was
-        // ever cached at all, which stopped being true one line later, the moment the first
-        // transfer succeeded.
+        // Adding a mapping needs no invalidation: the unit populates its cache from a
+        // SUCCESSFUL walk, never from a fault, so it cannot hold a stale translation for an
+        // address every previous attempt was refused at. That is true here and stays true.
+        // Withdrawal is the other case — which the older wording of this note called correctly
+        // ("the moment a mapping is CHANGED rather than added, this needs the command buffer")
+        // and which shipped without one anyway. It is handled where the withdrawal happens.
         // Load the pattern through the SOURCE mapping, then read it back through the
         // destination one. Both legs now go through translation, which is the point.
         let in_ok = run(IOVA_SRC, 0x4_0000, false);
