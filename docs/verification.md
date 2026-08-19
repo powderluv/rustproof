@@ -51,6 +51,48 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-19 (later) — the capability named a domain and the name was ignored
+
+Found by mutating what had just shipped. `caps_iommu_domain` returned the capability's `object`
+and `map_dma` discarded it — it did not take a domain parameter at all, and always used the one
+global domain. A capability granting DMA reach into **domain 999** mapped into the real domain
+and the boot passed. The type half and the rights half of that gate were both real; the thing
+the capability actually NAMES was decorative.
+
+Fixed: domains have an identity (`DEVICE_DOMAIN_ID`, a logical id because the role grant tables
+are static while the device's BDF is discovered at runtime), set only once a device table entry
+AND a table under it exist. `MAP_DMA`/`UNMAP_DMA` take the named domain and refuse otherwise.
+The rule is a pure predicate, `domain_named_is_live`, so it is checkable off-target — including
+the case that matters most: before any domain exists, NO object names one, and in particular the
+`0` that a zeroed slot carries must not become authority by coincidence.
+
+Two refusals are now kept apart because they mean different things: no unit programmed at all is
+`NO_MEM` (nothing here could bound DMA), while a domain that exists but is not the one named is
+`NO_CAP` (an authority question).
+
+A third under-powered capability is GRANTED to the worker — full rights, naming a domain that
+does not exist — for the reason `grants_for` already records: a refusing branch nothing can
+reach is not a check. That probe runs only where a domain EXISTS, because on a machine with no
+unit every domain capability is refused for that reason alone and the object is never consulted,
+which would make the assertion pass without testing anything.
+
+**What this does NOT establish.** There is one domain. The property that matters eventually —
+a capability for device A's domain cannot grant reach into device B's — has no second domain to
+be tested against, and is not claimed. The rig has two DMA-capable functions, so it is testable
+when per-device domains exist; that is the next step, and it needs the grant to move from
+`MAKE_REGION` (which today grants every region page to *the* device) to `MAP_DMA`.
+
+The mutant that ignores the object dies on the BOOT, not in the host suite: the suite tests the
+predicate, not whether `map_dma` calls it. Worth keeping separate — a checker existing and a
+checker being invoked are different claims, and only the second is a property of the system.
+
+Two self-inflicted breakages, both caught by existing assertions:
+- Adding one capability to the worker role made CAPABILITY SPACE, not the per-owner quota, the
+  limit that bound the region-quota demo — which is precisely the confusion that demo's comment
+  says it exists to detect. `CAP_SLOTS` is now sized with headroom and says why.
+- The first ordering returned `NO_CAP` where there is no unit, so the informative "no IOMMU"
+  refusal stopped being reachable.
+
 ## 2026-08-19 — DMA reach becomes a CAPABILITY
 
 `CapType::IommuDomain` had a referent since the IOMMU work but no ABI: the nucleus programmed

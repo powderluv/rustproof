@@ -336,6 +336,13 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ]; then
             echo "RESULT: FAIL — a DMA mapping was made and never withdrawn"
             exit 1
         fi
+        # Required only where a domain EXISTS: with no unit every domain capability is refused
+        # for that reason alone, and the object would never be looked at.
+        if ! echo "$OUT" | grep -q 'dma: a cap naming a domain that does not exist is refused'; then
+            echo "RESULT: FAIL — a capability naming a domain that does not exist was honoured,"
+            echo "  or the check for it never ran"
+            exit 1
+        fi
     elif ! echo "$OUT" | grep -q 'dma: no IOMMU on this machine, so MAP_DMA refuses'; then
         echo "RESULT: FAIL — with no IOMMU programmed, MAP_DMA must refuse rather than hand"
         echo "  out DMA reach that nothing bounds"

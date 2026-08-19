@@ -77,7 +77,13 @@ enum ProcState {
 }
 
 /// Capability slots per process.
-const CAP_SLOTS: usize = 16;
+///
+/// Sized with HEADROOM above what any role is granted, deliberately. `MAKE_REGION` mints into a
+/// free slot, so a capability space that is nearly full makes CAPABILITY SPACE the limit that
+/// bounds the region-quota demo instead of the per-owner quota it is testing — and that demo
+/// exists precisely to distinguish which limit bound it. Adding one capability to the worker
+/// role at 16 slots was enough to flip it, and the assertion caught it.
+const CAP_SLOTS: usize = 20;
 
 /// How many address-space frames a process may hold (tracked for reclamation on exit): its
 /// page tables + stack + ELF segments, ~25. VRAM frames are tracked + quota'd separately.
@@ -387,6 +393,15 @@ static mut TARGET_BDF: u32 = 0;
 /// reports itself; with none, a blocked transfer is silent.
 #[cfg(target_arch = "x86_64")]
 static mut EVENT_LOG: u64 = 0;
+
+/// Identity of the device domain, or 0 when none exists.
+///
+/// An `IommuDomain` capability's `object` names THIS. It used to name nothing: `map_dma` did not
+/// take a domain at all and always used the single global one, so a capability naming domain 999
+/// granted DMA reach and the boot passed — the capability named a domain and the name was
+/// discarded. A logical id rather than the device's BDF, because the role grant tables are
+/// static and the BDF is discovered at runtime; when several domains exist they take 1..N.
+static mut DEVICE_DOMAIN_ID: u64 = 0;
 
 /// Command buffer base, and our own copy of the tail offset. The unit owns the head; the tail
 /// is ours to advance, and nothing else may write it.
@@ -1131,8 +1146,13 @@ fn grants_for(role: Role) -> &'static [(abi::CapType, abi::CapRights, u64)] {
             // vacuous on hardware precisely because no under-powered capability of the right
             // type was granted to anyone, so the refusing branch could not be reached. Both
             // are exercised by the demo — the first maps, the second is refused.
-            (abi::CapType::IommuDomain, abi::CapRights::ALL, 0),
-            (abi::CapType::IommuDomain, abi::CapRights::READ, 0),
+            (abi::CapType::IommuDomain, abi::CapRights::ALL, 1),
+            (abi::CapType::IommuDomain, abi::CapRights::READ, 1),
+            // CapId(10): fully powered, naming a domain that does not exist. Granted rather
+            // than merely described, so the object check has a reachable refusing branch —
+            // without one it was decorative, and measured as such: a capability naming domain
+            // 999 mapped into the real domain and the boot passed.
+            (abi::CapType::IommuDomain, abi::CapRights::ALL, 2),
         ],
         // Nothing. A spawned process begins with no authority of its own; what it can do is
         // exactly what its parent delegated (never more — the rights are intersected), so
@@ -1647,6 +1667,10 @@ unsafe fn program_dte<A: Arch>(
             (l1.as_u64() & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | NEXT_LEVEL_1,
         );
         IOMMU_L1 = Some(l1.as_u64());
+        // The domain exists only now that there is a device table entry AND a table under it.
+        // Setting this earlier would let `MAP_DMA` accept a capability for a domain that could
+        // not yet hold a mapping.
+        DEVICE_DOMAIN_ID = 1;
     }
     let w1: u64 = 0; // domain 0
 
@@ -1876,6 +1900,15 @@ const DMA_IOVA_FIRST_SLOT: u64 = 256;
 #[cfg(target_arch = "x86_64")]
 const DMA_IOVA_SLOTS: u64 = 256;
 
+/// May a capability naming domain `named` act, given that the live domain is `live`?
+///
+/// Pure, so the rule is checkable without a machine. `live == 0` means no domain exists yet —
+/// a device table entry with a table under it is what brings one into being — and in that state
+/// NO capability names a usable domain, including one whose object happens to be 0.
+const fn domain_named_is_live(named: u64, live: u64) -> bool {
+    live != 0 && named == live
+}
+
 /// Index of the live region with identity `id`.
 #[cfg(target_arch = "x86_64")]
 unsafe fn region_index(id: u64) -> Option<usize> {
@@ -1896,10 +1929,20 @@ unsafe fn region_index(id: u64) -> Option<usize> {
 /// # Safety
 /// Single-CPU, non-reentrant.
 #[cfg(target_arch = "x86_64")]
-unsafe fn map_dma(region_id: u64, rights: abi::CapRights) -> u64 {
-    // No unit programmed means no containment. Refuse rather than hand out reach that nothing
-    // bounds — on such a machine a "granted" mapping and unrestricted access to all of memory
-    // are the same thing, and the caller has no way to tell them apart.
+unsafe fn map_dma(domain: u64, region_id: u64, rights: abi::CapRights) -> u64 {
+    // The capability's object has to name a domain that EXISTS. Without this the object is
+    // decorative: measured, a capability naming domain 999 mapped into the real one.
+    // Two different refusals, kept apart because they mean different things to the caller.
+    // No unit programmed at all is NO_MEM: there is nothing here that could bound DMA, and a
+    // "granted" mapping would be indistinguishable from access to all of memory. A domain that
+    // exists but is not the one this capability names is NO_CAP: an authority question.
+    let live = *core::ptr::addr_of!(DEVICE_DOMAIN_ID);
+    if live == 0 {
+        return abi::syserr::NO_MEM;
+    }
+    if !domain_named_is_live(domain, live) {
+        return abi::syserr::NO_CAP;
+    }
     let Some(l1) = *core::ptr::addr_of!(IOMMU_L1) else {
         return abi::syserr::NO_MEM;
     };
@@ -1956,7 +1999,14 @@ unsafe fn map_dma(region_id: u64, rights: abi::CapRights) -> u64 {
 /// # Safety
 /// Single-CPU, non-reentrant.
 #[cfg(target_arch = "x86_64")]
-unsafe fn unmap_dma(region_id: u64) -> u64 {
+unsafe fn unmap_dma(domain: u64, region_id: u64) -> u64 {
+    let live = *core::ptr::addr_of!(DEVICE_DOMAIN_ID);
+    if live == 0 {
+        return abi::syserr::NO_MEM;
+    }
+    if !domain_named_is_live(domain, live) {
+        return abi::syserr::NO_CAP;
+    }
     let Some(l1) = *core::ptr::addr_of!(IOMMU_L1) else {
         return abi::syserr::NO_MEM;
     };
@@ -3594,14 +3644,14 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                 caps_region(caps, reg_cap, abi::CapRights::READ),
             ) {
                 // The HOLDER's rights decide what the device may do, never the request's.
-                (Some(_), Some((region, rights))) => {
+                (Some(domain), Some((region, rights))) => {
                     #[cfg(target_arch = "x86_64")]
                     {
-                        map_dma(region, rights)
+                        map_dma(domain, region, rights)
                     }
                     #[cfg(not(target_arch = "x86_64"))]
                     {
-                        let _ = (region, rights);
+                        let _ = (domain, region, rights);
                         abi::syserr::NO_MEM
                     }
                 }
@@ -3617,14 +3667,14 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                 caps_iommu_domain(caps, dom_cap, abi::CapRights::WRITE),
                 caps_region(caps, reg_cap, abi::CapRights::READ),
             ) {
-                (Some(_), Some((region, _))) => {
+                (Some(domain), Some((region, _))) => {
                     #[cfg(target_arch = "x86_64")]
                     {
-                        unmap_dma(region)
+                        unmap_dma(domain, region)
                     }
                     #[cfg(not(target_arch = "x86_64"))]
                     {
-                        let _ = region;
+                        let _ = (domain, region);
                         abi::syserr::NO_MEM
                     }
                 }
@@ -4431,6 +4481,32 @@ mod tests {
             None,
             "an empty slot resolved"
         );
+    }
+
+    /// A capability's domain OBJECT must name a domain that exists.
+    ///
+    /// This shipped decorative: `map_dma` took no domain at all and always used the single
+    /// global one, so a capability naming domain 999 granted DMA reach and the boot passed.
+    #[test]
+    fn a_capability_must_name_a_domain_that_exists() {
+        assert!(domain_named_is_live(1, 1), "the live domain must be usable");
+        assert!(
+            !domain_named_is_live(2, 1),
+            "a capability naming another domain acted on the live one"
+        );
+        assert!(
+            !domain_named_is_live(999, 1),
+            "an arbitrary object resolved to the live domain"
+        );
+        // Before any device table entry exists there is no domain, and nothing names one —
+        // including a capability whose object is 0, which is the value an uninitialised or
+        // zeroed slot carries. That coincidence must not become authority.
+        for named in [0u64, 1, 2, 999] {
+            assert!(
+                !domain_named_is_live(named, 0),
+                "domain {named} was usable before any domain existed"
+            );
+        }
     }
 
     /// The two Region gates, both of which the boot cannot see (measured: deleting either

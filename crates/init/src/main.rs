@@ -846,42 +846,41 @@ fn compute(id: u64) -> ! {
         }
         // ---- DMA reach is a CAPABILITY, not a kernel decision ----
         //
-        // CapId(9) names the same domain as CapId(8) and carries no WRITE. Handing a device
-        // the ability to reach memory is granting authority, so the rights half has to bite —
-        // and it is exercised from a process that holds BOTH, which is what the Mmio case
-        // above was found NOT to do, leaving its check vacuous on hardware.
+        // CapId(8) names the live domain with full rights; CapId(9) names the same domain and
+        // carries no WRITE; CapId(10) is fully powered and names a domain that does not exist.
+        // All three are GRANTED rather than merely described, because a refusing branch nothing
+        // can reach is not a check — measured twice here, once for rights and once for the
+        // object, which mapped into the real domain while naming domain 999.
         tag(id);
         if map_dma(9, mbox) == syserr::NO_CAP {
-            dw!(
-                b"dma: an IommuDomain cap without WRITE cannot grant DMA reach
-"
-            );
+            dw!(b"dma: an IommuDomain cap without WRITE cannot grant DMA reach\n");
         } else {
-            dw!(b"dma: a rights-less domain cap granted DMA reach (bug)
-");
+            dw!(b"dma: a rights-less domain cap granted DMA reach (bug)\n");
         }
         tag(id);
         let iova = map_dma(8, mbox);
         if iova == syserr::NO_MEM {
-            // No unit programmed. Refusing is the whole point: DMA reach nothing bounds is
-            // indistinguishable from access to all of memory.
-            dw!(
-                b"dma: no IOMMU on this machine, so MAP_DMA refuses to hand out reach
-"
-            );
+            // No unit programmed. Refusing is the whole point: DMA reach that nothing bounds
+            // is indistinguishable from access to all of memory.
+            dw!(b"dma: no IOMMU on this machine, so MAP_DMA refuses to hand out reach\n");
         } else if iova == syserr::NO_CAP {
-            dw!(b"dma: MAP_DMA refused a region we hold (bug)
-");
+            dw!(b"dma: MAP_DMA refused a region we hold (bug)\n");
         } else {
-            dw!(b"dma: the device can now reach our region by DMA
-");
+            dw!(b"dma: the device can now reach our region by DMA\n");
+            // Only meaningful once a domain EXISTS. Where there is no unit, every domain
+            // capability is refused for that reason alone and the object is never looked at,
+            // so asserting it there would pass without testing anything.
+            tag(id);
+            if map_dma(10, mbox) == syserr::NO_CAP {
+                dw!(b"dma: a cap naming a domain that does not exist is refused\n");
+            } else {
+                dw!(b"dma: a cap for a nonexistent domain granted DMA reach (bug)\n");
+            }
             tag(id);
             if unmap_dma(8, mbox) == syserr::OK {
-                dw!(b"dma: UNMAP_DMA withdrew it and invalidated the unit
-");
+                dw!(b"dma: UNMAP_DMA withdrew it and invalidated the unit\n");
             } else {
-                dw!(b"dma: UNMAP_DMA failed on a mapping we made (bug)
-");
+                dw!(b"dma: UNMAP_DMA failed on a mapping we made (bug)\n");
             }
         }
 
