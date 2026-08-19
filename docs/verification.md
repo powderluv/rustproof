@@ -51,6 +51,33 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-19 (later still) — the device kept reaching memory the nucleus had reclaimed
+
+`MAP_DMA` writes real I/O page-table entries. `FREE_REGION` revoked the domain's grant and
+returned the frames to the allocator — and never touched the table. So a process that mapped a
+region for DMA and then freed it left a PRESENT leaf pointing at a frame on its way back into
+the pool, to be reissued to someone else while the device could still write it.
+
+Every check in the tree missed it, and the reason is worth stating plainly: `contained()`
+compares the domain's mappings with the domain's own grants. Revoking both at once leaves that
+comparison perfectly satisfied. The model agreed with itself while the hardware disagreed with
+both, which is the one shape a model-only invariant cannot see.
+
+Measured before fixing, on the rig: a present entry at IOVA `0x100000` naming a frame no grant
+covered. Nothing in the ABI obliges a caller to `UNMAP_DMA` first, and a killed process cannot
+be relied on to have done anything, so `FREE_REGION` is where it has to close.
+
+Fixed, hardware FIRST — the model is the index that finds the hardware, so revoking it first
+would leave the entries with nothing remaining that knows where they are — then the unit is
+invalidated. `UNMAP_DMA` and `FREE_REGION` now share one helper so the two cannot drift.
+
+**The new check is the interesting part.** The boot now WALKS THE REAL I/O PAGE TABLE and
+requires every present leaf to be covered by a live grant — the hardware analogue of
+`contained()`, and the first check here that is not the model talking to itself. A probe in the
+demo exercises exactly the case that produced the bug (map for DMA, then free without
+unmapping), and the runner requires that probe to have run: the scan only reports a stale entry
+if something created one, so a missing probe is a quietly weaker boot rather than a failing one.
+
 ## 2026-08-19 (later) — the capability named a domain and the name was ignored
 
 Found by mutating what had just shipped. `caps_iommu_domain` returned the capability's `object`

@@ -884,6 +884,25 @@ fn compute(id: u64) -> ! {
             }
         }
 
+        // Freeing a region must withdraw the device's reach to it. Nothing in the ABI obliges
+        // a caller to UNMAP_DMA first, and a process that is killed cannot be relied on to
+        // have done anything at all — so FREE_REGION has to be the one that closes this. If it
+        // returns the frames while the I/O page table still points at them, the device reaches
+        // memory the nucleus has since reissued to someone else.
+        tag(id);
+        let doomed = make_region(2, 1);
+        if doomed == syserr::NO_CAP || doomed == syserr::NO_MEM {
+            dw!(b"dma: could not make a region for the free-while-mapped probe (bug)\n");
+        } else {
+            let m = map_dma(8, doomed);
+            free_region(doomed);
+            if m == syserr::NO_MEM {
+                dw!(b"dma: freed a region that no unit could reach anyway\n");
+            } else {
+                dw!(b"dma: freed a region while the device still had it mapped\n");
+            }
+        }
+
         tag(id);
         let again = map_region(mbox);
         if again == mva && unsafe { core::ptr::read_volatile(mva as *const u8) } == b'B' {

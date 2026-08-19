@@ -322,6 +322,15 @@ for want in \
         exit 1
     fi
 done
+# Freeing a region must withdraw the device's reach, whether or not the caller unmapped first.
+# The probe that exercises it has to have RUN — the scan it feeds only reports a stale entry if
+# something created one, so a missing probe is a silently weaker boot, not a passing one.
+if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ] \
+    && ! echo "$OUT" | grep -qE 'dma: freed a region (while the device still had it mapped|that no unit could reach anyway)'; then
+    echo "RESULT: FAIL — the free-while-DMA-mapped probe never ran"
+    exit 1
+fi
+
 # And the outcome that depends on whether a unit exists — keyed on what the BOOT reports about
 # the machine, not on what the env flags imply about it. Keying it on IOMMU=1 && FIRMWARE=1 was
 # wrong: `IOMMU=1` alone also finds IVRS and enables the unit, so the run that was supposed to

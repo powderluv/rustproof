@@ -774,9 +774,30 @@ unsafe fn run_region_plan<A: Arch>(plan: &regions::Plan<PLAN_STEPS>) {
                     // Withdraw the device's authorization BEFORE the frames return to the
                     // pool. The other order is the stale-authorization bug: a frame reissued
                     // to someone else while the domain still names it.
+                    //
+                    // Both halves, hardware FIRST. Revoking only the model left a PRESENT leaf
+                    // in the I/O page table pointing at a frame on its way back to the
+                    // allocator — measured on the rig at IOVA 0x100000 — and every check in
+                    // the tree missed it, because the model agreed with itself perfectly.
+                    // Nothing in the ABI obliges a caller to UNMAP_DMA first, and a killed
+                    // process cannot be relied on to have done anything, so it closes here.
+                    let mut touched = false;
                     for k in 0..r.npages as usize {
-                        device_domain().revoke(r.frames[k].as_u64() >> abi::PAGE_SHIFT);
+                        let pfn = r.frames[k].as_u64() >> abi::PAGE_SHIFT;
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            touched |= clear_io_mappings_of(pfn);
+                        }
+                        device_domain().revoke(pfn);
                     }
+                    #[cfg(target_arch = "x86_64")]
+                    if touched {
+                        let base = *core::ptr::addr_of!(AMDVI_BASE);
+                        if base != 0 {
+                            iommu_invalidate(base);
+                        }
+                    }
+                    let _ = touched;
                     if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
                         use abi::FrameAllocator as _;
                         for k in 0..r.npages as usize {
@@ -1266,6 +1287,45 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
         );
         A::exit(false);
     }
+    // ---- the HARDWARE table must agree with the model ----
+    //
+    // Every check above this one is the model talking to itself: `contained()` compares the
+    // domain's mappings with its own grants, so a `Release` that withdraws both while leaving
+    // a PRESENT leaf in the I/O page table looks perfectly clean — and the device goes on
+    // reaching a frame that has since been reissued to someone else. That is the stale-mapping
+    // hazard `crates/iommu` exists to prevent, arriving in the half the model cannot see.
+    //
+    // So walk the real table. Any present leaf must be covered by a live grant for the same
+    // frame; anything else is the model and the hardware having diverged.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(l1) = *core::ptr::addr_of!(IOMMU_L1) {
+        let dom = device_domain();
+        let mut stale = 0u64;
+        let mut first = 0u64;
+        for slot in 0..512u64 {
+            let pte = core::ptr::read_volatile((l1 + slot * 8) as *const u64);
+            if pte & iopte::PR == 0 {
+                continue;
+            }
+            let frame = (pte & iopte::ADDR) >> abi::PAGE_SHIFT;
+            if dom.granted(frame).is_none() {
+                if stale == 0 {
+                    first = slot * abi::PAGE_SIZE;
+                }
+                stale += 1;
+            }
+        }
+        if stale > 0 {
+            let _ = writeln!(
+                con,
+                "\n[iommu] (bug) STALE HARDWARE MAPPING: {stale} present I/O page-table \
+                 entr(ies) name a frame no grant covers, first at IOVA {first:#x} — the device \
+                 can still reach memory the nucleus has reclaimed"
+            );
+            A::exit(false);
+        }
+    }
+
     // The device domain must track the live DMA regions EXACTLY. Nothing is mapped (there is
     // no IOMMU and no device), so the containment half is trivially satisfied and is not what
     // this asserts. What it asserts is the half that can actually be wrong today: a `Release`
@@ -1994,6 +2054,35 @@ unsafe fn map_dma(domain: u64, region_id: u64, rights: abi::CapRights) -> u64 {
     first * abi::PAGE_SIZE
 }
 
+/// Clear every I/O page-table entry that points at `pfn`, leaving the model untouched.
+///
+/// Returns whether anything was cleared, so the caller can skip an invalidation with nothing
+/// to invalidate. The domain is the index — it knows which IOVAs it handed out, so no caller
+/// ever names one — which is why this must run BEFORE the model is revoked. A revoked domain
+/// has forgotten where the mappings were, and the hardware entries would be left behind with
+/// nothing remaining that knows to look for them.
+///
+/// # Safety
+/// Single-CPU, non-reentrant.
+#[cfg(target_arch = "x86_64")]
+unsafe fn clear_io_mappings_of(pfn: u64) -> bool {
+    let Some(l1) = *core::ptr::addr_of!(IOMMU_L1) else {
+        return false;
+    };
+    let mut iovas = [0u64; REGION_MAX_PAGES as usize * 2];
+    let mut n = 0;
+    for (iova, frame, _) in device_domain().reachable() {
+        if frame == pfn && n < iovas.len() {
+            iovas[n] = iova;
+            n += 1;
+        }
+    }
+    for &iova in iovas.iter().take(n) {
+        core::ptr::write_volatile((l1 + (iova >> abi::PAGE_SHIFT) * 8) as *mut u64, 0);
+    }
+    n > 0
+}
+
 /// Withdraw every DMA mapping of a region, and TELL THE UNIT.
 ///
 /// # Safety
@@ -2013,23 +2102,23 @@ unsafe fn unmap_dma(domain: u64, region_id: u64) -> u64 {
     let Some(ri) = region_index(region_id) else {
         return abi::syserr::NO_CAP;
     };
+    let _ = l1;
     let npages = (*core::ptr::addr_of!(REGIONS[ri])).npages;
     for k in 0..npages {
-        let frame =
+        let pfn =
             (*core::ptr::addr_of!(REGIONS[ri])).frames[k as usize].as_u64() >> abi::PAGE_SHIFT;
-        // The domain knows where it put them; the caller never names an address.
-        let iovas: [u64; REGION_MAX_PAGES as usize] = core::array::from_fn(|_| u64::MAX);
-        let mut iovas = iovas;
+        // Hardware first, then the model — the model is the index that finds the hardware.
+        clear_io_mappings_of(pfn);
+        let mut iovas = [0u64; REGION_MAX_PAGES as usize * 2];
         let mut n = 0;
-        for (iova, f, _) in device_domain().reachable() {
-            if f == frame && n < iovas.len() {
+        for (iova, frame, _) in device_domain().reachable() {
+            if frame == pfn && n < iovas.len() {
                 iovas[n] = iova;
                 n += 1;
             }
         }
         for &iova in iovas.iter().take(n) {
             device_domain().unmap(iova);
-            core::ptr::write_volatile((l1 + (iova >> abi::PAGE_SHIFT) * 8) as *mut u64, 0);
         }
     }
     // Clearing the table is not revocation while the unit still holds a translation it has
