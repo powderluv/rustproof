@@ -222,7 +222,17 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${IOMMU:-0}" = "1" ] &&
     # PAYLOAD: the same two transfers land when the unit is not translating and do not when it
     # is, so "CONTAINED" means nothing reached memory rather than nothing was attempted — the
     # transfers are separately required to have completed at the device.
-    if [ "${FIRMWARE:-0}" = "1" ] && echo "$OUT" | grep -q 'edu ident='; then
+    if [ "${FIRMWARE:-0}" = "1" ]; then
+        # REQUIRED, not a condition. This used to read `&& grep -q 'edu ident='`, and that line
+        # is printed LAST, after five places where the probe can bail out quietly: no DMA-capable
+        # device, not edu, no BAR, the BAR would not map, a wrong ident. Any of them made the
+        # condition false, skipped every gate below, and reported PASS — the containment result
+        # would have stopped being tested with CI still green. Reaching the device is itself part
+        # of what the firmware rig asserts.
+        if ! echo "$OUT" | grep -q 'edu ident='; then
+            echo "RESULT: FAIL — the probe never reached the device, so nothing below was checked"
+            exit 1
+        fi
         if ! echo "$OUT" | grep -q 'transfers: RAM->dev done dev->RAM done'; then
             echo "RESULT: FAIL — the device did not complete its transfers; containment untested"
             exit 1
@@ -241,9 +251,39 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${IOMMU:-0}" = "1" ] &&
             echo "RESULT: FAIL — the domain let an ungranted frame into the I/O page table"
             exit 1
         fi
+        # That line is the MODEL's verdict printed back. This one is the device's: a DMA is
+        # actually aimed at the ungranted IOVA and must not land. Without it, a defect that
+        # wrote the PTE anyway would still print "refused (no PTE written)" and pass.
+        if ! echo "$OUT" | grep -q 'UNREACHABLE: the ungranted IOVA'; then
+            echo "RESULT: FAIL — an ungranted IOVA was never tested against the device, or it"
+            echo "  was reachable"
+            exit 1
+        fi
         if ! echo "$OUT" | grep -q '\[iommu\] TRANSLATED:'; then
             echo "RESULT: FAIL — a GRANTED IOVA did not reach its frame; the unit is refusing"
             echo "  everything rather than enforcing a policy"
+            exit 1
+        fi
+        # Rights, not just reachability. Every refusal above is of an absent mapping; this one
+        # is of a PRESENT and readable page that the device may not WRITE, which is the only
+        # way to show the granted rights reach the hardware entry instead of being validated
+        # and then discarded. They were discarded, for eighteen commits: the leaf was written
+        # with a constant IR|IW, and every grant happened to be RW so nothing noticed.
+        if ! echo "$OUT" | grep -q '\[iommu\] RIGHTS ENFORCED:'; then
+            echo "RESULT: FAIL — a READ-only grant did not stop a device WRITE"
+            exit 1
+        fi
+        # And withdrawal has to reach the hardware too. Clearing the page-table entry is not
+        # revocation while the unit still holds a cached translation — measured, not assumed:
+        # without the invalidation this exact check read back the pattern.
+        if ! echo "$OUT" | grep -q '\[iommu\] REVOKED:'; then
+            echo "RESULT: FAIL — a withdrawn mapping was still reachable, or the check for it"
+            echo "  did not run"
+            exit 1
+        fi
+        if ! echo "$OUT" | grep -q 'invalidation issued and COMPLETED'; then
+            echo "RESULT: FAIL — the unit never acknowledged an invalidation, so the revocation"
+            echo "  above proves nothing about ordering"
             exit 1
         fi
     fi

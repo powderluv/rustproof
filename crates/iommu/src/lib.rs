@@ -208,6 +208,23 @@ impl<const G: usize, const M: usize> Domain<G, M> {
             .map(|m| (m.iova, m.frame, m.rights))
     }
 
+    /// Plant a mapping straight into slot `i`, bypassing every check.
+    ///
+    /// Tests only, and load-bearing. [`Domain::contained`] exists to DETECT a state the public
+    /// API cannot produce, so it is only ever called where the answer should be `true` — which
+    /// made `fn contained() -> bool { true }` pass all 221 tests in the tree, the exhaustive
+    /// 21,952-sequence search included. A checker that cannot be shown to reject anything is
+    /// not a checker. Producing the bad state is the only way to test the thing.
+    #[cfg(test)]
+    pub fn force_mapping(&mut self, i: usize, iova: u64, frame: u64, rights: CapRights) {
+        self.maps[i] = Mapping {
+            live: true,
+            iova,
+            frame,
+            rights,
+        };
+    }
+
     /// THE INVARIANT: `device_reachable ⊆ granted`.
     ///
     /// Every address the device can reach is covered by a live grant, with rights no wider
@@ -354,6 +371,108 @@ mod tests {
         v
     }
 
+    /// `contained` must REJECT, and from any slot.
+    ///
+    /// Two mutants motivate this: `contained() { true }` passed every test in the repository,
+    /// and `contained()` truncated to the first two slots passed them too. Both are alive
+    /// against a suite that only ever asks the question where the answer is yes.
+    #[test]
+    fn contained_rejects_an_ungranted_frame_in_every_slot() {
+        const NM: usize = 8;
+        for slot in 0..NM {
+            let mut d: Domain<48, NM> = Domain::new();
+            assert!(d.grant(500, RW));
+            assert!(d.map(0, 500, RW).is_ok());
+            assert!(d.contained(), "the legitimate state must pass");
+            d.force_mapping(slot, 900 + slot as u64, 777, RW);
+            assert!(
+                !d.contained(),
+                "a frame nobody granted, mapped in slot {slot}, went unnoticed"
+            );
+        }
+    }
+
+    /// The other half of the invariant: rights no wider than the grant confers.
+    #[test]
+    fn contained_rejects_rights_wider_than_the_grant_in_every_slot() {
+        const NM: usize = 8;
+        for slot in 0..NM {
+            let mut d: Domain<48, NM> = Domain::new();
+            assert!(d.grant(500, R));
+            d.force_mapping(slot, 10 + slot as u64, 500, RW);
+            assert!(
+                !d.contained(),
+                "a WRITE mapping over a READ-only grant in slot {slot} went unnoticed"
+            );
+        }
+    }
+
+    /// The DEPLOYED shape, with the violation in the LAST slot.
+    ///
+    /// The exhaustive search runs `Domain<3, 3>` and never fills more than two of either
+    /// table, while the kernel runs `Domain<48, 8>` and its boot assertion calls `contained`.
+    /// Every scan in this module was therefore only ever exercised at index 0 and 1: a scan
+    /// that stopped early — `.take(2)` — passed all 21,952 sequences, and would have been
+    /// blind to a mapping that outlived its grant in any slot from 2 up.
+    #[test]
+    fn every_scan_reaches_the_last_deployed_slot() {
+        const NG_DEPLOYED: usize = 48;
+        const NM_DEPLOYED: usize = 8;
+        let mut d: Domain<NG_DEPLOYED, NM_DEPLOYED> = Domain::new();
+
+        // Fill every mapping slot, and a grant slot for each.
+        for i in 0..NM_DEPLOYED as u64 {
+            assert!(d.grant(100 + i, RW), "grant {i} did not take");
+            assert!(d.map(i, 100 + i, RW).is_ok(), "map {i} did not take");
+        }
+        assert!(d.contained());
+        assert_eq!(d.reachable().count(), NM_DEPLOYED);
+
+        // `granted` must see the LAST grant: a short scan reports NotGranted.
+        assert_eq!(d.granted(100 + NM_DEPLOYED as u64 - 1), Some(RW));
+        // `map` must see the LAST mapping when rejecting a duplicate IOVA.
+        assert_eq!(
+            d.map(NM_DEPLOYED as u64 - 1, 100, RW),
+            Err(MapErr::IovaInUse)
+        );
+        // `revoke` must withdraw a mapping held in the LAST slot, not just the early ones.
+        let last = 100 + NM_DEPLOYED as u64 - 1;
+        assert_eq!(
+            d.revoke(last),
+            1,
+            "revoke did not reach the last mapping slot"
+        );
+        assert!(
+            d.contained(),
+            "a mapping outlived its grant in the last slot"
+        );
+        assert_eq!(d.reachable().count(), NM_DEPLOYED - 1);
+        // `unmap` must reach it too.
+        assert!(d.unmap(NM_DEPLOYED as u64 - 2));
+    }
+
+    /// The same width question on the GRANT table, which is six times wider than the map table.
+    #[test]
+    fn the_last_grant_slot_is_usable_and_enforced() {
+        const NG_DEPLOYED: usize = 48;
+        let mut d: Domain<NG_DEPLOYED, 8> = Domain::new();
+        for i in 0..NG_DEPLOYED as u64 {
+            assert!(d.grant(200 + i, RW), "grant slot {i} unusable");
+        }
+        assert!(!d.grant(999, RW), "a full grant table must refuse");
+        // A frame parked in the very last grant slot must still authorize a mapping...
+        let last = 200 + NG_DEPLOYED as u64 - 1;
+        assert_eq!(d.granted(last), Some(RW));
+        assert!(d.map(0, last, RW).is_ok());
+        // ...and narrowing THAT grant must withdraw the mapping it no longer covers.
+        assert!(d.grant(last, R));
+        assert!(
+            d.contained(),
+            "narrowing a grant in the last slot left a wider mapping behind"
+        );
+        assert_eq!(d.reachable().count(), 0);
+    }
+
     // `std` is available under cfg(test); the crate itself is no_std.
     mod alloc_vec {
         pub use std::vec::Vec;
@@ -380,7 +499,15 @@ mod tests {
     fn exhaustive_containment_survives_every_operation_sequence() {
         let ops = alphabet();
         let mut checks = 0u64;
-        // Depth 3 over a 26-symbol alphabet = 17,576 sequences, each checked after every step.
+        // Depth 3 over a 28-symbol alphabet = 21,952 sequences, each checked after every step.
+        // (2 frames x (4 rights + revoke) = 10, plus 2 iovas x (2 frames x 4 rights + unmap)
+        // = 18. It was documented as 26 symbols / 17,576 for as long as it existed; the count
+        // was written down rather than derived, and never recomputed when the alphabet grew.)
+        //
+        // What this search covers is INTERLEAVING, not width: two frames and two IOVAs mean at
+        // most two grants and two mappings are ever live, so no table slot above index 1 is
+        // ever occupied no matter how large NG and NM are. Width is covered separately, by the
+        // deployed-shape tests below, because a truncated scan passes everything here.
         for a in ops.iter() {
             for b in ops.iter() {
                 for c in ops.iter() {

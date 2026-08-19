@@ -51,6 +51,74 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-18 (later) — the adversarial review, and the checker that could not fail
+
+Six defects, all of the same family: a mechanism whose check could not fail, or a claim written
+into a comment instead of measured. Two were found before the review returned, four by it. Every
+fix below is mutation-tested — the mutant is named, and it died.
+
+**1. `contained()` was never verified at all.** `fn contained() -> bool { true }` passed all 221
+tests in the repository, the 21,952-sequence exhaustive search included. The invariant is only
+ever evaluated in states the public API cannot corrupt, so "always true" is indistinguishable
+from the real predicate: the search verifies the API and never the checker. `contained` is what
+the kernel asserts at boot and what `crates/iommu` exists for. Fixed with a `#[cfg(test)]`
+`force_mapping` that plants the state the API cannot produce, plus tests that require rejection
+from EVERY slot. Both the `{ true }` mutant and a `.take(2)` truncation now die.
+
+**2. The exhaustive search never occupied more than two slots.** It runs `Domain<3, 3>` over two
+frames and two IOVAs while the kernel deploys `Domain<48, 8>`, so no table index above 1 was
+ever exercised, at any N — widening the constants would not have helped, because the universe
+caps live occupancy. Added deployed-shape tests that put the violation in the LAST slot; a
+truncated `granted` scan dies against them. Separately the search size was documented as
+"26 symbols / 17,576 sequences" for as long as it existed. The alphabet is 28 symbols and 21,952
+sequences: the number was written down once and never recomputed when the alphabet grew.
+
+**3. Granted rights never reached the hardware.** `Domain::map` refuses rights wider than the
+grant, and the page-table leaf was then written with a constant `IR | IW` regardless. A READ-only
+grant produced a WRITABLE mapping. Nothing caught it because every grant in the demo was RW, so
+the constant was accidentally correct in every case exercised — the model's authority covered
+which FRAME the device could reach but not what it could DO to it. The PTE bits are now derived
+from the grant, and a read-only page is proved unwritable on the rig: the device is told to write
+it, reports the transfer complete, and the page still reads its sentinel.
+
+**4. Withdrawal did not withdraw.** Clearing a page-table entry is not revocation while the unit
+still holds a cached translation. The comment licensing the omission — "nothing was ever cached
+for this domain: the unit has refused every transfer so far" — was true where it was written and
+false forty lines below it, where it was relied upon, because two transfers had succeeded in
+between. Measured, not argued: re-aiming the device at the withdrawn IOVA returned `0xd1ce…`.
+Fixed by implementing the command buffer (INVALIDATE_IOMMU_PAGES + INVALIDATE_DEVTAB_ENTRY +
+COMPLETION_WAIT with a store, so completion is observed rather than assumed). The same probe now
+reads back the sentinel, and removing the invalidation puts `0xd1ce…` back.
+
+**5. "CONTAINED" could not distinguish a blocked write from a write of zeros.** The verdict was
+`wrote != PATTERN` over a pre-zeroed frame — but the inbound leg is refused too, so the device's
+buffer is empty and a transfer the unit ALLOWED would deposit zeros into a frame already reading
+zero. The line claimed "NOTHING reached memory"; what it established was "the pattern did not
+arrive". Frames are now pre-filled with a sentinel and all 64 transferred bytes are checked, so
+any write is visible, including a write of zeros or one that starts at byte 8.
+
+**6. The hardware gates were self-disabling.** All four containment gates sat behind
+`grep -q 'edu ident='`, a line printed AFTER five places where the probe can bail out quietly.
+Any regression that stopped the nucleus reaching the device skipped every gate and reported PASS.
+It is now required rather than a condition; a mutant that bails early fails the run.
+
+Also fixed: the AMD-Vi capability walk did `u8` arithmetic on offsets that legally reach 0xFC
+(silent wrap in release, where overflow checks are off, composing the aperture base from the
+Vendor/Device ID registers); and `PageFlags::NO_CACHE` was pinned by no test, so zeroing it left
+every suite green while the boot still printed "aperture mapped uncached".
+
+**Still not proven: the event log records nothing.** Now attributable rather than vague. A
+positive control deliberately corrupts the DTE with a reserved bit — the one refusal that cannot
+be blamed on the shape of a page-table walk — and reads the log BUFFER directly rather than the
+tail register, since a tail is only evidence if the unit reflects it back. Nothing is written.
+So the log is the unfinished part and the silence is ours, not the emulator's. The refusals
+themselves are real and separately demonstrated by the payload; what is missing is the unit
+REPORTING them, which a driver diagnosing a misbehaving device will need.
+
+The lesson worth keeping: an exhaustive search over an API proves things about the API. It says
+nothing about a predicate that the API is designed never to falsify. Testing a checker means
+constructing the state it exists to reject.
+
 ## 2026-08-18 — the MODEL now governs the MACHINE
 
 `crates/iommu`'s `Domain` has been exhaustively host-tested since it was written, and until now
@@ -67,7 +135,7 @@ device, not merely unrecorded in a table. In one boot:
 [iommu] domain: dst mapped src mapped ungranted-frame refused (no PTE written)
 [iommu] TRANSLATED: the same device reached exactly the frame it was granted
 [iommu] withdrew both mappings and grants; domain holds 0 grant(s)
-[iommu] CONTAINED: the transfer completed at the device and NOTHING reached memory
+[iommu] CONTAINED: the transfer completed at the device and the target frame is UNTOUCHED
 ```
 
 The withdrawal is not tidiness. The proof's grants are not a standing authority, and the boot's
@@ -85,7 +153,7 @@ that the table works, not that anything decides what goes into it.
 In one boot, on one unit, with one device:
 
 ```
-[iommu] CONTAINED:  the transfer completed at the device and NOTHING reached memory
+[iommu] CONTAINED:  the transfer completed at the device and the target frame is UNTOUCHED
 [iommu] TRANSLATED: the same device reached exactly the frame it was granted
 ```
 
@@ -144,7 +212,8 @@ positive control is what turned each of them up.
 **What is NOT proven: the event log records nothing.** Tail stays at 0 across a refused
 transfer, so the unit is not reporting the refusal even though it is performing it. Event-log
 setup is unfinished, and the boot line says so rather than leaving the silence to be read as
-"no faults occurred".
+"no faults occurred". (Followed up above with a positive control that rules out the emulator
+as the explanation.)
 
 The runner gates on the payload: the transfers must complete AND `CONTAINED:` must appear.
 
@@ -398,7 +467,7 @@ repeatedly, and the searches below still hold real axes constant:
 | `runstate` | every state vector of length 1..=6 × 7 predicates | endpoint/line values ∈ {0,1}; 7 of the boolean functions over the reachable domain |
 | `regions` | 20,736 configs × 7 plans at `P=6`/`S=4`/`N=52` (tables both compacted and with a dead entry first), plus the worst-case teardown at `MAX_REGIONS=12` | region ARITY (≤2 live) — but measured: `take(1)`/`take(2)` on the teardown loop is already caught, so arity is covered and it was the COMPACTION that was not |
 | `capabilities` | rights bits, every slot of `CapSpace<16>`, occupancy under a NONE-rights slot, two slots on one object | cap TYPE is thin here (5 of 11 variants) — but measured: covered at the repo level by `kernel`'s Region tests |
-| `iommu` | every 3-op sequence over grant/revoke/map/unmap (17,576 sequences, invariant checked after EVERY step) | there is no hardware half — nothing maps, so the containment side is satisfied trivially IN THE KERNEL (the crate's own search does exercise it) |
+| `iommu` | every 3-op sequence over grant/revoke/map/unmap (21,952 sequences, invariant checked after EVERY step; plus deployed-shape tests that reach the LAST slot, which the search itself never occupies) | there is no hardware half — nothing maps, so the containment side is satisfied trivially IN THE KERNEL (the crate's own search does exercise it) |
 | `mm` | `partition_holds_for_every_dma_top` (1,040 configs), every **3**-region map shape over unaligned starts/lengths/kinds asserting the exact allocatable SET (110,592 configs), and 5×4000-step arbitrary alloc/free interleavings | maps are 3 regions, not arbitrary-length |
 | `kernel` | boot grant tables, every authority predicate, the PVH map bound (17 properties) | everything else in ~2400 lines — a foothold, not coverage |
 

@@ -500,6 +500,15 @@ mod tests {
         assert_eq!(PageFlags::USER.bits(), 1 << 2);
         assert_eq!(PageFlags::HUGE.bits(), 1 << 7);
         assert_eq!(PageFlags::NO_EXEC.bits(), 1 << 63);
+        // NO_CACHE was added without being added HERE, and nothing else checks it: zeroing it
+        // left all 219 tests green, the nucleus building, and the boot still printing
+        // "aperture mapped uncached" — because that line is printed on `map_page` returning
+        // true, not on the bits. QEMU TCG ignores PAT/PCD, so the rig cannot see it either.
+        // PWT|PCD, both: with the default PAT, PCD alone selects UC-, which a later PAT change
+        // can weaken, while PWT+PCD selects strong UC.
+        assert_eq!(PageFlags::NO_CACHE.bits(), (1 << 3) | (1 << 4));
+        assert!(PageFlags::NO_CACHE.contains(PageFlags(1 << 3)));
+        assert!(PageFlags::NO_CACHE.contains(PageFlags(1 << 4)));
     }
 
     #[test]

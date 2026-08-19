@@ -388,6 +388,19 @@ static mut TARGET_BDF: u32 = 0;
 #[cfg(target_arch = "x86_64")]
 static mut EVENT_LOG: u64 = 0;
 
+/// Command buffer base, and our own copy of the tail offset. The unit owns the head; the tail
+/// is ours to advance, and nothing else may write it.
+static mut CMD_BUF: u64 = 0;
+static mut CMD_TAIL: u64 = 0;
+
+/// Where COMPLETION_WAIT deposits its word. Its own frame: the ring's 256 entries fill a page
+/// exactly, so there is no spare corner of it to borrow.
+static mut CMD_STORE: u64 = 0;
+
+/// Address of the target device's device-table entry, kept so the boot can perturb it for the
+/// event log's positive control. Zero until [`program_dte`] has written one.
+static mut DEVICE_TABLE_ENTRY: u64 = 0;
+
 /// Physical base of the device domain's I/O page-table root, or 0 if none is programmed.
 #[cfg(target_arch = "x86_64")]
 static mut IOMMU_PT_ROOT: u64 = 0;
@@ -1584,6 +1597,8 @@ unsafe fn program_dte<A: Arch>(
     let w1: u64 = 0; // domain 0
 
     let dte = (dt + bdf * 32) as *mut u64;
+    // SAFETY: single-CPU boot path.
+    DEVICE_TABLE_ENTRY = dte as u64;
     core::ptr::write_volatile(dte, w0);
     core::ptr::write_volatile(dte.add(1), w1);
     core::ptr::write_volatile(dte.add(2), 0);
@@ -1598,22 +1613,16 @@ unsafe fn program_dte<A: Arch>(
         return;
     }
 
-    // Enable translation. Safe here for a specific reason rather than by luck: nothing in this
-    // guest does DMA — the demo touches the serial port and debug-exit only — so a unit that
-    // refuses every transfer cannot break the boot. On a machine that WAS doing DMA this line
-    // would need the command buffer and an invalidation first.
-    const IOMMU_EN: u64 = 1 << 0;
-    let ctrl = base + 0x18;
-    let before = core::ptr::read_volatile(ctrl as *const u64);
-    core::ptr::write_volatile(ctrl as *mut u64, before | IOMMU_EN | EVENT_LOG_EN);
-    let after = core::ptr::read_volatile(ctrl as *const u64);
-
     // ---- event log: without it, a refused DMA is SILENT ----
     //
     // The unit reports IO_PAGE_FAULT (and friends) by appending 16-byte entries to a ring in
     // memory. With no log armed, a blocked transfer produces no record anywhere — the device
     // simply does not get its data, which is indistinguishable from a device that was never
     // asked. Arming it is what makes "refused" observable rather than assumed.
+    //
+    // Armed BEFORE the unit is enabled. It used to be armed after, which the AMD-Vi spec
+    // does not permit — the base registers are to be programmed while the unit is off — and
+    // which left a window where translation was live with no log behind it.
     //
     // 4 KiB = 256 entries; the EventLen field encodes 256 as 8.
     const EVENT_ENTRIES_LOG2: u64 = 8;
@@ -1635,6 +1644,52 @@ unsafe fn program_dte<A: Arch>(
         }
     }
 
+    // ---- command buffer: the only way to tell the unit that a table CHANGED ----
+    //
+    // Adding a mapping needs no announcement — the unit had nothing cached for an address it
+    // had never translated. REMOVING one does, and that difference was assumed rather than
+    // measured: withdrawing a mapping cleared the page-table entry and the model's record and
+    // stopped there, and the device went on reaching the frame from a cached translation.
+    // Clearing a table is not revocation until the unit has been told.
+    const CMD_ENTRIES_LOG2: u64 = 8;
+    const CMD_BUF_EN: u64 = 1 << 12;
+    if let Some(cmd) = fa.alloc_frame().map(|f| zero_frame(f)) {
+        let val = (cmd.as_u64() & 0x000F_FFFF_FFFF_F000) | (CMD_ENTRIES_LOG2 << 56);
+        core::ptr::write_volatile((base + 0x08) as *mut u64, val);
+        let back = core::ptr::read_volatile((base + 0x08) as *const u64);
+        if back == val {
+            // SAFETY: single-CPU boot path.
+            CMD_BUF = cmd.as_u64();
+            CMD_TAIL = 0;
+            if let Some(store) = fa.alloc_frame().map(|f| zero_frame(f)) {
+                CMD_STORE = store.as_u64();
+            }
+            let _ = writeln!(
+                con,
+                "[iommu] command buffer {:#x} (256 entries) armed; CBBR reads back {back:#018x}",
+                cmd.as_u64()
+            );
+        } else {
+            let _ = writeln!(
+                con,
+                "[iommu] command buffer base did not take: {back:#018x}"
+            );
+        }
+    }
+
+    // Enable translation. Safe here for a specific reason rather than by luck: nothing in this
+    // guest does DMA — the demo touches the serial port and debug-exit only — so a unit that
+    // refuses every transfer cannot break the boot. On a machine that WAS doing DMA this line
+    // would need the command buffer and an invalidation first.
+    const IOMMU_EN: u64 = 1 << 0;
+    let ctrl = base + 0x18;
+    let before = core::ptr::read_volatile(ctrl as *const u64);
+    core::ptr::write_volatile(
+        ctrl as *mut u64,
+        before | IOMMU_EN | EVENT_LOG_EN | CMD_BUF_EN,
+    );
+    let after = core::ptr::read_volatile(ctrl as *const u64);
+
     if after & IOMMU_EN != 0 {
         let _ = writeln!(
             con,
@@ -1650,6 +1705,108 @@ unsafe fn program_dte<A: Arch>(
     } else {
         let _ = writeln!(con, "[iommu] CTRL write did not take: {after:#018x}");
     }
+}
+
+/// The first of `frame`'s 64 sentinel bytes that is NOT the sentinel, or the sentinel itself if
+/// all eight words are intact.
+///
+/// Each transfer moves 64 bytes and every check used to read only the first eight, so a partial
+/// or offset write — bytes 8..64 landing while 0..8 did not — read as untouched. Returning the
+/// offending word rather than a bool keeps the existing `== SENTINEL` comparisons and puts the
+/// value that broke it into the message.
+#[cfg(target_arch = "x86_64")]
+unsafe fn first_disturbed(frame: u64, sentinel: u64) -> u64 {
+    for i in 0..8u64 {
+        let v = core::ptr::read_volatile((frame + i * 8) as *const u64);
+        if v != sentinel {
+            return v;
+        }
+    }
+    sentinel
+}
+
+/// Append one 128-bit command and ring the tail. False if no buffer is armed.
+///
+/// The tail is ours to advance and the head is the unit's. 256 entries with a handful of
+/// commands per boot never wraps, and the assert states that rather than a comment claiming it.
+#[cfg(target_arch = "x86_64")]
+unsafe fn iommu_cmd(base: u64, cmd: [u32; 4]) -> bool {
+    let buf = *core::ptr::addr_of!(CMD_BUF);
+    if buf == 0 {
+        return false;
+    }
+    let tail = *core::ptr::addr_of!(CMD_TAIL);
+    assert!(
+        tail + 16 <= 4096,
+        "IOMMU command ring wrapped and wrap handling is not implemented"
+    );
+    let slot = (buf + tail) as *mut u32;
+    for (i, w) in cmd.iter().enumerate() {
+        core::ptr::write_volatile(slot.add(i), *w);
+    }
+    // SAFETY: single-CPU boot path.
+    CMD_TAIL = tail + 16;
+    core::ptr::write_volatile((base + 0x2008) as *mut u64, tail + 16);
+    true
+}
+
+/// Drop everything the unit may have cached for the target device, and WAIT for it to say so.
+///
+/// Completion is observed, not assumed: these commands are asynchronous, so a reachability
+/// check run before the invalidation landed would report withdrawn or stale purely by timing.
+#[cfg(target_arch = "x86_64")]
+unsafe fn iommu_invalidate(base: u64) -> bool {
+    let store = *core::ptr::addr_of!(CMD_STORE);
+    if store == 0 {
+        return false;
+    }
+    const DONE: u64 = 0x5A5A_5A5A_A5A5_A5A5;
+    core::ptr::write_volatile(store as *mut u64, 0);
+
+    // INVALIDATE_IOMMU_PAGES: domain 0, S=1 with an all-ones address means the whole domain.
+    if !iommu_cmd(base, [0, 0x3 << 28, 0xFFFF_F000 | 1, 0x7FFF_FFFF]) {
+        return false;
+    }
+    // The device-table entry is cacheable in its own right, so it is invalidated too.
+    let bdf = *core::ptr::addr_of!(TARGET_BDF) & 0xFFFF;
+    if !iommu_cmd(base, [bdf, 0x2 << 28, 0, 0]) {
+        return false;
+    }
+    // COMPLETION_WAIT, with a store so there is something to actually observe.
+    let cw = [
+        (store as u32 & 0xFFFF_FFF8) | 1,
+        (((store >> 32) as u32) & 0x000F_FFFF) | (0x1 << 28),
+        DONE as u32,
+        (DONE >> 32) as u32,
+    ];
+    if !iommu_cmd(base, cw) {
+        return false;
+    }
+    for _ in 0..10_000_000u64 {
+        if core::ptr::read_volatile(store as *const u64) == DONE {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// What the read-only probe observed: whether the narrowed mapping was written, whether the
+/// model refused wider rights, and what the frame and the event log looked like afterwards.
+#[cfg(target_arch = "x86_64")]
+struct RoProbe {
+    /// What the ungranted frame read after the device was aimed at its IOVA. The refusal used
+    /// to be reported straight from the model — `!dom.map(..).is_ok()` printed as the hardware
+    /// fact "no PTE written" — so a defect that wrote the entry anyway would still have said
+    /// "refused". This is the device's answer instead of the model's.
+    ungranted_seen: u64,
+    frame: u64,
+    mapped: bool,
+    wider_refused: bool,
+    done: bool,
+    seen: u64,
+    tail_before: u64,
+    tail_after: u64,
 }
 
 /// Make the bounded device attempt a DMA, and report what the IOMMU did about it.
@@ -1726,6 +1883,16 @@ unsafe fn prove_containment<A: Arch>(
     let Some(target) = fa.alloc_frame().map(|f| zero_frame(f)) else {
         return;
     };
+    // Pre-fill with a SENTINEL rather than leaving it zeroed. "Contained" has to mean nothing
+    // was written, and a zeroed target cannot show that: the inbound RAM->device load is
+    // refused too, so edu's buffer is empty, and a transfer the IOMMU ALLOWED would deposit
+    // zeros — byte-identical to one it blocked. Checking `!= PATTERN` therefore only
+    // established "the pattern did not arrive", while the line claimed "nothing reached
+    // memory". With a sentinel, ANY write is visible, including a write of zeros.
+    const SENTINEL: u64 = 0x5E17_11E1_5E17_11E1;
+    for i in 0..8u64 {
+        core::ptr::write_volatile((target.as_u64() + i * 8) as *mut u64, SENTINEL);
+    }
 
     let tail_before = core::ptr::read_volatile((base + 0x2018) as *const u64);
 
@@ -1780,11 +1947,11 @@ unsafe fn prove_containment<A: Arch>(
     let finished = in_ok && out_ok;
 
     let tail_after = core::ptr::read_volatile((base + 0x2018) as *const u64);
-    let wrote = core::ptr::read_volatile(target.as_u64() as *const u64);
+    let wrote = first_disturbed(target.as_u64(), SENTINEL);
     let _ = writeln!(
         con,
         "[iommu] DMA {}: event tail {tail_before:#x} -> {tail_after:#x}, target reads \
-         {wrote:#018x} (pattern would be {PATTERN:#018x})",
+         {wrote:#018x} (untouched = {SENTINEL:#018x})",
         if finished {
             "completed"
         } else {
@@ -1811,6 +1978,7 @@ unsafe fn prove_containment<A: Arch>(
     const IOVA: u64 = 0x1000;
     const IOVA_SRC: u64 = 0x2000;
     const IOVA_UNGRANTED: u64 = 0x3000;
+    const IOVA_RO: u64 = 0x5000;
 
     // BOTH directions need a mapping. The first attempt mapped only the destination and got
     // "NOT TRANSLATED" — because the inbound RAM->device transfer that loads the pattern was
@@ -1827,7 +1995,6 @@ unsafe fn prove_containment<A: Arch>(
         let root = *core::ptr::addr_of!(IOMMU_PT_ROOT);
         let i3 = ((IOVA >> 30) & 0x1FF) as u64;
         let i2 = ((IOVA >> 21) & 0x1FF) as u64;
-        let i1 = ((IOVA >> 12) & 0x1FF) as u64;
         core::ptr::write_volatile(
             (root + i3 * 8) as *mut u64,
             (l2.as_u64() & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | NEXT_LEVEL_2,
@@ -1847,30 +2014,50 @@ unsafe fn prove_containment<A: Arch>(
         // granted and refuses rights wider than the grant. A refusal writes NO page-table
         // entry, which is what makes the tie observable: an ungranted frame stays unreachable
         // by the device, not merely unrecorded in a table.
+        // Allocated and granted here, above the closure below, because that closure takes
+        // `dom` mutably for its whole life and nothing else may touch the domain while it is
+        // alive. Used further down, in the rights phase.
+        let ro = fa.alloc_frame().map(|f| zero_frame(f))?;
+
         let dom = device_domain();
         let rw = abi::CapRights(0b011);
+        let r_only = abi::CapRights::READ;
         dom.grant(dst.as_u64() >> abi::PAGE_SHIFT, rw);
         dom.grant(src.as_u64() >> abi::PAGE_SHIFT, rw);
+        dom.grant(ro.as_u64() >> abi::PAGE_SHIFT, r_only);
 
-        let mut leaf = |iova: u64, frame: u64| -> bool {
-            if dom.map(iova, frame >> abi::PAGE_SHIFT, rw).is_err() {
+        // The PTE's permission bits are derived FROM the granted rights. They used to be a
+        // constant `IR | IW`: the domain would refuse rights wider than the grant and then
+        // write a read-WRITE entry regardless, so a READ-only grant produced a WRITABLE
+        // mapping. The model's authority reached which FRAME the device could touch but not
+        // what it could DO to it — and nothing caught it, because every grant here happened
+        // to be RW, which made the constant accidentally correct in every case exercised.
+        let mut leaf = |iova: u64, frame: u64, rights: abi::CapRights| -> bool {
+            if dom.map(iova, frame >> abi::PAGE_SHIFT, rights).is_err() {
                 return false;
             }
+            let mut pte = (frame & 0x000F_FFFF_FFFF_F000) | PR | LEAF;
+            if rights.contains(abi::CapRights::READ) {
+                pte |= IR;
+            }
+            if rights.contains(abi::CapRights::WRITE) {
+                pte |= IW;
+            }
             let idx = ((iova >> 12) & 0x1FF) as u64;
-            core::ptr::write_volatile(
-                (l1.as_u64() + idx * 8) as *mut u64,
-                (frame & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | LEAF,
-            );
+            core::ptr::write_volatile((l1.as_u64() + idx * 8) as *mut u64, pte);
             true
         };
-        let dst_ok = leaf(IOVA, dst.as_u64());
-        let src_ok = leaf(IOVA_SRC, src.as_u64());
+        let dst_ok = leaf(IOVA, dst.as_u64(), rw);
+        let src_ok = leaf(IOVA_SRC, src.as_u64(), rw);
 
         // The NEGATIVE case, in the same boot: a frame nobody granted. The domain must refuse
         // it, and because a refusal writes no entry, the device is left unable to reach it —
         // the model's decision and the hardware's behaviour are the same fact.
         let ungranted = fa.alloc_frame().map(|f| zero_frame(f))?;
-        let refused = !leaf(IOVA_UNGRANTED, ungranted.as_u64());
+        for i in 0..8u64 {
+            core::ptr::write_volatile((ungranted.as_u64() + i * 8) as *mut u64, SENTINEL);
+        }
+        let refused = !leaf(IOVA_UNGRANTED, ungranted.as_u64(), rw);
         let _ = writeln!(
             con,
             "[iommu] domain: dst {} src {} ungranted-frame {}",
@@ -1885,18 +2072,68 @@ unsafe fn prove_containment<A: Arch>(
         if !refused || !dst_ok || !src_ok {
             return None;
         }
-        // No invalidation is issued because nothing was ever cached for this domain: the unit
-        // has refused every transfer so far, so there is no stale entry to flush. The moment a
-        // mapping is CHANGED rather than added, this needs the command buffer.
+        // Adding a mapping needs no invalidation: the unit cannot hold a stale translation
+        // for an address it has never successfully translated. Withdrawal is the other case,
+        // and it is handled where the withdrawal happens — this note used to claim nothing was
+        // ever cached at all, which stopped being true one line later, the moment the first
+        // transfer succeeded.
         // Load the pattern through the SOURCE mapping, then read it back through the
         // destination one. Both legs now go through translation, which is the point.
         let in_ok = run(IOVA_SRC, 0x4_0000, false);
         let ok = in_ok && run(0x4_0000, IOVA, true);
         let landed = core::ptr::read_volatile(dst.as_u64() as *const u64);
-        Some((ok, landed, dst.as_u64()))
+
+        // ---- rights, not merely reachability ----
+        //
+        // A frame granted READ and not WRITE. The domain narrows the mapping, the leaf above
+        // therefore writes IR without IW, and the device is then told to WRITE there. The
+        // refusal has to come from the unit's PERMISSION check rather than from an absent
+        // entry: this page is present and is readable, which separates "the device cannot see
+        // it" from "the device may not write it". Every refusal demonstrated until now was of
+        // the first kind.
+        //
+        // It also settles the event log, which has recorded nothing across a refused transfer
+        // and left "refusal not reported" indistinguishable from "our log setup is broken".
+        // QEMU's walker returns SILENTLY when a next-level entry reads as zero — precisely the
+        // empty-table refusal above, blocked correctly and never logged. A PRESENT entry with
+        // insufficient permissions takes the other path, the one that writes an event. So if
+        // the tail moves here and not there, the log works and the earlier zero was the
+        // emulator's shape; if it moves in neither, the fault is ours.
+        for i in 0..8u64 {
+            core::ptr::write_volatile((ro.as_u64() + i * 8) as *mut u64, SENTINEL);
+        }
+        let ro_mapped = leaf(IOVA_RO, ro.as_u64(), r_only);
+        // And the model must refuse WIDER rights than the grant. This goes through `leaf`
+        // rather than calling the model directly, so a wrongly-allowed map would write a real
+        // WRITABLE entry to the same IOVA — meaning the device write below would land and
+        // `ro_seen` would catch it. The check and the consequence are the same code path.
+        let wider_refused = !leaf(IOVA_RO, ro.as_u64(), rw);
+        let tail_ro_before = core::ptr::read_volatile((base + 0x2018) as *const u64);
+        let ro_done = run(0x4_0000, IOVA_RO, true);
+        let ro_seen = first_disturbed(ro.as_u64(), SENTINEL);
+        // And aim one at the ungranted IOVA, so "refused" is something the DEVICE demonstrates.
+        let _ = run(0x4_0000, IOVA_UNGRANTED, true);
+        let ungranted_seen = first_disturbed(ungranted.as_u64(), SENTINEL);
+        let tail_ro_after = core::ptr::read_volatile((base + 0x2018) as *const u64);
+
+        Some((
+            ok,
+            landed,
+            dst.as_u64(),
+            RoProbe {
+                ungranted_seen,
+                frame: ro.as_u64(),
+                mapped: ro_mapped,
+                wider_refused,
+                done: ro_done,
+                seen: ro_seen,
+                tail_before: tail_ro_before,
+                tail_after: tail_ro_after,
+            },
+        ))
     })();
 
-    if let Some((ok, landed, dst)) = translated {
+    if let Some((ok, landed, dst, _)) = translated {
         let _ = writeln!(
             con,
             "[iommu] mapped IOVA {IOVA:#x} -> {dst:#x}; transfer {} and that frame reads \
@@ -1927,8 +2164,68 @@ unsafe fn prove_containment<A: Arch>(
     // only the model would leave the device still able to reach the frame while nothing said
     // it could — the stale-mapping hazard `crates/iommu`'s exhaustive search exists to
     // prevent, which would be a poor thing to demonstrate and then commit here.
-    if let Some((_, _, dst_phys)) = translated {
+    if let Some((_, _, dst_phys, ro)) = translated {
+        let _ = writeln!(
+            con,
+            "[iommu] read-only grant: mapped {} | wider rights {} | device write {} | frame \
+             reads {:#018x} | event tail {:#x} -> {:#x}",
+            if ro.mapped { "yes (IR, no IW)" } else { "NO" },
+            if ro.wider_refused {
+                "refused"
+            } else {
+                "ALLOWED"
+            },
+            if ro.done { "completed" } else { "stuck" },
+            ro.seen,
+            ro.tail_before,
+            ro.tail_after
+        );
+        if ro.seen != SENTINEL {
+            let _ = writeln!(
+                con,
+                "[iommu] (bug) WRITE-THROUGH: a READ-only mapping accepted a device write"
+            );
+        } else {
+            let _ = writeln!(
+                con,
+                "[iommu] RIGHTS ENFORCED: the device could reach that page but not write it"
+            );
+        }
+        if ro.ungranted_seen == SENTINEL {
+            let _ = writeln!(
+                con,
+                "[iommu] UNREACHABLE: the ungranted IOVA was refused by the DEVICE, not just \
+                 by the model (frame still {:#018x})",
+                ro.ungranted_seen
+            );
+        } else {
+            let _ = writeln!(
+                con,
+                "[iommu] (bug) an ungranted IOVA reached its frame ({:#018x})",
+                ro.ungranted_seen
+            );
+        }
+        if ro.tail_after != ro.tail_before {
+            let _ = writeln!(
+                con,
+                "[iommu] EVENT LOGGED: the unit RECORDED the refusal it performed"
+            );
+        } else {
+            let _ = writeln!(
+                con,
+                "[iommu] event log still silent on a permission fault — our setup, not the \
+                 emulator's walk shape"
+            );
+        }
+
         let dom = device_domain();
+        dom.revoke(ro.frame >> abi::PAGE_SHIFT);
+        {
+            let idx = ((IOVA_RO >> 12) & 0x1FF) as u64;
+            if let Some(l1) = *core::ptr::addr_of!(IOMMU_L1) {
+                core::ptr::write_volatile((l1 + idx * 8) as *mut u64, 0);
+            }
+        }
         for (iova, frame) in [(IOVA, dst_phys), (IOVA_SRC, src.as_u64())] {
             dom.revoke(frame >> abi::PAGE_SHIFT);
             let idx = ((iova >> 12) & 0x1FF) as u64;
@@ -1941,23 +2238,102 @@ unsafe fn prove_containment<A: Arch>(
             "[iommu] withdrew both mappings and grants; domain holds {} grant(s)",
             dom.grant_count()
         );
+
+        // ---- does WITHDRAWAL take effect in the HARDWARE? ----
+        //
+        // Clearing the PTE and the model entry was assumed to settle this. It does not. The
+        // unit may CACHE a translation it has already performed, and this exact IOVA was
+        // translated successfully moments ago — so the standing note that "nothing was ever
+        // cached" stopped being true the instant the first transfer succeeded. Clearing a
+        // table without invalidating leaves any cached entry live, and the device keeps
+        // reaching a frame nothing grants it: the stale-mapping hazard `crates/iommu` refuses
+        // in the model, arriving by way of the hardware instead.
+        //
+        // Re-fill with the sentinel and tell the device to write there again. If the pattern
+        // comes back, a withdrawn mapping is still being honoured.
+        let flushed = iommu_invalidate(base);
+        let _ = writeln!(
+            con,
+            "[iommu] invalidation {}",
+            if flushed {
+                "issued and COMPLETED (the unit acknowledged)"
+            } else {
+                "NOT completed — no command buffer, or the unit never acknowledged"
+            }
+        );
+
+        for i in 0..8u64 {
+            core::ptr::write_volatile((dst_phys + i * 8) as *mut u64, SENTINEL);
+        }
+        let _ = run(0x4_0000, IOVA, true);
+        let after_withdraw = first_disturbed(dst_phys, SENTINEL);
+        if after_withdraw == SENTINEL {
+            let _ = writeln!(
+                con,
+                "[iommu] REVOKED: after invalidation the device can no longer reach the frame \
+                 it lost (still {after_withdraw:#018x})"
+            );
+        } else {
+            let _ = writeln!(
+                con,
+                "[iommu] (bug) STALE MAPPING: a withdrawn IOVA still reached its frame \
+                 ({after_withdraw:#018x}) — the table was cleared but the unit was not told"
+            );
+        }
+    }
+
+    // ---- POSITIVE CONTROL for the event log itself ----
+    //
+    // Reported silence means nothing until the log is shown capable of speaking. Bit 2 of DTE
+    // word0 is RESERVED, so a unit that validates the entry must reject it and record an
+    // illegal-device-table-entry event — the one case that cannot be blamed on how a walk is
+    // shaped. The log buffer is read directly rather than the tail register, because a tail
+    // is only evidence if the unit reflects it back through MMIO, and that is the thing in
+    // question.
+    //
+    // It does not move. So the event log is the unfinished part, and every silence reported
+    // above is ours and not the emulator's. The refusals themselves are real and separately
+    // demonstrated by the payload; what is missing is the unit REPORTING them, which a driver
+    // that must diagnose a misbehaving device will need.
+    {
+        let dte = *core::ptr::addr_of!(DEVICE_TABLE_ENTRY);
+        let log = *core::ptr::addr_of!(EVENT_LOG);
+        let before = core::ptr::read_volatile((base + 0x2018) as *const u64);
+        let buf_before = core::ptr::read_volatile(log as *const u64);
+        let w0 = core::ptr::read_volatile(dte as *const u64);
+        core::ptr::write_volatile(dte as *mut u64, w0 | 0b100);
+        // A FRESH IOVA. Reusing one that already translated successfully would be answered
+        // from the unit's cache without the device table being consulted, so the deliberately
+        // invalid entry below would never be looked at and the control would prove nothing.
+        let _ = run(0x4_0000, 0x9000, true);
+        let after = core::ptr::read_volatile((base + 0x2018) as *const u64);
+        let buf_after = core::ptr::read_volatile(log as *const u64);
+        let buf_next = core::ptr::read_volatile((log + 8) as *const u64);
+        core::ptr::write_volatile(dte as *mut u64, w0);
+        let _ = writeln!(
+            con,
+            "[iommu] CONTROL invalid-DTE: tail {before:#x} -> {after:#x}, log word0 \
+             {buf_before:#018x} -> {buf_after:#018x}, word1 {buf_next:#018x}"
+        );
     }
 
     // The PAYLOAD is the oracle, not the event log. Measured both ways with the same code and
     // the same device, differing only in whether the unit was translating:
-    //   translation OFF -> target reads 0xd1ce...  (the transfer lands)
-    //   translation ON  -> target reads 0x0        (the transfer is refused)
+    //   translation OFF -> target reads 0xd1ce...   (the transfer lands)
+    //   translation ON  -> target still reads the SENTINEL it was filled with (refused)
     // That difference is the containment result. The event log is a separate question and is
     // reported separately, because a refusal that is not RECORDED is still a refusal.
-    if wrote == PATTERN {
+    if wrote != SENTINEL {
         let _ = writeln!(
             con,
-            "[iommu] NOT CONTAINED: the device wrote through to memory it was not granted"
+            "[iommu] NOT CONTAINED: the target frame changed ({wrote:#018x}) — the device wrote \
+             to memory it was not granted"
         );
     } else {
         let _ = writeln!(
             con,
-            "[iommu] CONTAINED: the transfer completed at the device and NOTHING reached memory"
+            "[iommu] CONTAINED: the transfer completed at the device and the target frame is \
+             UNTOUCHED (still {wrote:#018x})"
         );
     }
 

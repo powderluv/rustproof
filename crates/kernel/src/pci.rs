@@ -62,7 +62,7 @@ impl Function {
 /// # Safety
 /// Touches the global 0xCF8/0xCFC pair. Single-CPU, non-reentrant, kernel-only: no other agent
 /// may be mid-config-cycle, which holds because nothing else in this nucleus performs one.
-unsafe fn read32(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
+unsafe fn read32(bus: u8, dev: u8, func: u8, off: u16) -> u32 {
     let addr = 0x8000_0000
         | ((bus as u32) << 16)
         | ((dev as u32) << 11)
@@ -157,7 +157,12 @@ pub unsafe fn amd_vi_cap(func: &Function) -> Option<AmdViCap> {
     if status & (1 << 4) == 0 {
         return None;
     }
-    let mut off = (read32(func.bus, func.dev, func.func, 0x34) & 0xFC) as u8;
+    // u16, not u8. A capability may legally sit at 0xF8 or 0xFC, where `off + 0x08` wraps a
+    // u8 — silently in release, since overflow-checks are off there, so the aperture base
+    // would be composed from the Vendor/Device ID registers instead. The walk was already
+    // hardened against a circular list and a below-header pointer; this was the same
+    // outside-the-TCB input at the other end.
+    let mut off = (read32(func.bus, func.dev, func.func, 0x34) & 0xFC) as u16;
     // A malformed list can be circular. Config space holds at most 48 capabilities, so a walk
     // longer than that is a loop and must terminate rather than hang the boot.
     for _ in 0..48 {
@@ -169,6 +174,10 @@ pub unsafe fn amd_vi_cap(func: &Function) -> Option<AmdViCap> {
             if (header >> 16) & 0x7 != CAP_TYPE_IOMMU {
                 return None;
             }
+            // Both registers must lie inside the 256-byte config header.
+            if off + 0x08 > 0xFF {
+                return None;
+            }
             let lo = read32(func.bus, func.dev, func.func, off + 0x04);
             let hi = read32(func.bus, func.dev, func.func, off + 0x08);
             return Some(AmdViCap {
@@ -177,7 +186,7 @@ pub unsafe fn amd_vi_cap(func: &Function) -> Option<AmdViCap> {
                 enabled: lo & 1 != 0,
             });
         }
-        off = ((header >> 8) & 0xFC) as u8;
+        off = ((header >> 8) & 0xFC) as u16;
         if off == 0 {
             return None;
         }
