@@ -234,6 +234,13 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${IOMMU:-0}" = "1" ] &&
         # BOTH halves, and the second is what makes the first mean something: blocking
         # everything is what a broken unit also does. A granted IOVA must reach exactly its
         # frame, or the "containment" above is indistinguishable from a wall.
+        # The model must GOVERN the hardware: a frame no capability granted must be refused a
+        # page-table entry. Without this, "translated" only shows the table works, not that
+        # anything decides what goes in it.
+        if ! echo "$OUT" | grep -q 'ungranted-frame refused (no PTE written)'; then
+            echo "RESULT: FAIL — the domain let an ungranted frame into the I/O page table"
+            exit 1
+        fi
         if ! echo "$OUT" | grep -q '\[iommu\] TRANSLATED:'; then
             echo "RESULT: FAIL — a GRANTED IOVA did not reach its frame; the unit is refusing"
             echo "  everything rather than enforcing a policy"

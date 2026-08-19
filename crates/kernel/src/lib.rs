@@ -391,6 +391,11 @@ static mut EVENT_LOG: u64 = 0;
 /// Physical base of the device domain's I/O page-table root, or 0 if none is programmed.
 #[cfg(target_arch = "x86_64")]
 static mut IOMMU_PT_ROOT: u64 = 0;
+
+/// The last-level I/O page table of the proof's mapping, so its leaves can be cleared when the
+/// grants are withdrawn.
+#[cfg(target_arch = "x86_64")]
+static mut IOMMU_L1: Option<u64> = None;
 /// Pages of that window. One page for now: the frame allocator makes no contiguity
 /// promise, and a real BAR is a contiguous physical range, so a larger stand-in would
 /// have to reserve one deliberately.
@@ -1805,6 +1810,7 @@ unsafe fn prove_containment<A: Arch>(
     const LEAF: u64 = 0 << 9;
     const IOVA: u64 = 0x1000;
     const IOVA_SRC: u64 = 0x2000;
+    const IOVA_UNGRANTED: u64 = 0x3000;
 
     // BOTH directions need a mapping. The first attempt mapped only the destination and got
     // "NOT TRANSLATED" — because the inbound RAM->device transfer that loads the pattern was
@@ -1814,6 +1820,8 @@ unsafe fn prove_containment<A: Arch>(
     let translated = (|| {
         let l2 = fa.alloc_frame().map(|f| zero_frame(f))?;
         let l1 = fa.alloc_frame().map(|f| zero_frame(f))?;
+        // SAFETY: single-CPU boot path.
+        IOMMU_L1 = Some(l1.as_u64());
         let dst = fa.alloc_frame().map(|f| zero_frame(f))?;
         // Mode 3 walks root -> L2 -> L1 -> page, indexed by IOVA[38:30], [29:21], [20:12].
         let root = *core::ptr::addr_of!(IOMMU_PT_ROOT);
@@ -1828,16 +1836,55 @@ unsafe fn prove_containment<A: Arch>(
             (l2.as_u64() + i2 * 8) as *mut u64,
             (l1.as_u64() & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | NEXT_LEVEL_1,
         );
-        core::ptr::write_volatile(
-            (l1.as_u64() + i1 * 8) as *mut u64,
-            (dst.as_u64() & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | LEAF,
+        // ---- the DOMAIN decides; the page table only records what it allowed ----
+        //
+        // `crates/iommu` has been exhaustively host-tested since it was written, and until now
+        // it ran BESIDE the hardware: the model said what was authorized while these stores
+        // said what the device could reach, and nothing tied the two together. A model with no
+        // authority over the machine it models is documentation.
+        //
+        // So every leaf below goes through `Domain::map`, which refuses a frame no capability
+        // granted and refuses rights wider than the grant. A refusal writes NO page-table
+        // entry, which is what makes the tie observable: an ungranted frame stays unreachable
+        // by the device, not merely unrecorded in a table.
+        let dom = device_domain();
+        let rw = abi::CapRights(0b011);
+        dom.grant(dst.as_u64() >> abi::PAGE_SHIFT, rw);
+        dom.grant(src.as_u64() >> abi::PAGE_SHIFT, rw);
+
+        let mut leaf = |iova: u64, frame: u64| -> bool {
+            if dom.map(iova, frame >> abi::PAGE_SHIFT, rw).is_err() {
+                return false;
+            }
+            let idx = ((iova >> 12) & 0x1FF) as u64;
+            core::ptr::write_volatile(
+                (l1.as_u64() + idx * 8) as *mut u64,
+                (frame & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | LEAF,
+            );
+            true
+        };
+        let dst_ok = leaf(IOVA, dst.as_u64());
+        let src_ok = leaf(IOVA_SRC, src.as_u64());
+
+        // The NEGATIVE case, in the same boot: a frame nobody granted. The domain must refuse
+        // it, and because a refusal writes no entry, the device is left unable to reach it —
+        // the model's decision and the hardware's behaviour are the same fact.
+        let ungranted = fa.alloc_frame().map(|f| zero_frame(f))?;
+        let refused = !leaf(IOVA_UNGRANTED, ungranted.as_u64());
+        let _ = writeln!(
+            con,
+            "[iommu] domain: dst {} src {} ungranted-frame {}",
+            if dst_ok { "mapped" } else { "REFUSED" },
+            if src_ok { "mapped" } else { "REFUSED" },
+            if refused {
+                "refused (no PTE written)"
+            } else {
+                "MAPPED — the domain let an ungranted frame through"
+            }
         );
-        // A second leaf for the SOURCE frame, one IOVA higher.
-        let i1_src = ((IOVA_SRC >> 12) & 0x1FF) as u64;
-        core::ptr::write_volatile(
-            (l1.as_u64() + i1_src * 8) as *mut u64,
-            (src.as_u64() & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | LEAF,
-        );
+        if !refused || !dst_ok || !src_ok {
+            return None;
+        }
         // No invalidation is issued because nothing was ever cached for this domain: the unit
         // has refused every transfer so far, so there is no stale entry to flush. The moment a
         // mapping is CHANGED rather than added, this needs the command buffer.
@@ -1867,6 +1914,33 @@ unsafe fn prove_containment<A: Arch>(
                 "[iommu] NOT TRANSLATED: a granted IOVA did not reach its frame"
             );
         }
+    }
+
+    // ---- withdraw: the model AND the hardware, in that order ----
+    //
+    // The proof's grants are not a standing authority — the device has no business reaching
+    // those frames afterwards, and the boot's own consistency check (grants must equal live
+    // DMA pages) would otherwise fail, correctly, because two grants would be outstanding with
+    // no region behind them. That check catching this is the check working.
+    //
+    // Mappings go before grants, and the PTE is cleared as well as the model entry. Clearing
+    // only the model would leave the device still able to reach the frame while nothing said
+    // it could — the stale-mapping hazard `crates/iommu`'s exhaustive search exists to
+    // prevent, which would be a poor thing to demonstrate and then commit here.
+    if let Some((_, _, dst_phys)) = translated {
+        let dom = device_domain();
+        for (iova, frame) in [(IOVA, dst_phys), (IOVA_SRC, src.as_u64())] {
+            dom.revoke(frame >> abi::PAGE_SHIFT);
+            let idx = ((iova >> 12) & 0x1FF) as u64;
+            if let Some(l1) = *core::ptr::addr_of!(IOMMU_L1) {
+                core::ptr::write_volatile((l1 + idx * 8) as *mut u64, 0);
+            }
+        }
+        let _ = writeln!(
+            con,
+            "[iommu] withdrew both mappings and grants; domain holds {} grant(s)",
+            dom.grant_count()
+        );
     }
 
     // The PAYLOAD is the oracle, not the event log. Measured both ways with the same code and

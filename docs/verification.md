@@ -51,6 +51,35 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-18 — the MODEL now governs the MACHINE
+
+`crates/iommu`'s `Domain` has been exhaustively host-tested since it was written, and until now
+it ran BESIDE the hardware: the model said what was authorized while separate stores said what
+the device could reach, and nothing tied them together. A model with no authority over the thing
+it models is documentation.
+
+Every I/O page-table leaf now goes through `Domain::map`, which refuses a frame no capability
+granted and refuses rights wider than the grant. A refusal writes NO entry, which is what makes
+the tie observable rather than structural — an ungranted frame is left UNREACHABLE by the
+device, not merely unrecorded in a table. In one boot:
+
+```
+[iommu] domain: dst mapped src mapped ungranted-frame refused (no PTE written)
+[iommu] TRANSLATED: the same device reached exactly the frame it was granted
+[iommu] withdrew both mappings and grants; domain holds 0 grant(s)
+[iommu] CONTAINED: the transfer completed at the device and NOTHING reached memory
+```
+
+The withdrawal is not tidiness. The proof's grants are not a standing authority, and the boot's
+own consistency check — grants must equal live DMA pages — FAILED when two were left
+outstanding with no region behind them. That check catching this is the check working. Mappings
+are withdrawn before grants and the PTE is cleared as well as the model entry: clearing only the
+model would leave the device able to reach a frame nothing said it could, which is the exact
+stale-mapping hazard the crate's exhaustive search exists to prevent.
+
+The runner gates on the refusal as well as the translation. Without it, "translated" shows only
+that the table works, not that anything decides what goes into it.
+
 ## 2026-08-18 — THE LOOP IS CLOSED: refused where unmapped, delivered where granted
 
 In one boot, on one unit, with one device:
