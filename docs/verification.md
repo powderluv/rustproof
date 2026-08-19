@@ -117,13 +117,30 @@ Also fixed: the AMD-Vi capability walk did `u8` arithmetic on offsets that legal
 Vendor/Device ID registers); and `PageFlags::NO_CACHE` was pinned by no test, so zeroing it left
 every suite green while the boot still printed "aperture mapped uncached".
 
-**Still not proven: the event log records nothing.** Now attributable rather than vague. A
-positive control deliberately corrupts the DTE with a reserved bit — the one refusal that cannot
-be blamed on the shape of a page-table walk — and reads the log BUFFER directly rather than the
-tail register, since a tail is only evidence if the unit reflects it back. Nothing is written.
-So the log is the unfinished part and the silence is ours, not the emulator's. The refusals
-themselves are real and separately demonstrated by the payload; what is missing is the unit
-REPORTING them, which a driver diagnosing a misbehaving device will need.
+**Still not proven: the event log records nothing — and the cause is UNRESOLVED.** Correcting
+the previous entry, which said the silence was ours: that was asserted on no more evidence than
+the silence itself, which is the same move this document exists to catch.
+
+`QEMU_TRACE='amdvi_*'` (new hook in `tools/run-qemu.sh`, output to its own file) shows the unit
+DOES detect the errors — `amdvi_invalid_dte` sixteen times, `amdvi_unhandled_command` once — and
+upstream 8.2.2's source has every one of those paths call `amdvi_log_event`. Yet no event appears.
+Measured, and therefore ruled out: logging disabled (the unit's own STATUS reports EventLogRun=1),
+overflow (EventOverflow=0, and that path would set it), a failed write (`amdvi_evntlog_fail` never
+fires), reading the wrong entry (the whole 4 KiB ring is scanned), unmapped registers (four
+aperture pages mapped, STATUS reads sensibly), and "the unit cannot write our memory"
+(COMPLETION_WAIT's store lands every boot). Observation and upstream source disagree; the next
+step is the distro build's actual sources rather than another guess.
+
+Two positive controls now exist for it — a DTE corrupted with a reserved bit, and an illegal
+command opcode — because reported silence means nothing until the log is shown capable of
+speaking. Neither speaks. The refusals themselves are real and separately demonstrated by the
+payload; what is missing is the unit REPORTING them.
+
+One process note worth keeping: turning the trace on made the run FAIL. QEMU writes trace lines
+to stderr, the runner merges that into the serial stream, and 392 interleaved lines chopped a
+gate string in half — the assertion was present in the output and the gate missed it. Test
+through the harness: an unintended difference is indistinguishable from the bug being hunted.
+The hook now sends trace output to its own file.
 
 The lesson worth keeping: an exhaustive search over an API proves things about the API. It says
 nothing about a predicate that the API is designed never to falsify. Testing a checker means

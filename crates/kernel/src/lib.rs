@@ -2214,8 +2214,8 @@ unsafe fn prove_containment<A: Arch>(
         } else {
             let _ = writeln!(
                 con,
-                "[iommu] event log still silent on a permission fault — our setup, not the \
-                 emulator's walk shape"
+                "[iommu] event log silent on a permission fault (see the controls below for \
+                 what that does and does not show)"
             );
         }
 
@@ -2292,10 +2292,25 @@ unsafe fn prove_containment<A: Arch>(
     // is only evidence if the unit reflects it back through MMIO, and that is the thing in
     // question.
     //
-    // It does not move. So the event log is the unfinished part, and every silence reported
-    // above is ours and not the emulator's. The refusals themselves are real and separately
-    // demonstrated by the payload; what is missing is the unit REPORTING them, which a driver
-    // that must diagnose a misbehaving device will need.
+    // It does not move, and neither does the illegal-command control below. The attribution
+    // is UNRESOLVED and deliberately not asserted either way — an earlier version of this
+    // comment claimed the fault was ours, on no more evidence than the silence itself.
+    //
+    // What the instrumentation has RULED OUT, all measured on this rig:
+    //   - not "logging disabled": the unit reports EventLogRun=1 in its own STATUS register,
+    //     which QEMU sets exactly when it considers event logging enabled;
+    //   - not overflow: EventOverflow=0, and the overflow path would set it;
+    //   - not a failed log write: the `amdvi_evntlog_fail` trace point never fires;
+    //   - not "we read the wrong entry": the whole 4 KiB ring is scanned, not word 0;
+    //   - not unmapped registers: four aperture pages are mapped and STATUS reads sensibly;
+    //   - not "the unit cannot write our memory": COMPLETION_WAIT's store lands every boot.
+    // And the unit DOES detect these errors — `amdvi_invalid_dte` fires sixteen times and
+    // `amdvi_unhandled_command` once (QEMU_TRACE='amdvi_*'), while upstream 8.2.2 has every
+    // one of those paths call `amdvi_log_event`. Observation and source disagree, so the next
+    // step is the distro build's actual sources, not another guess.
+    //
+    // The refusals themselves are real and separately demonstrated by the payload. What is
+    // missing is the unit REPORTING them, which a driver diagnosing a bad device will need.
     {
         let dte = *core::ptr::addr_of!(DEVICE_TABLE_ENTRY);
         let log = *core::ptr::addr_of!(EVENT_LOG);
@@ -2316,6 +2331,68 @@ unsafe fn prove_containment<A: Arch>(
             "[iommu] CONTROL invalid-DTE: tail {before:#x} -> {after:#x}, log word0 \
              {buf_before:#018x} -> {buf_after:#018x}, word1 {buf_next:#018x}"
         );
+    }
+
+    // ---- POSITIVE CONTROL, take two: an ILLEGAL COMMAND ----
+    //
+    // The DTE probe above cannot answer the question. QEMU's trace shows `amdvi_invalid_dte`
+    // firing for it — the entry IS rejected — and still no event is written, so this emulator
+    // does not report that class either, and a second silence adds nothing.
+    //
+    // An unknown command opcode is a different path, and the one whose logging is actually
+    // evidenced: the command buffer works end to end here (COMPLETION_WAIT's store lands), so
+    // if an event never appears for a command the unit itself calls illegal, the log is ours.
+    // Done last, because an illegal command may stop the command processor.
+    {
+        let log = *core::ptr::addr_of!(EVENT_LOG);
+        let before = core::ptr::read_volatile(log as *const u64);
+        let _ = iommu_cmd(base, [0, 0xF << 28, 0, 0]);
+        // The unit consumes the ring asynchronously; give it a bounded chance to be seen.
+        for _ in 0..1_000_000u64 {
+            if core::ptr::read_volatile(log as *const u64) != before {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        let after = core::ptr::read_volatile(log as *const u64);
+        // Scan the WHOLE ring, not word 0. If the unit wrote at a nonzero tail offset — a
+        // stale internal tail, a different base than the one we programmed — checking only the
+        // first entry would report silence for a log that is in fact being written.
+        let mut nonzero_at = -1i64;
+        for i in 0..512u64 {
+            if core::ptr::read_volatile((log + i * 8) as *const u64) != 0 {
+                nonzero_at = (i * 8) as i64;
+                break;
+            }
+        }
+        let head = core::ptr::read_volatile((base + 0x2010) as *const u64);
+        let tail = core::ptr::read_volatile((base + 0x2018) as *const u64);
+        // The unit's own STATUS register, which is what settles WHY nothing is logged. The
+        // emulator's log path has exactly three early-outs — logging disabled, the overflow
+        // bit already set, or a zero-length ring — and two of them are visible right here:
+        // EventLogRun (bit 3) is set iff it considers logging enabled, and EventOverflow
+        // (bit 0) is the second. Reading it beats inferring from silence.
+        let status = core::ptr::read_volatile((base + 0x2020) as *const u64);
+        let _ = writeln!(
+            con,
+            "[iommu] STATUS {status:#018x} (EventOverflow={}, EventLogRun={}, CmdBufRun={})",
+            status & 1,
+            (status >> 3) & 1,
+            (status >> 4) & 1
+        );
+        if after != before {
+            let _ = writeln!(
+                con,
+                "[iommu] EVENT LOG WORKS: an illegal command was RECORDED — log word0 \
+                 {after:#018x}, head {head:#x} tail {tail:#x}"
+            );
+        } else {
+            let _ = writeln!(
+                con,
+                "[iommu] event log wrote NOTHING even for an illegal command (head {head:#x} \
+                 tail {tail:#x}, first nonzero byte in the 4 KiB ring: {nonzero_at})"
+            );
+        }
     }
 
     // The PAYLOAD is the oracle, not the event log. Measured both ways with the same code and

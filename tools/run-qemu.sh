@@ -111,8 +111,26 @@ if [ "${IOMMU:-0}" = "1" ]; then
     echo "== IOMMU rig: q35 + emulated AMD-Vi =="
 fi
 
+# Diagnostic hook: QEMU_TRACE='amdvi_*' turns on the emulator's own trace points, which is the
+# only way to see which path a refusal took inside the unit rather than inferring it from the
+# outside. Reasoning about QEMU's internals from memory is what produced several of the oracle
+# failures in docs/verification.md; this observes them instead. Off by default — the extra output
+# is noise for every other run.
+# Trace output goes to its OWN file via -D. It used to land on stderr, which run-qemu.sh merges
+# into the serial stream — and 392 interleaved trace lines chop serial lines in half, so a gate
+# string stops matching and the run "fails" for a reason that has nothing to do with the guest.
+# That cost one confusing FAIL: the assertion was present in the output and the gate still missed
+# it.
+TRACE=()
+if [ -n "${QEMU_TRACE:-}" ]; then
+    : "${QEMU_TRACE_FILE:=/tmp/qemu-amdvi-trace.log}"
+    TRACE=(-trace "$QEMU_TRACE" -D "$QEMU_TRACE_FILE")
+    echo "== qemu trace: $QEMU_TRACE -> $QEMU_TRACE_FILE =="
+fi
+
 feed_console_byte | timeout 30 qemu-system-x86_64 \
     "${MACHINE[@]}" \
+    "${TRACE[@]}" \
     -kernel "$KERNEL" \
     -m 512M \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
