@@ -309,6 +309,40 @@ fi
 
 # Scoped off under PROVOKE_FAULT, which kills the guest long before the demo gets here —
 # the same scoping the clock gate above needs, and for the same reason.
+# DMA reach is a capability. All three refusals are asserted on EVERY x86 boot, IOMMU rig or
+# not: the two halves of the gate (a domain cap without WRITE, and no domain cap at all) plus
+# the refusal to hand out reach on a machine with no unit to bound it. The last is the one that
+# would otherwise be tempting to soften into a no-op success.
+for want in \
+    'dma: an IommuDomain cap without WRITE cannot grant DMA reach' \
+    'role: producer cannot grant DMA reach (no domain capability at all)'; do
+    if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ] \
+        && ! echo "$OUT" | grep -qF "$want"; then
+        echo "RESULT: FAIL — a required assertion never ran: $want"
+        exit 1
+    fi
+done
+# And the outcome that depends on whether a unit exists — keyed on what the BOOT reports about
+# the machine, not on what the env flags imply about it. Keying it on IOMMU=1 && FIRMWARE=1 was
+# wrong: `IOMMU=1` alone also finds IVRS and enables the unit, so the run that was supposed to
+# demonstrate the refusal was demonstrating the mapping, and the gate failed a working boot.
+if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ]; then
+    if echo "$OUT" | grep -q 'unit ENABLED'; then
+        if ! echo "$OUT" | grep -q 'dma: the device can now reach our region by DMA'; then
+            echo "RESULT: FAIL — MAP_DMA did not hand out reach on a rig that HAS an IOMMU"
+            exit 1
+        fi
+        if ! echo "$OUT" | grep -q 'dma: UNMAP_DMA withdrew it and invalidated the unit'; then
+            echo "RESULT: FAIL — a DMA mapping was made and never withdrawn"
+            exit 1
+        fi
+    elif ! echo "$OUT" | grep -q 'dma: no IOMMU on this machine, so MAP_DMA refuses'; then
+        echo "RESULT: FAIL — with no IOMMU programmed, MAP_DMA must refuse rather than hand"
+        echo "  out DMA reach that nothing bounds"
+        exit 1
+    fi
+fi
+
 for want in 'share: a WRITABLE borrower still cannot destroy what it borrowed'; do
     if [ "${PROVOKE_FAULT:-0}" != "1" ] && ! echo "$OUT" | grep -qF "$want"; then
         echo "RESULT: FAIL — a required assertion never ran: $want"

@@ -331,6 +331,35 @@ pub mod sysno {
     /// it and invalidates every capability naming it, so no mapping and no authority
     /// survives the memory.
     pub const FREE_REGION: u64 = 16;
+    /// Give a DEVICE the ability to reach a region by DMA: `a0` = an `IommuDomain` capability
+    /// (needs `WRITE` — handing out DMA reach is granting authority, not observing it), `a1` =
+    /// a `Region` capability (needs `READ`). Returns the I/O virtual address the KERNEL chose,
+    /// or `NO_CAP` / `NO_MEM`.
+    ///
+    /// The device may WRITE the region only if the caller's own `Region` capability carries
+    /// `WRITE`, exactly as [`MAP_REGION`] decides a CPU mapping's permissions from the
+    /// holder's rights rather than the request's. Two capabilities are required because two
+    /// separate authorities are involved: over the memory, and over the device's DMA domain.
+    ///
+    /// Refused with `NO_MEM` when no IOMMU is programmed. The nucleus will not hand out DMA
+    /// reach it cannot contain — on a machine with no unit, a "granted" mapping would be
+    /// indistinguishable from unrestricted access to all of memory.
+    ///
+    /// No user-supplied address reaches the I/O page tables: the kernel picks the IOVA, the
+    /// same rule [`MAP_REGION`] follows for virtual addresses.
+    pub const MAP_DMA: u64 = 17;
+    /// Withdraw a DMA mapping: `a0` = the `IommuDomain` capability (needs `WRITE`), `a1` = the
+    /// same `Region` capability that was mapped (needs `READ`). Returns `OK`, or `NO_CAP`.
+    ///
+    /// The REGION is named, not the address. An IOVA travelling back in from userland would be
+    /// a user-supplied address reaching the I/O page-table path, which is the thing [`MAP_DMA`]
+    /// is careful to avoid on the way out.
+    ///
+    /// Clears the I/O page-table entries, drops the domain's grants, AND invalidates the unit's
+    /// caches before returning. Clearing a table is not revocation while a translation the unit
+    /// already performed is still cached — measured on the rig, where the device went on
+    /// reaching a withdrawn frame until the invalidation was issued.
+    pub const UNMAP_DMA: u64 = 18;
     /// Revoke every capability DELEGATED from `a0` (one of the caller's own capabilities),
     /// transitively — the children it was handed to and the grandchildren they passed it on
     /// to. Returns `OK`, or `NO_CAP` if the caller does not hold `a0`. The caller keeps its

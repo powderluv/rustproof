@@ -51,6 +51,50 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-19 — DMA reach becomes a CAPABILITY
+
+`CapType::IommuDomain` had a referent since the IOMMU work but no ABI: the nucleus programmed
+the I/O page tables from its own boot path, so "the driver is an untrusted process that reaches
+hardware only through capabilities" had nothing behind it for the one thing a driver
+fundamentally needs. Syscalls stopped at `FREE_REGION`.
+
+`MAP_DMA`/`UNMAP_DMA` close that. Two capabilities are required, because two separate
+authorities are involved: an `IommuDomain` carrying WRITE (handing a device the ability to reach
+memory is GRANTING authority, not observing it) and a `Region` carrying READ. The kernel picks
+the IOVA — no user-supplied address reaches the I/O page tables, the same rule `MAP_REGION`
+follows for virtual addresses. The device may WRITE the region only if the caller's own region
+capability carries WRITE, so a READ-only loan produces a read-only I/O mapping; `Domain::map`
+enforces that, and a refusal writes no page-table entry.
+
+The grant half already existed — `make_region` grants each page into the device domain as it
+allocates it, which is what the boot's `grants == live region pages` check has been asserting.
+What was missing was the MAPPING half and any way to ask for it.
+
+**With no unit programmed, `MAP_DMA` refuses** (`NO_MEM`) rather than quietly succeeding. On such
+a machine a "granted" mapping and unrestricted access to all of memory are the same thing, and
+the caller cannot tell them apart. The mutant that returns a plausible IOVA instead dies.
+
+Three refusals are asserted on every x86 boot, and all three are reachable because the demo
+holds the capabilities needed to reach them: a domain cap WITHOUT WRITE (the rights half), no
+domain cap at all (the type half, from the producer role), and the no-unit case. The rights half
+is exercised from a process holding BOTH caps — which the note in `grants_for` records the
+`Mmio` case as NOT doing, leaving its check vacuous on hardware. Under-powered capabilities of
+the right type are granted rather than merely described, for the same reason.
+
+Also hoisted: the I/O page table's lower two levels are now built where the DTE is programmed
+rather than inside the containment demo, since a syscall has to write a leaf into a table that
+exists whether or not the demo ran. Both levels stay empty, so what can be REACHED is unchanged.
+
+Two process notes, both the same lesson twice:
+- A hand-run `cargo build -p init` failed to link (`R_X86_64_32S out of range`). I "fixed" the
+  code model globally, which broke the nucleus into an empty serial log. The runner had been
+  passing `-C code-model=large` for init all along, with a comment saying exactly why. Nothing
+  was wrong; I had built it out-of-band.
+- The first version of the new gate keyed on `IOMMU=1 && FIRMWARE=1` to decide whether a unit
+  exists. `IOMMU=1` alone also finds IVRS and enables the unit, so the run meant to demonstrate
+  the refusal was demonstrating the mapping, and the gate failed a working boot. It now keys on
+  what the boot REPORTS about the machine rather than on what a flag implies about it.
+
 ## 2026-08-18 (later) — the adversarial review, and the checker that could not fail
 
 Six items, mostly of the same family: a mechanism whose check could not fail, or a claim written

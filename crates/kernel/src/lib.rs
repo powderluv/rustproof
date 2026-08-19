@@ -937,6 +937,28 @@ fn caps_region(
     }
 }
 
+/// Resolve one capability id to the IOMMU DOMAIN it names, enforcing type AND rights.
+///
+/// `IommuDomain` was an `abi::CapType` variant with a kernel-side referent and no way to reach
+/// it: the nucleus programmed the I/O page tables from its own boot path, so "the driver is an
+/// untrusted process that reaches hardware only through capabilities" had no ABI behind it for
+/// the one thing a driver fundamentally needs. This is the gate for that.
+///
+/// WRITE, not READ. Handing a device the ability to reach memory is granting authority, and a
+/// capability that only permits looking at a domain must not permit extending it.
+fn caps_iommu_domain(
+    caps: &capabilities::CapSpace<CAP_SLOTS>,
+    cap: abi::CapId,
+    needed: abi::CapRights,
+) -> Option<u64> {
+    let slot = caps.lookup(cap)?;
+    if slot.cap_type == abi::CapType::IommuDomain && slot.rights.contains(needed) {
+        Some(slot.object)
+    } else {
+        None
+    }
+}
+
 /// Resolve one capability id to the endpoint it names, enforcing type AND rights.
 fn caps_endpoint_object(
     caps: &capabilities::CapSpace<CAP_SLOTS>,
@@ -1103,6 +1125,14 @@ fn grants_for(role: Role) -> &'static [(abi::CapType, abi::CapRights, u64)] {
             // capability for one line can never read or clear another's" is true only
             // because there is no other line.
             (abi::CapType::Irq, abi::CapRights::READ, IRQ_CONSOLE),
+            // CapId(8)/CapId(9): the device's DMA domain, and the same domain WITHOUT WRITE.
+            // The under-powered one is here rather than merely described, because the note
+            // above records what happens otherwise: three rights checks turned out to be
+            // vacuous on hardware precisely because no under-powered capability of the right
+            // type was granted to anyone, so the refusing branch could not be reached. Both
+            // are exercised by the demo — the first maps, the second is refused.
+            (abi::CapType::IommuDomain, abi::CapRights::ALL, 0),
+            (abi::CapType::IommuDomain, abi::CapRights::READ, 0),
         ],
         // Nothing. A spawned process begins with no authority of its own; what it can do is
         // exactly what its parent delegated (never more — the rights are intersected), so
@@ -1594,6 +1624,30 @@ unsafe fn program_dte<A: Arch>(
     let w0 = V | TV | MODE_3_LEVEL | (root.as_u64() & 0x000F_FFFF_FFFF_F000) | IR | IW;
     // SAFETY: single-CPU boot path.
     IOMMU_PT_ROOT = root.as_u64();
+
+    // The lower two levels are built HERE, not in the demo that first needed them. A syscall
+    // that maps DMA has to write a leaf into a table that already exists, and while the demo
+    // owned the L2/L1 allocation the table only existed if the demo happened to run. Both
+    // levels stay EMPTY: an entry per level covering IOVA 0..2 MiB, with no leaf under it, so
+    // this changes what can be REACHED not at all — every address still resolves to a
+    // not-present leaf until something writes one.
+    const PR: u64 = 1 << 0;
+    const NEXT_LEVEL_2: u64 = 2 << 9;
+    const NEXT_LEVEL_1: u64 = 1 << 9;
+    if let (Some(l2), Some(l1)) = (
+        fa.alloc_frame().map(|f| zero_frame(f)),
+        fa.alloc_frame().map(|f| zero_frame(f)),
+    ) {
+        core::ptr::write_volatile(
+            root.as_u64() as *mut u64,
+            (l2.as_u64() & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | NEXT_LEVEL_2,
+        );
+        core::ptr::write_volatile(
+            l2.as_u64() as *mut u64,
+            (l1.as_u64() & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | NEXT_LEVEL_1,
+        );
+        IOMMU_L1 = Some(l1.as_u64());
+    }
     let w1: u64 = 0; // domain 0
 
     let dte = (dt + bdf * 32) as *mut u64;
@@ -1791,6 +1845,152 @@ unsafe fn iommu_invalidate(base: u64) -> bool {
     false
 }
 
+/// I/O page-table entry bits, shared by the boot demo and the `MAP_DMA` path so the two cannot
+/// drift into writing different-looking entries for the same intent.
+#[cfg(target_arch = "x86_64")]
+mod iopte {
+    pub const PR: u64 = 1 << 0;
+    pub const IR: u64 = 1 << 61;
+    pub const IW: u64 = 1 << 62;
+    pub const LEAF: u64 = 0 << 9;
+    pub const ADDR: u64 = 0x000F_FFFF_FFFF_F000;
+
+    /// The entry for `frame` with `rights`, permission bits DERIVED rather than constant.
+    pub fn leaf(frame: u64, rights: abi::CapRights) -> u64 {
+        let mut pte = (frame & ADDR) | PR | LEAF;
+        if rights.contains(abi::CapRights::READ) {
+            pte |= IR;
+        }
+        if rights.contains(abi::CapRights::WRITE) {
+            pte |= IW;
+        }
+        pte
+    }
+}
+
+/// The IOVA window `MAP_DMA` allocates from: L1 slots 256..512, i.e. IOVA 0x10_0000..0x20_0000.
+/// Inside the single L1 table (which covers 0..2 MiB) and above every IOVA the boot demo uses,
+/// so the demo and userland cannot collide.
+#[cfg(target_arch = "x86_64")]
+const DMA_IOVA_FIRST_SLOT: u64 = 256;
+#[cfg(target_arch = "x86_64")]
+const DMA_IOVA_SLOTS: u64 = 256;
+
+/// Index of the live region with identity `id`.
+#[cfg(target_arch = "x86_64")]
+unsafe fn region_index(id: u64) -> Option<usize> {
+    (0..MAX_REGIONS).find(|&i| {
+        let r = &*core::ptr::addr_of!(REGIONS[i]);
+        r.live && r.id == id
+    })
+}
+
+/// Give the device DMA reach to every page of a region, at an IOVA the KERNEL picks.
+///
+/// The grant already exists — `make_region` grants each page into the device domain as it
+/// allocates it — so this adds the MAPPING half, which nothing could previously ask for. The
+/// domain still decides: `Domain::map` refuses rights wider than the grant, and a refusal
+/// writes no page-table entry, so a borrower holding a READ-only capability gets a read-only
+/// I/O mapping rather than the owner's.
+///
+/// # Safety
+/// Single-CPU, non-reentrant.
+#[cfg(target_arch = "x86_64")]
+unsafe fn map_dma(region_id: u64, rights: abi::CapRights) -> u64 {
+    // No unit programmed means no containment. Refuse rather than hand out reach that nothing
+    // bounds — on such a machine a "granted" mapping and unrestricted access to all of memory
+    // are the same thing, and the caller has no way to tell them apart.
+    let Some(l1) = *core::ptr::addr_of!(IOMMU_L1) else {
+        return abi::syserr::NO_MEM;
+    };
+    let Some(ri) = region_index(region_id) else {
+        return abi::syserr::NO_CAP;
+    };
+    let npages = (*core::ptr::addr_of!(REGIONS[ri])).npages;
+
+    // A free run of L1 slots, read from the table itself rather than from a side index that
+    // could disagree with it.
+    let mut first = None;
+    let mut run = 0u64;
+    for slot in DMA_IOVA_FIRST_SLOT..DMA_IOVA_FIRST_SLOT + DMA_IOVA_SLOTS {
+        if core::ptr::read_volatile((l1 + slot * 8) as *const u64) & iopte::PR == 0 {
+            run += 1;
+            if run == npages {
+                first = Some(slot + 1 - npages);
+                break;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    let Some(first) = first else {
+        return abi::syserr::NO_MEM;
+    };
+
+    for k in 0..npages {
+        let frame = (*core::ptr::addr_of!(REGIONS[ri])).frames[k as usize].as_u64();
+        let iova = (first + k) * abi::PAGE_SIZE;
+        if device_domain()
+            .map(iova, frame >> abi::PAGE_SHIFT, rights)
+            .is_err()
+        {
+            // All or nothing. A half-mapped region would leave the device reaching part of
+            // something the caller was told it could not reach at all.
+            for done in 0..k {
+                let back = (first + done) * abi::PAGE_SIZE;
+                device_domain().unmap(back);
+                core::ptr::write_volatile((l1 + (first + done) * 8) as *mut u64, 0);
+            }
+            return abi::syserr::NO_CAP;
+        }
+        core::ptr::write_volatile(
+            (l1 + (first + k) * 8) as *mut u64,
+            iopte::leaf(frame, rights),
+        );
+    }
+    first * abi::PAGE_SIZE
+}
+
+/// Withdraw every DMA mapping of a region, and TELL THE UNIT.
+///
+/// # Safety
+/// Single-CPU, non-reentrant.
+#[cfg(target_arch = "x86_64")]
+unsafe fn unmap_dma(region_id: u64) -> u64 {
+    let Some(l1) = *core::ptr::addr_of!(IOMMU_L1) else {
+        return abi::syserr::NO_MEM;
+    };
+    let Some(ri) = region_index(region_id) else {
+        return abi::syserr::NO_CAP;
+    };
+    let npages = (*core::ptr::addr_of!(REGIONS[ri])).npages;
+    for k in 0..npages {
+        let frame =
+            (*core::ptr::addr_of!(REGIONS[ri])).frames[k as usize].as_u64() >> abi::PAGE_SHIFT;
+        // The domain knows where it put them; the caller never names an address.
+        let iovas: [u64; REGION_MAX_PAGES as usize] = core::array::from_fn(|_| u64::MAX);
+        let mut iovas = iovas;
+        let mut n = 0;
+        for (iova, f, _) in device_domain().reachable() {
+            if f == frame && n < iovas.len() {
+                iovas[n] = iova;
+                n += 1;
+            }
+        }
+        for &iova in iovas.iter().take(n) {
+            device_domain().unmap(iova);
+            core::ptr::write_volatile((l1 + (iova >> abi::PAGE_SHIFT) * 8) as *mut u64, 0);
+        }
+    }
+    // Clearing the table is not revocation while the unit still holds a translation it has
+    // already performed. Measured on the rig: without this the device kept reaching the frame.
+    let base = *core::ptr::addr_of!(AMDVI_BASE);
+    if base != 0 {
+        iommu_invalidate(base);
+    }
+    abi::syserr::OK
+}
+
 /// What the read-only probe observed: whether the narrowed mapping was written, whether the
 /// model refused wider rights, and what the frame and the event log looked like afterwards.
 #[cfg(target_arch = "x86_64")]
@@ -1986,23 +2186,9 @@ unsafe fn prove_containment<A: Arch>(
     // the zeroed buffer earlier, one level up: the payload has to be able to reach the device
     // before its arrival back in memory can mean anything.
     let translated = (|| {
-        let l2 = fa.alloc_frame().map(|f| zero_frame(f))?;
-        let l1 = fa.alloc_frame().map(|f| zero_frame(f))?;
-        // SAFETY: single-CPU boot path.
-        IOMMU_L1 = Some(l1.as_u64());
+        // The table skeleton is built with the DTE now; the demo only writes leaves into it.
+        let l1 = abi::PhysAddr((*core::ptr::addr_of!(IOMMU_L1))?);
         let dst = fa.alloc_frame().map(|f| zero_frame(f))?;
-        // Mode 3 walks root -> L2 -> L1 -> page, indexed by IOVA[38:30], [29:21], [20:12].
-        let root = *core::ptr::addr_of!(IOMMU_PT_ROOT);
-        let i3 = ((IOVA >> 30) & 0x1FF) as u64;
-        let i2 = ((IOVA >> 21) & 0x1FF) as u64;
-        core::ptr::write_volatile(
-            (root + i3 * 8) as *mut u64,
-            (l2.as_u64() & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | NEXT_LEVEL_2,
-        );
-        core::ptr::write_volatile(
-            (l2.as_u64() + i2 * 8) as *mut u64,
-            (l1.as_u64() & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | NEXT_LEVEL_1,
-        );
         // ---- the DOMAIN decides; the page table only records what it allowed ----
         //
         // `crates/iommu` has been exhaustively host-tested since it was written, and until now
@@ -3394,6 +3580,58 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             };
             A::frame_set_ret(&mut f, ret);
         }
+        abi::sysno::MAP_DMA => {
+            // TWO capabilities, because two separate authorities are involved: over the
+            // device's DMA domain, and over the memory. Holding one without the other is not
+            // enough — a process that may drive a device must not thereby be able to point it
+            // at memory it was never lent, and one holding memory must not be able to hand it
+            // to a device it has no authority over.
+            let dom_cap = abi::CapId(A::frame_arg(&f, 0) as usize);
+            let reg_cap = abi::CapId(A::frame_arg(&f, 1) as usize);
+            let caps = &proc_at(cur).caps;
+            let ret = match (
+                caps_iommu_domain(caps, dom_cap, abi::CapRights::WRITE),
+                caps_region(caps, reg_cap, abi::CapRights::READ),
+            ) {
+                // The HOLDER's rights decide what the device may do, never the request's.
+                (Some(_), Some((region, rights))) => {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        map_dma(region, rights)
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        let _ = (region, rights);
+                        abi::syserr::NO_MEM
+                    }
+                }
+                _ => abi::syserr::NO_CAP,
+            };
+            A::frame_set_ret(&mut f, ret);
+        }
+        abi::sysno::UNMAP_DMA => {
+            let dom_cap = abi::CapId(A::frame_arg(&f, 0) as usize);
+            let reg_cap = abi::CapId(A::frame_arg(&f, 1) as usize);
+            let caps = &proc_at(cur).caps;
+            let ret = match (
+                caps_iommu_domain(caps, dom_cap, abi::CapRights::WRITE),
+                caps_region(caps, reg_cap, abi::CapRights::READ),
+            ) {
+                (Some(_), Some((region, _))) => {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        unmap_dma(region)
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        let _ = region;
+                        abi::syserr::NO_MEM
+                    }
+                }
+                _ => abi::syserr::NO_CAP,
+            };
+            A::frame_set_ret(&mut f, ret);
+        }
         abi::sysno::FREE_REGION => {
             // Only the OWNER may destroy a region, and ownership is by process IDENTITY —
             // never by slot, which is recycled. A borrower must not be able to free memory
@@ -4157,6 +4395,42 @@ mod tests {
                 wrong
             );
         }
+    }
+
+    /// The DMA gate: WRITE on the domain, and the right TYPE.
+    ///
+    /// `MAP_DMA` hands a device the ability to reach memory, which is granting authority. A
+    /// capability that merely names a domain must not extend it, and no other capability type
+    /// may stand in for one — an `Mmio` cap for the same device is authority over its
+    /// REGISTERS, which is a different thing from authority over what it may reach by DMA.
+    #[test]
+    fn granting_dma_reach_needs_a_domain_cap_carrying_write() {
+        // Decoy at slot 0 so a slot/object confusion cannot pass by coincidence.
+        let cs = space(&[
+            (abi::CapType::Mmio, abi::CapRights::ALL, 0),
+            (abi::CapType::IommuDomain, abi::CapRights::READ, 7),
+            (abi::CapType::IommuDomain, abi::CapRights::ALL, 7),
+        ]);
+        assert_eq!(
+            caps_iommu_domain(&cs, abi::CapId(1), abi::CapRights::WRITE),
+            None,
+            "a domain capability without WRITE granted DMA reach"
+        );
+        assert_eq!(
+            caps_iommu_domain(&cs, abi::CapId(2), abi::CapRights::WRITE),
+            Some(7),
+            "a fully-powered domain capability must resolve, to its OBJECT not its slot"
+        );
+        assert_eq!(
+            caps_iommu_domain(&cs, abi::CapId(0), abi::CapRights::WRITE),
+            None,
+            "an Mmio capability resolved as an IOMMU domain"
+        );
+        assert_eq!(
+            caps_iommu_domain(&cs, abi::CapId(9), abi::CapRights::WRITE),
+            None,
+            "an empty slot resolved"
+        );
     }
 
     /// The two Region gates, both of which the boot cannot see (measured: deleting either

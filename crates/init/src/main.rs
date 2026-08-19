@@ -492,6 +492,19 @@ fn map_region(cap: u64) -> u64 {
     unsafe { syscall1(sysno::MAP_REGION, cap) }
 }
 
+/// Give the device DMA reach to region `region`, under domain capability `dom`. Returns the
+/// IOVA the kernel chose, or a `syserr`.
+fn map_dma(dom: u64, region: u64) -> u64 {
+    // SAFETY: MAP_DMA takes two cap ids and returns an IOVA; no user memory is touched.
+    unsafe { syscall2(sysno::MAP_DMA, dom, region) }
+}
+
+/// Withdraw the device's DMA reach to `region`.
+fn unmap_dma(dom: u64, region: u64) -> u64 {
+    // SAFETY: UNMAP_DMA takes two cap ids and returns a status.
+    unsafe { syscall2(sysno::UNMAP_DMA, dom, region) }
+}
+
 /// Drop our mapping of region capability `cap` (the capability survives).
 fn unmap_region(cap: u64) -> u64 {
     // SAFETY: UNMAP_REGION takes a cap id and returns a status.
@@ -633,6 +646,11 @@ fn producer() -> ! {
         dw!(b"role: producer CAN recv (bug)\n");
     }
     tag(0);
+    if map_dma(8, 2) == syserr::NO_CAP {
+        dw!(b"role: producer cannot grant DMA reach (no domain capability at all)\n");
+    } else {
+        dw!(b"role: producer granted DMA reach (bug)\n");
+    }
     if map_bar(CapId(1), 0).is_err() {
         dw!(b"role: producer holds no device authority\n");
     } else {
@@ -826,6 +844,47 @@ fn compute(id: u64) -> ! {
         } else {
             dw!(b"share: UNMAP_REGION left the window mapped (bug)\n");
         }
+        // ---- DMA reach is a CAPABILITY, not a kernel decision ----
+        //
+        // CapId(9) names the same domain as CapId(8) and carries no WRITE. Handing a device
+        // the ability to reach memory is granting authority, so the rights half has to bite —
+        // and it is exercised from a process that holds BOTH, which is what the Mmio case
+        // above was found NOT to do, leaving its check vacuous on hardware.
+        tag(id);
+        if map_dma(9, mbox) == syserr::NO_CAP {
+            dw!(
+                b"dma: an IommuDomain cap without WRITE cannot grant DMA reach
+"
+            );
+        } else {
+            dw!(b"dma: a rights-less domain cap granted DMA reach (bug)
+");
+        }
+        tag(id);
+        let iova = map_dma(8, mbox);
+        if iova == syserr::NO_MEM {
+            // No unit programmed. Refusing is the whole point: DMA reach nothing bounds is
+            // indistinguishable from access to all of memory.
+            dw!(
+                b"dma: no IOMMU on this machine, so MAP_DMA refuses to hand out reach
+"
+            );
+        } else if iova == syserr::NO_CAP {
+            dw!(b"dma: MAP_DMA refused a region we hold (bug)
+");
+        } else {
+            dw!(b"dma: the device can now reach our region by DMA
+");
+            tag(id);
+            if unmap_dma(8, mbox) == syserr::OK {
+                dw!(b"dma: UNMAP_DMA withdrew it and invalidated the unit
+");
+            } else {
+                dw!(b"dma: UNMAP_DMA failed on a mapping we made (bug)
+");
+            }
+        }
+
         tag(id);
         let again = map_region(mbox);
         if again == mva && unsafe { core::ptr::read_volatile(mva as *const u8) } == b'B' {

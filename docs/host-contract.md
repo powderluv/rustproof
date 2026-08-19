@@ -376,12 +376,19 @@ Client-side typed-cap signatures are shown as comments for readability; the wire
      2026-08-14. docs/nucleus-design.md states the premise this whole contract rests on: the
      nucleus grants the driver an `Mmio` capability for the GPU aperture but never for the
      IOMMU aperture, so "the driver can command arbitrary DMA; it cannot touch the tables that
-     bound that DMA." There is no IOMMU in this tree — `CapType::IommuDomain` is a bare enum
-     variant with no referent. Until one exists, mapping a real bus-mastering BAR into an
-     untrusted process hands it a DMA engine that can write the process table, the capability
-     spaces and the delegation ledger, at which point every other gate here is advisory. This
-     is why `DEVICE_PHYS` is deliberately a kernel-allocated RAM frame with no bus master
-     behind it, and why that stand-in stays until the IOMMU lands.
+     bound that DMA." Updated 2026-08-19: `CapType::IommuDomain` is no longer a bare enum
+     variant. It has a referent (`crates/iommu::Domain`, which governs the real AMD-Vi page
+     table) AND an ABI: `MAP_DMA`/`UNMAP_DMA` take a domain capability carrying WRITE plus a
+     `Region` capability carrying READ, and the kernel picks the IOVA. The device may write the
+     region only if the caller's own region capability carries WRITE, so a READ-only loan
+     produces a read-only I/O mapping.
+     With no unit programmed, `MAP_DMA` returns `NO_MEM` rather than succeeding: DMA reach that
+     nothing bounds is indistinguishable from access to all of memory, so the nucleus declines
+     to hand out what it cannot contain.
+     What is still true: this contract's own precondition is that a bus-mastering BAR must not
+     reach an untrusted process before its DMA is bounded. `DEVICE_PHYS` therefore remains a
+     kernel-allocated RAM frame with no bus master behind it — the IOMMU now exists, but the
+     device-capability plumbing that would pair a real BAR with its domain does not.
   A fresh `Cap<Mmio>` recording `(phys_base+offset, len, vaddr, rights)` is derived from the device
   cap and inserted in slot 0.
 - **Tag: VERIFIED** for the *mapping decision* — the choice of which physical frames become reachable
