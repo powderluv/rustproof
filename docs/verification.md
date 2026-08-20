@@ -51,6 +51,41 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-19 (fourth) — allocating memory stopped being authority to reach it
+
+`MAKE_REGION` granted every page it allocated into the device domain. So every region was
+DMA-authorized whether or not anyone had asked, which is authority nobody requested and nobody
+could decline — and it made `grant_count` a restatement of the region table rather than a record
+of what had been handed out. Grants are now issued by `MAP_DMA`, from the rights of the
+capability that asks, and withdrawn by `UNMAP_DMA` and `FREE_REGION`.
+
+That invalidated the boot check, which asserted `grants == the page count of every live region`.
+It held only because of the thing being removed, and it could not distinguish a domain holding
+the right NUMBER of grants from one holding the right ONES. Replaced with the property that
+actually matters, checked frame by frame: **no grant may outlive the memory it names.**
+`crates/iommu` gained a `grants()` iterator for it — the mapping side has had `reachable()` since
+the beginning while the grant side had only a count, and a count answers "how many", not "which".
+
+**Where the mutants landed is the interesting part.** Restoring the old grant-at-allocation
+survived BOTH new shutdown checks:
+
+- not an orphan — the regions granting at allocation are live, so their grants are legitimate;
+- not a containment failure — nothing is mapped, and `contained()` only compares mappings with
+  grants;
+- and a third check added specifically for it, "no grant without a mapping under it", ALSO
+  passed: by the time the shutdown checks run every region has been freed and its grants revoked
+  along with it, so there is nothing left to find.
+
+Three checks, none of which could see it. What catches it is a TRIPWIRE at the site — an
+`assert!` in `MAKE_REGION` that no frame it allocates is already granted. Some properties are
+about a moment, not a final state, and a shutdown check is structurally blind to them however
+many of them you add.
+
+Operational note: shark-a went unreachable mid-run, and it turns out this Mac runs the full rig
+— QEMU 8.2.1 with both `amd-iommu` and `edu`, and SeaBIOS supplies an RSDP on the multiboot
+path. All five modes, including `IOMMU=1 FIRMWARE=1`, validate locally. shark-a is a
+cross-check, not a dependency.
+
 ## 2026-08-19 (later still) — the device kept reaching memory the nucleus had reclaimed
 
 `MAP_DMA` writes real I/O page-table entries. `FREE_REGION` revoked the domain's grant and

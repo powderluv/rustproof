@@ -200,6 +200,19 @@ impl<const G: usize, const M: usize> Domain<G, M> {
         }
     }
 
+    /// Every live grant, as (frame, rights).
+    ///
+    /// The mapping side has had [`Domain::reachable`] since the beginning; the grant side had
+    /// only a count. A count answers "how many" and not "which", so the kernel could assert
+    /// that the number of grants matched the number of DMA pages without anything checking
+    /// that they were the SAME pages.
+    pub fn grants(&self) -> impl Iterator<Item = (u64, CapRights)> + '_ {
+        self.grants
+            .iter()
+            .filter(|g| g.live)
+            .map(|g| (g.frame, g.rights))
+    }
+
     /// Every live mapping, as (iova, frame, rights).
     pub fn reachable(&self) -> impl Iterator<Item = (u64, u64, CapRights)> + '_ {
         self.maps
@@ -405,6 +418,35 @@ mod tests {
                 "a WRITE mapping over a READ-only grant in slot {slot} went unnoticed"
             );
         }
+    }
+
+    /// `grants` must report exactly the live grants, from any slot, and drop revoked ones.
+    #[test]
+    fn grants_reports_which_frames_not_merely_how_many() {
+        let mut d: Domain<48, 8> = Domain::new();
+        assert_eq!(d.grants().count(), 0);
+        assert!(d.grant(10, RW));
+        assert!(d.grant(11, R));
+        let mut seen: alloc_vec::Vec<(u64, CapRights)> = d.grants().collect();
+        seen.sort_by_key(|(f, _)| *f);
+        assert_eq!(seen, alloc_vec::Vec::from([(10, RW), (11, R)]));
+        assert_eq!(d.grants().count(), d.grant_count());
+        d.revoke(10);
+        assert_eq!(
+            d.grants().collect::<alloc_vec::Vec<_>>(),
+            alloc_vec::Vec::from([(11, R)]),
+            "a revoked grant is still reported"
+        );
+        // From the LAST slot too, for the same reason the other width tests exist.
+        let mut wide: Domain<48, 8> = Domain::new();
+        for i in 0..48u64 {
+            assert!(wide.grant(500 + i, RW));
+        }
+        assert_eq!(wide.grants().count(), 48);
+        assert!(
+            wide.grants().any(|(f, _)| f == 547),
+            "the last slot is missing"
+        );
     }
 
     /// The DEPLOYED shape, with the violation in the LAST slot.

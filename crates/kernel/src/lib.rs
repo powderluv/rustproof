@@ -1326,39 +1326,67 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
         }
     }
 
-    // The device domain must track the live DMA regions EXACTLY. Nothing is mapped (there is
-    // no IOMMU and no device), so the containment half is trivially satisfied and is not what
-    // this asserts. What it asserts is the half that can actually be wrong today: a `Release`
-    // that frees frames without withdrawing the domain's authorization leaves grants behind,
-    // and the two sets diverge. That divergence is exactly what the hardware half would turn
-    // into a device still writing memory the nucleus has reissued to someone else.
+    // No grant may outlive the memory it names.
+    //
+    // This used to assert `grants == the page count of every live region`, which held only
+    // because `MAKE_REGION` granted every page it allocated. That made the count a restatement
+    // of the region table: it could not distinguish a domain holding the right NUMBER of
+    // grants from one holding the right ONES, and it said nothing about whether anybody had
+    // asked for them. Grants are now issued by `MAP_DMA`, so the number is a fact about what
+    // was requested and no longer predictable from the region table at all.
+    //
+    // What replaces it is the property that actually matters: every frame the domain still
+    // authorizes belongs to a region that still exists. A `Release` that returns frames to the
+    // pool while the domain names them is a device authorized to write memory the nucleus has
+    // reissued — and that is checkable frame by frame rather than by counting.
     {
         let dom = device_domain();
-        let expect: usize = (0..MAX_REGIONS)
-            .map(|i| {
+        let live_frame = |pfn: u64| -> bool {
+            (0..MAX_REGIONS).any(|i| {
                 let r = &*core::ptr::addr_of!(REGIONS[i]);
-                if r.live {
-                    r.npages as usize
-                } else {
-                    0
-                }
+                r.live
+                    && (0..r.npages as usize)
+                        .any(|k| r.frames[k].as_u64() >> abi::PAGE_SHIFT == pfn)
             })
-            .sum();
-        let have = dom.grant_count();
+        };
+        let orphan = dom.grants().find(|(pfn, _)| !live_frame(*pfn));
         let _ = writeln!(
             con,
-            "[iommu] domain grants {} frame(s) for {} live DMA page(s)",
-            have, expect
+            "[iommu] domain holds {} grant(s) and {} mapping(s), all within live regions: {}",
+            dom.grant_count(),
+            dom.reachable().count(),
+            orphan.is_none() && dom.contained()
         );
-        if have != expect || !dom.contained() {
+        if let Some((pfn, _)) = orphan {
             let _ = writeln!(
                 con,
-                "\n[iommu] the device domain disagrees with the region table: {} grant(s) for \
-                 {} live DMA page(s), contained={}\n      a region was released without \
-                 withdrawing its authorization, which is the stale-authorization bug.",
-                have,
-                expect,
-                dom.contained()
+                "\n[iommu] the device domain still authorizes frame {pfn:#x}, which belongs to \
+                 no live region — a region was released without withdrawing its authorization, \
+                 which is the stale-authorization bug."
+            );
+            A::exit(false);
+        }
+        if !dom.contained() {
+            let _ = writeln!(
+                con,
+                "\n[iommu] the device can reach an address no grant covers (contained=false)"
+            );
+            A::exit(false);
+        }
+        // And no grant without a mapping under it. Grants are issued by `MAP_DMA` and
+        // withdrawn by `UNMAP_DMA`/`FREE_REGION`, so at a quiescent point every one of them is
+        // backing something. Without this the decision that allocating memory is NOT authority
+        // for a device to reach it is a sentence in a comment: putting the grant back into
+        // `MAKE_REGION` produces no orphan and breaks no containment, and the boot passes.
+        // Measured — that mutant survived every other check here.
+        if let Some((pfn, _)) = dom
+            .grants()
+            .find(|(pfn, _)| !dom.reachable().any(|(_, f, _)| f == *pfn))
+        {
+            let _ = writeln!(
+                con,
+                "\n[iommu] frame {pfn:#x} is authorized for DMA with nothing mapped to it — an \
+                 authority nobody asked for, which is what granting at allocation looked like"
             );
             A::exit(false);
         }
@@ -2033,15 +2061,21 @@ unsafe fn map_dma(domain: u64, region_id: u64, rights: abi::CapRights) -> u64 {
     for k in 0..npages {
         let frame = (*core::ptr::addr_of!(REGIONS[ri])).frames[k as usize].as_u64();
         let iova = (first + k) * abi::PAGE_SIZE;
+        // The grant is issued HERE, with the rights of the capability that asked. `map` still
+        // decides — it refuses rights wider than the grant — but the grant now records an
+        // actual request rather than the fact that memory was once allocated.
+        device_domain().grant(frame >> abi::PAGE_SHIFT, rights);
         if device_domain()
             .map(iova, frame >> abi::PAGE_SHIFT, rights)
             .is_err()
         {
             // All or nothing. A half-mapped region would leave the device reaching part of
             // something the caller was told it could not reach at all.
-            for done in 0..k {
+            for done in 0..=k {
                 let back = (first + done) * abi::PAGE_SIZE;
+                let f = (*core::ptr::addr_of!(REGIONS[ri])).frames[done as usize].as_u64();
                 device_domain().unmap(back);
+                device_domain().revoke(f >> abi::PAGE_SHIFT);
                 core::ptr::write_volatile((l1 + (first + done) * 8) as *mut u64, 0);
             }
             return abi::syserr::NO_CAP;
@@ -2120,6 +2154,10 @@ unsafe fn unmap_dma(domain: u64, region_id: u64) -> u64 {
         for &iova in iovas.iter().take(n) {
             device_domain().unmap(iova);
         }
+        // And the grant, which `MAP_DMA` issued. Leaving it would make the domain hold
+        // authority for a frame nothing can reach — harmless for containment, but it would
+        // outlive the request that created it and accumulate for the life of the boot.
+        device_domain().revoke(pfn);
     }
     // Clearing the table is not revocation while the unit still holds a translation it has
     // already performed. Measured on the rig: without this the device kept reaching the frame.
@@ -3957,11 +3995,25 @@ unsafe fn make_region<A: Arch>(owner: usize, pages: u64, rights: abi::CapRights)
         return abi::syserr::NO_MEM;
     };
     NEXT_REGION_ID = next;
-    // The frames are now device-reachable in principle, so the domain must say so. Rights come
-    // from the minting capability, never from the request — the same attenuation `caps_region`
-    // enforces on the CPU side.
+    // No grant here. Creating a region is allocating MEMORY; it is not a decision that a
+    // device may reach it. Granting at allocation made every region DMA-authorized for the
+    // device whether or not anyone had asked, which is authority nobody requested and nobody
+    // could decline — and it made `grant_count` a restatement of the region table rather than
+    // a record of what had been handed out. The grant is issued by `MAP_DMA`, from the
+    // capability of whoever asks, and withdrawn again by `UNMAP_DMA` and `FREE_REGION`.
+    let _ = rights;
+    // TRIPWIRE, at the site, because nothing downstream can see this. Restoring the old grant
+    // loop here passes every other check in the tree: the grants are not orphans (their regions
+    // are live), containment holds, and by the time the shutdown checks run every region has
+    // been freed and its grants revoked with it. Measured — that mutant survived both of them.
+    // An `assert!` and not `debug_assert!`: the release build is the one that boots.
     for k in 0..pages as usize {
-        let _ = device_domain().grant(frames[k].as_u64() >> abi::PAGE_SHIFT, rights);
+        assert!(
+            device_domain()
+                .granted(frames[k].as_u64() >> abi::PAGE_SHIFT)
+                .is_none(),
+            "MAKE_REGION handed a device DMA authority for a frame nobody asked to map"
+        );
     }
     *(&mut *core::ptr::addr_of_mut!(REGIONS[idx])) = Region {
         live: true,
