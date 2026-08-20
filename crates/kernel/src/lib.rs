@@ -446,6 +446,21 @@ const fn delivers_irq(line: u64) -> bool {
 /// driver process would use for a real BAR, without needing the hardware.
 static mut DEVICE_PHYS: u64 = 0;
 
+/// Physical base of the BOUNDED device's real register aperture, or 0 if none was found.
+///
+/// Handing a bus-mastering BAR to an untrusted process is only defensible once that device's
+/// DMA is bounded, which is the precondition docs/host-contract.md §5 states and which per-device
+/// domains now satisfy: the nucleus owns the I/O page tables, the process owns nothing but the
+/// registers, and what the device can reach is exactly what some capability of that process
+/// asked `MAP_DMA` for. Until then this was deliberately a RAM stand-in with no bus master
+/// behind it.
+#[cfg(target_arch = "x86_64")]
+static mut DEVICE_BAR: u64 = 0;
+
+/// Grant-table selector meaning "the bounded device's real BAR" (see [`DEVICE_BAR`]). Any other
+/// `Mmio` object selects the RAM stand-in.
+const MMIO_DEVICE_BAR: u64 = 1;
+
 /// The AMD-Vi register base IVRS named, or 0 if this machine has no IOMMU (or no ACPI).
 ///
 /// Discovery happens before paging is enabled, and the aperture sits above the identity map,
@@ -1183,6 +1198,8 @@ const NO_AUTHORITY: (abi::CapType, abi::CapRights, u64) =
 /// Note that the structurally similar claim about `Irq` grants (in `run`) is UNAFFECTED and
 /// still exact: `make_region` can only ever mint `Region`, never `Irq`.
 fn grants_for(role: Role) -> &'static [(abi::CapType, abi::CapRights, u64)] {
+    // Logical selectors for `Mmio` grants, resolved to real physical bases at mint time.
+    // The stand-in is a kernel RAM frame; the other is the bounded device's real registers.
     const MMIO_BASE: u64 = 0xE000_0000;
     match role {
         // Send-only on endpoint object 0. No Mmio, no Untyped: a producer that is
@@ -1240,6 +1257,13 @@ fn grants_for(role: Role) -> &'static [(abi::CapType, abi::CapRights, u64)] {
             // CapId(11): the OTHER device's domain, fully powered. Holding it is real
             // authority — over a different device.
             (abi::CapType::IommuDomain, abi::CapRights::ALL, 2),
+            // CapId(12): the BOUNDED DEVICE'S REAL REGISTERS. Not a stand-in — mapping this
+            // hands an untrusted process a live bus-mastering device. That is defensible only
+            // because the same device's DMA is bounded by a domain the nucleus owns and the
+            // process cannot reach: it can command transfers, and they land only where some
+            // capability of its own asked `MAP_DMA` to put them. On a machine with no such
+            // device the slot resolves to no authority rather than to physical zero.
+            (abi::CapType::Mmio, abi::CapRights::ALL, MMIO_DEVICE_BAR),
         ],
         // Nothing. A spawned process begins with no authority of its own; what it can do is
         // exactly what its parent delegated (never more — the rights are intersected), so
@@ -1572,10 +1596,42 @@ unsafe fn load_process<A: Arch>(
             // the table becomes `CapId(i)` and the ids line up across roles.
             s.caps = capabilities::CapSpace::new();
             for &(cap_type, rights, object) in grants_for(role) {
-                // An `Mmio` grant names the device window the kernel reserved at boot; the
-                // table cannot hold that address because it is only known at run time.
+                // An `Mmio` grant names a window whose address is only known at run time, so
+                // the table carries a LOGICAL selector and it is resolved here — at mint time,
+                // so the capability the process holds names the real physical base and every
+                // path downstream (delegation, attenuation, `map_device`) is unchanged.
+                //
+                // Every `Mmio` grant used to resolve to the stand-in window regardless of what
+                // the table said, which made the object in the table decorative.
+                let mut skip = false;
                 let object = if cap_type == abi::CapType::Mmio {
-                    *core::ptr::addr_of!(DEVICE_PHYS)
+                    let resolved = match object {
+                        // ONLY IF ITS DMA IS BOUNDED. This is docs/host-contract.md §5's
+                        // precondition, enforced rather than stated: a bus-mastering BAR in an
+                        // untrusted process is a DMA engine that can write the process table,
+                        // the capability spaces and the ledger, at which point every other gate
+                        // is advisory. A device with no domain therefore yields NO capability.
+                        //
+                        // Not hypothetical: QEMU's default machine carries an e1000, so the
+                        // scan finds a real bus master on a boot with no IOMMU at all, and the
+                        // first version of this handed it over.
+                        #[cfg(target_arch = "x86_64")]
+                        MMIO_DEVICE_BAR => {
+                            let bounded = (*core::ptr::addr_of!(DOMAIN_SLOTS[0])).id != 0;
+                            if bounded {
+                                *core::ptr::addr_of!(DEVICE_BAR)
+                            } else {
+                                0
+                            }
+                        }
+                        _ => *core::ptr::addr_of!(DEVICE_PHYS),
+                    };
+                    // A window this machine does not have is NOT authority over physical zero.
+                    // The slot is still consumed so capability ids stay aligned across roles.
+                    if resolved == 0 {
+                        skip = true;
+                    }
+                    resolved
                 } else {
                     object
                 };
@@ -1598,6 +1654,11 @@ unsafe fn load_process<A: Arch>(
                     !is_mint_source(cap_type) || object == 0,
                     "a mint source acquired an extent; revisit the revocation decision"
                 );
+                let (cap_type, rights, object) = if skip {
+                    NO_AUTHORITY
+                } else {
+                    (cap_type, rights, object)
+                };
                 let _ = s.caps.insert(cap_type, rights, object);
             }
             s.role = role;
@@ -3118,6 +3179,11 @@ pub fn run<A: Arch>(a0: u64, a1: u64, user_elf: &'static [u8]) -> ! {
                 );
                 // SAFETY: as above.
                 unsafe { TARGET_BDF = d.bdf() as u32 | 0x1_0000 };
+                // SAFETY: as above. Zero if the firmware assigned no BAR, which the mint-time
+                // resolution below treats as "no such capability" rather than as address 0.
+                if let Some(bar) = unsafe { pci::bar0(&d) } {
+                    unsafe { DEVICE_BAR = bar };
+                }
             }
             None => {
                 let _ = writeln!(con, "[iommu] no DMA-capable device to bound");
@@ -4383,7 +4449,16 @@ impl<A: Arch> abi::HostEnv for KEnv<A> {
             // reserved at boot, or a mismatch between the two would map whatever ordinary
             // RAM happened to follow it into a user process.
             let window = *core::ptr::addr_of!(DEVICE_PHYS);
-            if window == 0 || phys != window || pages > DEVICE_PAGES {
+            #[cfg(target_arch = "x86_64")]
+            let bar = *core::ptr::addr_of!(DEVICE_BAR);
+            #[cfg(not(target_arch = "x86_64"))]
+            let bar = 0u64;
+            // A real register aperture must be mapped UNCACHED, or the stores a device is meant
+            // to see in order are reordered and coalesced — invisible under QEMU TCG and wrong
+            // on silicon. The stand-in is ordinary RAM and stays cacheable.
+            let is_device = bar != 0 && phys == bar;
+            let ok = (window != 0 && phys == window) || is_device;
+            if !ok || pages > DEVICE_PAGES {
                 return None;
             }
             let proc = proc_at(self.proc_idx);
@@ -4401,11 +4476,12 @@ impl<A: Arch> abi::HostEnv for KEnv<A> {
             // The mapping carries exactly the authority the capability did: a `READ`-only
             // capability must not produce a writable page, or attenuating a capability
             // (e.g. on delegation) would not attenuate the access it grants.
-            let perms = if writable {
+            let mut perms = if writable {
                 Perms::USER_RW
             } else {
                 Perms::USER_RO
             };
+            perms.device = is_device;
             for i in 0..DEVICE_PAGES {
                 // Drop any previous window first, so a repeat call is idempotent rather
                 // than failing "already mapped", and so re-mapping can change permissions.

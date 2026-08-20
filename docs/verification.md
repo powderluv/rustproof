@@ -51,6 +51,31 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-19 (sixth) — an untrusted process holds a REAL bus-mastering device
+
+`MAP_BAR` mapped a kernel RAM frame with a signature in it. That stand-in was deliberate:
+docs/host-contract.md §5 states that a bus-mastering BAR must not reach an untrusted process
+until that device's DMA is bounded, because otherwise the process holds a DMA engine that can
+write the process table, the capability spaces and the delegation ledger — at which point every
+other gate in the contract is advisory. Per-device domains satisfied that precondition, so the
+stand-in can go.
+
+A ring-3 process now maps `edu`'s real register aperture through an `Mmio` capability and reads
+`0x010000ed` back out of its identification register. A RAM frame cannot forge that. The window
+is mapped UNCACHED, which the stand-in never needed and which `Perms::device` existed to express.
+
+The grant table carries a LOGICAL selector resolved at mint time, so the capability the process
+holds names the real physical base and delegation, attenuation and `map_device` are unchanged.
+(Every `Mmio` grant previously resolved to the stand-in regardless of what the table said, which
+made that object decorative — the same shape as the domain object two commits ago.)
+
+**The precondition is now enforced rather than stated, and that was not hypothetical.** QEMU's
+default machine carries an e1000, so a boot with NO IOMMU still has a real bus master for the
+scan to find — and the first version of this handed it straight over. The capability now
+resolves to nothing unless that device has a domain; the default boot reports "no bounded device
+on this machine, so no BAR to map", and both directions are gated on whether the boot bound a
+domain. The mutant that skips the check fails the no-IOMMU boot.
+
 ## 2026-08-19 (fifth) — per-device containment, with both halves on hardware
 
 There was one domain, so "a capability for device A's domain cannot grant reach into device B's"

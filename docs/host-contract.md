@@ -388,10 +388,12 @@ Client-side typed-cap signatures are shown as comments for readability; the wire
      Updated 2026-08-19 (later): there are now TWO domains, one per DMA-capable function, each
      with its OWN I/O page table, and a capability naming one cannot install a mapping in the
      other's — demonstrated on the rig, both halves, by the device the nucleus can drive.
-     What is still true: this contract's own precondition is that a bus-mastering BAR must not
-     reach an untrusted process before its DMA is bounded. `DEVICE_PHYS` therefore remains a
-     kernel-allocated RAM frame with no bus master behind it — the IOMMU now exists, but the
-     device-capability plumbing that would pair a real BAR with its domain does not.
+     SATISFIED 2026-08-19: an `Mmio` capability can now name the bounded device's REAL register
+     aperture, and a ring-3 process maps it and reads the device's identification register back.
+     The precondition is ENFORCED, not stated: the capability resolves to nothing unless that
+     device has a domain, so on a machine with a bus master and no IOMMU — QEMU's default,
+     which has an e1000 — no BAR reaches the process at all. `DEVICE_PHYS` remains as the
+     stand-in for machines with no bounded device.
   A fresh `Cap<Mmio>` recording `(phys_base+offset, len, vaddr, rights)` is derived from the device
   cap and inserted in slot 0.
 - **Tag: VERIFIED** for the *mapping decision* — the choice of which physical frames become reachable

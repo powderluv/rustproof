@@ -898,6 +898,31 @@ fn compute(id: u64) -> ! {
             }
         }
 
+        // ---- the REAL device, reached through a capability ----
+        //
+        // CapId(12) names the bounded device's actual register aperture, not the RAM stand-in.
+        // `edu` reports 0x010000ed in its identification register, so a window that reads that
+        // back is the device itself — a RAM frame cannot forge it. Holding this is holding a
+        // live bus-mastering device, which is only defensible because the same device's DMA is
+        // bounded by a domain this process cannot reach: it may command transfers, and they
+        // land only where a capability of its own asked MAP_DMA to put them.
+        tag(id);
+        match map_bar(CapId(12), 0) {
+            Ok(resp) => {
+                // SAFETY: the kernel just mapped this window into our space, one page.
+                let ident = unsafe { core::ptr::read_volatile(resp.user_va as *const u32) };
+                if ident == 0x0100_00ed {
+                    dw!(b"dev: mapped the REAL device BAR and read its identification register\n");
+                } else {
+                    // A real aperture, but not the one whose signature we know. Reporting it
+                    // rather than calling it a bug: which device the nucleus bounded is its
+                    // decision, and a process cannot tell one unknown aperture from another.
+                    dw!(b"dev: mapped a real device aperture with no signature we recognise\n");
+                }
+            }
+            Err(_) => dw!(b"dev: no bounded device on this machine, so no BAR to map\n"),
+        }
+
         // Freeing a region must withdraw the device's reach to it. Nothing in the ABI obliges
         // a caller to UNMAP_DMA first, and a process that is killed cannot be relied on to
         // have done anything at all — so FREE_REGION has to be the one that closes this. If it

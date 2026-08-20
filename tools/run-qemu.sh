@@ -331,6 +331,24 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ] \
     exit 1
 fi
 
+# A REAL bus-mastering BAR reaches an untrusted process only where that device's DMA is
+# bounded. Both directions are required, keyed on whether the boot bound a domain — because
+# QEMU's default machine has an e1000, so a boot with no IOMMU still HAS a real bus master for
+# the scan to find, and the refusal is the whole point there.
+if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ]; then
+    if echo "$OUT" | grep -q '\[iommu\] domain 1 bound to'; then
+        if ! echo "$OUT" | grep -q 'dev: mapped the REAL device BAR'; then
+            echo "RESULT: FAIL — the device's DMA is bounded, yet its registers never reached"
+            echo "  the process, or the window mapped was not the device"
+            exit 1
+        fi
+    elif ! echo "$OUT" | grep -q 'dev: no bounded device on this machine'; then
+        echo "RESULT: FAIL — a real bus-mastering BAR was handed to an untrusted process on a"
+        echo "  machine where nothing bounds its DMA"
+        exit 1
+    fi
+fi
+
 # And the outcome that depends on whether a unit exists — keyed on what the BOOT reports about
 # the machine, not on what the env flags imply about it. Keying it on IOMMU=1 && FIRMWARE=1 was
 # wrong: `IOMMU=1` alone also finds IVRS and enables the unit, so the run that was supposed to
