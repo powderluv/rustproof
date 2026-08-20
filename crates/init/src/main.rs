@@ -876,6 +876,20 @@ fn compute(id: u64) -> ! {
             } else {
                 dw!(b"dma: a cap for a nonexistent domain granted DMA reach (bug)\n");
             }
+            // The OTHER device's domain, held with full rights. Mapping there is real
+            // authority and must succeed — the isolation claim is that it reaches a DIFFERENT
+            // table, not that a second capability is inert. The kernel proves the hardware
+            // half of that before userland starts; this is the ABI half.
+            tag(id);
+            let other = map_dma(11, mbox);
+            if other == syserr::NO_CAP || other == syserr::NO_MEM {
+                dw!(b"dma: a capability for the second device's domain was refused (bug)\n");
+            } else {
+                dw!(b"dma: the second device's domain is a separate authority we also hold\n");
+                if unmap_dma(11, mbox) != syserr::OK {
+                    dw!(b"dma: could not withdraw from the second domain (bug)\n");
+                }
+            }
             tag(id);
             if unmap_dma(8, mbox) == syserr::OK {
                 dw!(b"dma: UNMAP_DMA withdrew it and invalidated the unit\n");

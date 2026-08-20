@@ -385,6 +385,9 @@ Client-side typed-cap signatures are shown as comments for readability; the wire
      With no unit programmed, `MAP_DMA` returns `NO_MEM` rather than succeeding: DMA reach that
      nothing bounds is indistinguishable from access to all of memory, so the nucleus declines
      to hand out what it cannot contain.
+     Updated 2026-08-19 (later): there are now TWO domains, one per DMA-capable function, each
+     with its OWN I/O page table, and a capability naming one cannot install a mapping in the
+     other's — demonstrated on the rig, both halves, by the device the nucleus can drive.
      What is still true: this contract's own precondition is that a bus-mastering BAR must not
      reach an untrusted process before its DMA is bounded. `DEVICE_PHYS` therefore remains a
      kernel-allocated RAM frame with no bus master behind it — the IOMMU now exists, but the

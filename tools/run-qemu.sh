@@ -347,6 +347,17 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ]; then
         fi
         # Required only where a domain EXISTS: with no unit every domain capability is refused
         # for that reason alone, and the object would never be looked at.
+        # Per-device containment, both halves. The second is what makes the first mean
+        # anything: a device that reaches nothing is not contained, it is broken.
+        if ! echo "$OUT" | grep -q '\[iommu\] PER-DEVICE:'; then
+            echo "RESULT: FAIL — a frame mapped in another device's domain was reachable, or"
+            echo "  the device could not reach its own domain's mapping"
+            exit 1
+        fi
+        if ! echo "$OUT" | grep -q "dma: the second device's domain is a separate authority"; then
+            echo "RESULT: FAIL — the second domain's capability was refused, or never used"
+            exit 1
+        fi
         if ! echo "$OUT" | grep -q 'dma: a cap naming a domain that does not exist is refused'; then
             echo "RESULT: FAIL — a capability naming a domain that does not exist was honoured,"
             echo "  or the check for it never ran"

@@ -50,6 +50,16 @@ pub struct Function {
 }
 
 impl Function {
+    /// A slot no device has claimed. `0xFFFF` is the vendor id config space returns for an
+    /// absent function, so this cannot be mistaken for a real one.
+    pub const EMPTY: Function = Function {
+        bus: 0,
+        dev: 0,
+        func: 0,
+        vendor: 0xFFFF,
+        device: 0xFFFF,
+    };
+
     /// The BDF as AMD-Vi's Device Table is indexed: bus:dev.func packed into 16 bits.
     pub fn bdf(&self) -> u16 {
         ((self.bus as u16) << 8) | ((self.dev as u16) << 3) | (self.func as u16)
@@ -305,6 +315,55 @@ pub unsafe fn find_dma_device() -> Option<Function> {
         }
     }
     find_class(CLASS_ETHERNET)
+}
+
+/// Collect every DMA-capable function, `edu` first, into `out`. Returns how many were found.
+///
+/// `find_dma_device` returns only the first, which was enough while one domain existed. Per-device
+/// containment needs them all: a domain bound to one BDF says nothing about what another device
+/// can reach, and the second device is what makes "a capability for A's domain cannot grant reach
+/// into B's" a claim with two sides rather than one.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn find_dma_devices(out: &mut [Function]) -> usize {
+    let mut n = 0;
+    // `edu` first, deliberately: it is the one this nucleus can drive into a transfer, so it is
+    // the device every hardware oracle here is written against, and it should be domain 1
+    // regardless of where it sits in the bus scan.
+    if let Some(f) = find_dma_device() {
+        if n < out.len() {
+            out[n] = f;
+            n += 1;
+        }
+    }
+    for dev in 0..32u8 {
+        for func in 0..8u8 {
+            if n >= out.len() {
+                return n;
+            }
+            let id = read32(0, dev, func, 0x00);
+            let vendor = (id & 0xFFFF) as u16;
+            if vendor == 0xFFFF {
+                continue;
+            }
+            let class = read32(0, dev, func, 0x08) >> 16;
+            if class != CLASS_ETHERNET as u32 {
+                continue;
+            }
+            let f = Function {
+                bus: 0,
+                dev,
+                func,
+                vendor,
+                device: (id >> 16) as u16,
+            };
+            if out[..n].iter().any(|g| g.bdf() == f.bdf()) {
+                continue;
+            }
+            out[n] = f;
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Is this function the one we know how to drive into a DMA?

@@ -51,6 +51,45 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-19 (fifth) — per-device containment, with both halves on hardware
+
+There was one domain, so "a capability for device A's domain cannot grant reach into device B's"
+had nothing to be tested against and was not claimed. There are now two, one per DMA-capable
+function, **each with its own I/O page table** — separate tables are what makes this a fact about
+the machine rather than bookkeeping, since two devices sharing a table would have identical reach
+whatever their models said. The device-table entries carry distinct DomainIDs so the unit's own
+caching and invalidation treat them as separate.
+
+The hardware result, driven by `edu` (the device this nucleus can actually drive):
+
+```
+[iommu] domain 1 bound to 0x0028 with its own page table 0x1206000
+[iommu] domain 2 bound to 0x0010 with its own page table 0x1209000
+[iommu] cross-domain: mapped in 2 yes / in 1 yes | through 2 only the frame reads
+        0x5e17..(sentinel), once 1 maps it 0xd1ce..
+[iommu] PER-DEVICE: a frame mapped in another device's domain stayed UNREACHABLE, and became
+        reachable only when this device's own domain mapped it
+```
+
+Both halves are the same transfer by the same device with exactly ONE thing changed — which
+table the leaf was written into. Without the second half a wall would look like containment: a
+device that reaches nothing is not contained, it is broken. The mutant that gives both devices
+the same table fails with `CROSS-DOMAIN REACH`.
+
+`domain_lookup` is the pure naming rule, and its test covers the case that keeps recurring: `0`
+is what an unclaimed slot carries AND what a zeroed capability names, and that coincidence must
+never become authority — over an empty table or a partly filled one.
+
+What the sweeps had to learn: `FREE_REGION` clears mappings across EVERY domain, because a frame
+may be mapped by more than one device and the region being destroyed knows nothing about which
+domains took it. `UNMAP_DMA` deliberately does NOT — tearing down another device's mapping
+through your own capability is the mirror of installing one in its table.
+
+A capability that named domain 2 as "nonexistent" started failing the moment a second device got
+a domain. That is the assertion working: it was pinned to a fact that changed. It now names 3,
+and the worker also holds a real capability for domain 2, so the second domain is exercised as
+authority rather than only as a refusal.
+
 ## 2026-08-19 (fourth) — allocating memory stopped being authority to reach it
 
 `MAKE_REGION` granted every page it allocated into the device domain. So every region was

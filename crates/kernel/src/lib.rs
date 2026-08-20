@@ -118,15 +118,84 @@ const REGION_MAX_PAGES: u64 = 4;
 /// would make the two diverge, and that divergence is precisely the stale-authorization bug
 /// the hardware half would turn into a device still writing reclaimed memory.
 ///
-/// Sized for the worst case the kernel can reach: every region at its page limit.
-static mut DEVICE_DOMAIN: iommu::Domain<{ MAX_REGIONS * REGION_MAX_PAGES as usize }, 8> =
-    iommu::Domain::new();
+/// How many device domains the nucleus keeps. Two, because the rig has two DMA-capable
+/// functions and the property worth having — a capability for one device's domain cannot grant
+/// reach into another's — has no second side with only one domain.
+const MAX_DOMAINS: usize = 2;
 
+/// One domain: its identity, the device it is bound to, and its OWN I/O page table.
+///
+/// Separate tables are what makes the isolation real rather than bookkeeping. Two devices
+/// sharing a table would have identical reach no matter what the models said.
+#[derive(Clone, Copy)]
+struct DomainSlot {
+    /// 1..N, or 0 for a slot no device claimed.
+    id: u64,
+    /// The BDF whose device-table entry points at this domain's table. Reported at shutdown,
+    /// so which device a domain bounds is inspectable rather than inferred from the order the
+    /// bus scan happened to return.
+    bdf: u16,
+    /// Level-1 table for IOVA 0..2 MiB, or 0 if none was built.
+    l1: u64,
+}
+
+impl DomainSlot {
+    const EMPTY: DomainSlot = DomainSlot {
+        id: 0,
+        bdf: 0,
+        l1: 0,
+    };
+}
+
+static mut DOMAIN_SLOTS: [DomainSlot; MAX_DOMAINS] = [DomainSlot::EMPTY; MAX_DOMAINS];
+
+/// Sized for the worst case the kernel can reach: every region at its page limit.
+static mut DEVICE_DOMAINS: [iommu::Domain<{ MAX_REGIONS * REGION_MAX_PAGES as usize }, 8>;
+    MAX_DOMAINS] = [iommu::Domain::new(), iommu::Domain::new()];
+
+/// Which slot a capability's domain object names, if any.
+///
+/// Pure, so the naming rule is checkable without a machine — including the case that matters
+/// most: `0` is what an unclaimed slot carries AND what a zeroed capability names, and that
+/// coincidence must never become authority.
+fn domain_lookup(ids: &[u64; MAX_DOMAINS], named: u64) -> Option<usize> {
+    ids.iter().position(|&id| id != 0 && id == named)
+}
+
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the domain table.
+unsafe fn domain_ids() -> [u64; MAX_DOMAINS] {
+    core::array::from_fn(|i| (*core::ptr::addr_of!(DOMAIN_SLOTS[i])).id)
+}
+
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the domains.
+unsafe fn domain_at(
+    i: usize,
+) -> &'static mut iommu::Domain<{ MAX_REGIONS * REGION_MAX_PAGES as usize }, 8> {
+    &mut (*core::ptr::addr_of_mut!(DEVICE_DOMAINS))[i]
+}
+
+/// The I/O page table of the domain a capability names.
+///
+/// # Safety
+/// Single-CPU, non-reentrant.
+unsafe fn domain_l1(named: u64) -> Option<u64> {
+    let i = domain_lookup(&domain_ids(), named)?;
+    match (*core::ptr::addr_of!(DOMAIN_SLOTS[i])).l1 {
+        0 => None,
+        l1 => Some(l1),
+    }
+}
+
+/// Domain 1 — the one bound to the device this nucleus can actually drive, and therefore the
+/// one every hardware oracle in the boot demo is written against.
+///
 /// # Safety
 /// Single-CPU, non-reentrant: no other live borrow of the domain.
 unsafe fn device_domain(
 ) -> &'static mut iommu::Domain<{ MAX_REGIONS * REGION_MAX_PAGES as usize }, 8> {
-    &mut *core::ptr::addr_of_mut!(DEVICE_DOMAIN)
+    domain_at(0)
 }
 /// How many regions one process may have mapped at once. Each slot is a fixed span of the
 /// share window, so the kernel picks the address and the caller never supplies one.
@@ -393,15 +462,6 @@ static mut TARGET_BDF: u32 = 0;
 /// reports itself; with none, a blocked transfer is silent.
 #[cfg(target_arch = "x86_64")]
 static mut EVENT_LOG: u64 = 0;
-
-/// Identity of the device domain, or 0 when none exists.
-///
-/// An `IommuDomain` capability's `object` names THIS. It used to name nothing: `map_dma` did not
-/// take a domain at all and always used the single global one, so a capability naming domain 999
-/// granted DMA reach and the boot passed — the capability named a domain and the name was
-/// discarded. A logical id rather than the device's BDF, because the role grant tables are
-/// static and the BDF is discovered at runtime; when several domains exist they take 1..N.
-static mut DEVICE_DOMAIN_ID: u64 = 0;
 
 /// Command buffer base, and our own copy of the tail offset. The unit owns the head; the tail
 /// is ours to advance, and nothing else may write it.
@@ -788,7 +848,9 @@ unsafe fn run_region_plan<A: Arch>(plan: &regions::Plan<PLAN_STEPS>) {
                         {
                             touched |= clear_io_mappings_of(pfn);
                         }
-                        device_domain().revoke(pfn);
+                        for di in 0..MAX_DOMAINS {
+                            domain_at(di).revoke(pfn);
+                        }
                     }
                     #[cfg(target_arch = "x86_64")]
                     if touched {
@@ -1172,7 +1234,11 @@ fn grants_for(role: Role) -> &'static [(abi::CapType, abi::CapRights, u64)] {
             // CapId(10): fully powered, naming a domain that does not exist. Granted rather
             // than merely described, so the object check has a reachable refusing branch —
             // without one it was decorative, and measured as such: a capability naming domain
-            // 999 mapped into the real domain and the boot passed.
+            // 999 mapped into the real domain and the boot passed. It named 2 until a second
+            // device got a domain, at which point the assertion correctly began to fail.
+            (abi::CapType::IommuDomain, abi::CapRights::ALL, 3),
+            // CapId(11): the OTHER device's domain, fully powered. Holding it is real
+            // authority — over a different device.
             (abi::CapType::IommuDomain, abi::CapRights::ALL, 2),
         ],
         // Nothing. A spawned process begins with no authority of its own; what it can do is
@@ -1298,8 +1364,12 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
     // So walk the real table. Any present leaf must be covered by a live grant for the same
     // frame; anything else is the model and the hardware having diverged.
     #[cfg(target_arch = "x86_64")]
-    if let Some(l1) = *core::ptr::addr_of!(IOMMU_L1) {
-        let dom = device_domain();
+    for di in 0..MAX_DOMAINS {
+        let l1 = match (*core::ptr::addr_of!(DOMAIN_SLOTS[di])).l1 {
+            0 => continue,
+            l1 => l1,
+        };
+        let dom = domain_at(di);
         let mut stale = 0u64;
         let mut first = 0u64;
         for slot in 0..512u64 {
@@ -1308,6 +1378,8 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
                 continue;
             }
             let frame = (pte & iopte::ADDR) >> abi::PAGE_SHIFT;
+            // Checked against THIS domain's grants. A leaf covered by some other domain's
+            // grant is exactly the failure worth catching: reach installed in the wrong table.
             if dom.granted(frame).is_none() {
                 if stale == 0 {
                     first = slot * abi::PAGE_SIZE;
@@ -1339,8 +1411,12 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
     // authorizes belongs to a region that still exists. A `Release` that returns frames to the
     // pool while the domain names them is a device authorized to write memory the nucleus has
     // reissued — and that is checkable frame by frame rather than by counting.
-    {
-        let dom = device_domain();
+    for di in 0..MAX_DOMAINS {
+        let slot = *core::ptr::addr_of!(DOMAIN_SLOTS[di]);
+        if slot.id == 0 {
+            continue;
+        }
+        let dom = domain_at(di);
         let live_frame = |pfn: u64| -> bool {
             (0..MAX_REGIONS).any(|i| {
                 let r = &*core::ptr::addr_of!(REGIONS[i]);
@@ -1352,7 +1428,10 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
         let orphan = dom.grants().find(|(pfn, _)| !live_frame(*pfn));
         let _ = writeln!(
             con,
-            "[iommu] domain holds {} grant(s) and {} mapping(s), all within live regions: {}",
+            "[iommu] domain {} ({:#06x}) holds {} grant(s) and {} mapping(s), all within live \
+             regions: {}",
+            slot.id,
+            slot.bdf,
             dom.grant_count(),
             dom.reachable().count(),
             orphan.is_none() && dom.contained()
@@ -1708,18 +1787,12 @@ unsafe fn program_dte<A: Arch>(
     base: u64,
     dt: u64,
 ) {
-    let bdf = *core::ptr::addr_of!(TARGET_BDF);
-    if bdf & 0x1_0000 == 0 {
+    if *core::ptr::addr_of!(TARGET_BDF) & 0x1_0000 == 0 {
         let _ = writeln!(con, "[iommu] no target device — leaving the unit disabled");
         return;
     }
-    let bdf = (bdf & 0xFFFF) as u64;
 
     use abi::FrameAllocator as _;
-    let Some(root) = fa.alloc_frame().map(|f| zero_frame(f)) else {
-        let _ = writeln!(con, "[iommu] no frame for an I/O page-table root");
-        return;
-    };
 
     // DTE word 0: V | TV | Mode (bits 11:9) | root (bits 51:12) | IR | IW.
     // Mode 3 = a three-level table. Mode 0 would mean "translation disabled", i.e. the device
@@ -1729,23 +1802,37 @@ unsafe fn program_dte<A: Arch>(
     const TV: u64 = 1 << 1;
     const IR: u64 = 1 << 61;
     const IW: u64 = 1 << 62;
-    let w0 = V | TV | MODE_3_LEVEL | (root.as_u64() & 0x000F_FFFF_FFFF_F000) | IR | IW;
-    // SAFETY: single-CPU boot path.
-    IOMMU_PT_ROOT = root.as_u64();
-
-    // The lower two levels are built HERE, not in the demo that first needed them. A syscall
-    // that maps DMA has to write a leaf into a table that already exists, and while the demo
-    // owned the L2/L1 allocation the table only existed if the demo happened to run. Both
-    // levels stay EMPTY: an entry per level covering IOVA 0..2 MiB, with no leaf under it, so
-    // this changes what can be REACHED not at all — every address still resolves to a
-    // not-present leaf until something writes one.
     const PR: u64 = 1 << 0;
     const NEXT_LEVEL_2: u64 = 2 << 9;
     const NEXT_LEVEL_1: u64 = 1 << 9;
-    if let (Some(l2), Some(l1)) = (
-        fa.alloc_frame().map(|f| zero_frame(f)),
-        fa.alloc_frame().map(|f| zero_frame(f)),
-    ) {
+
+    // ONE TABLE PER DEVICE. Two devices sharing a table would have identical reach whatever
+    // their models said, so separate tables are what makes per-device containment a fact about
+    // the machine rather than bookkeeping. Domain 1 is `edu` — the device this nucleus can
+    // drive — so every hardware oracle in the demo is written against a domain that can answer.
+    let mut devs = [pci::Function::EMPTY; MAX_DOMAINS];
+    let found = pci::find_dma_devices(&mut devs);
+    let mut live = 0usize;
+    let mut dev0_w0 = 0u64;
+    for (i, f) in devs[..found].iter().enumerate() {
+        let bdf = f.bdf() as u64;
+        let Some(root) = fa.alloc_frame().map(|f| zero_frame(f)) else {
+            let _ = writeln!(con, "[iommu] no frame for an I/O page-table root");
+            break;
+        };
+        let w0 = V | TV | MODE_3_LEVEL | (root.as_u64() & 0x000F_FFFF_FFFF_F000) | IR | IW;
+
+        // Both lower levels are built here, EMPTY: an entry per level covering IOVA 0..2 MiB
+        // with no leaf under it, so what can be reached is unchanged — every address still
+        // resolves to a not-present leaf until something writes one. They exist up front
+        // because a syscall that maps DMA must write into a table that is already there.
+        let (Some(l2), Some(l1)) = (
+            fa.alloc_frame().map(|f| zero_frame(f)),
+            fa.alloc_frame().map(|f| zero_frame(f)),
+        ) else {
+            let _ = writeln!(con, "[iommu] no frames for an I/O page table");
+            break;
+        };
         core::ptr::write_volatile(
             root.as_u64() as *mut u64,
             (l2.as_u64() & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | NEXT_LEVEL_2,
@@ -1754,30 +1841,56 @@ unsafe fn program_dte<A: Arch>(
             l2.as_u64() as *mut u64,
             (l1.as_u64() & 0x000F_FFFF_FFFF_F000) | PR | IR | IW | NEXT_LEVEL_1,
         );
-        IOMMU_L1 = Some(l1.as_u64());
+
+        let dte = (dt + bdf * 32) as *mut u64;
+        core::ptr::write_volatile(dte, w0);
+        // Word 1 carries the DomainID. Distinct per device, so the unit's own invalidation and
+        // caching treat them as separate domains rather than as one.
+        core::ptr::write_volatile(dte.add(1), i as u64);
+        core::ptr::write_volatile(dte.add(2), 0);
+        core::ptr::write_volatile(dte.add(3), 0);
+        let back = core::ptr::read_volatile(dte);
+        if back != w0 {
+            let _ = writeln!(
+                con,
+                "[iommu] DTE write did NOT take for {bdf:#06x}: {back:#018x} != {w0:#018x}"
+            );
+            continue;
+        }
+
         // The domain exists only now that there is a device table entry AND a table under it.
-        // Setting this earlier would let `MAP_DMA` accept a capability for a domain that could
+        // Claiming it earlier would let `MAP_DMA` accept a capability for a domain that could
         // not yet hold a mapping.
-        DEVICE_DOMAIN_ID = 1;
-    }
-    let w1: u64 = 0; // domain 0
-
-    let dte = (dt + bdf * 32) as *mut u64;
-    // SAFETY: single-CPU boot path.
-    DEVICE_TABLE_ENTRY = dte as u64;
-    core::ptr::write_volatile(dte, w0);
-    core::ptr::write_volatile(dte.add(1), w1);
-    core::ptr::write_volatile(dte.add(2), 0);
-    core::ptr::write_volatile(dte.add(3), 0);
-
-    let back = core::ptr::read_volatile(dte);
-    if back != w0 {
+        DOMAIN_SLOTS[i] = DomainSlot {
+            id: (i + 1) as u64,
+            bdf: f.bdf(),
+            l1: l1.as_u64(),
+        };
+        live += 1;
+        if i == 0 {
+            IOMMU_PT_ROOT = root.as_u64();
+            IOMMU_L1 = Some(l1.as_u64());
+            DEVICE_TABLE_ENTRY = dte as u64;
+            dev0_w0 = w0;
+        }
         let _ = writeln!(
             con,
-            "[iommu] DTE write did NOT take: {back:#018x} != {w0:#018x}"
+            "[iommu] domain {} bound to {:#06x} with its own page table {:#x}",
+            i + 1,
+            f.bdf(),
+            l1.as_u64()
+        );
+    }
+    if live == 0 {
+        let _ = writeln!(
+            con,
+            "[iommu] no domain could be built — leaving the unit disabled"
         );
         return;
     }
+    let bdf = (*core::ptr::addr_of!(TARGET_BDF) & 0xFFFF) as u64;
+    let w0 = dev0_w0;
+    let root = abi::PhysAddr(*core::ptr::addr_of!(IOMMU_PT_ROOT));
 
     // ---- event log: without it, a refused DMA is SILENT ----
     //
@@ -1988,15 +2101,6 @@ const DMA_IOVA_FIRST_SLOT: u64 = 256;
 #[cfg(target_arch = "x86_64")]
 const DMA_IOVA_SLOTS: u64 = 256;
 
-/// May a capability naming domain `named` act, given that the live domain is `live`?
-///
-/// Pure, so the rule is checkable without a machine. `live == 0` means no domain exists yet —
-/// a device table entry with a table under it is what brings one into being — and in that state
-/// NO capability names a usable domain, including one whose object happens to be 0.
-const fn domain_named_is_live(named: u64, live: u64) -> bool {
-    live != 0 && named == live
-}
-
 /// Index of the live region with identity `id`.
 #[cfg(target_arch = "x86_64")]
 unsafe fn region_index(id: u64) -> Option<usize> {
@@ -2021,17 +2125,17 @@ unsafe fn map_dma(domain: u64, region_id: u64, rights: abi::CapRights) -> u64 {
     // The capability's object has to name a domain that EXISTS. Without this the object is
     // decorative: measured, a capability naming domain 999 mapped into the real one.
     // Two different refusals, kept apart because they mean different things to the caller.
-    // No unit programmed at all is NO_MEM: there is nothing here that could bound DMA, and a
-    // "granted" mapping would be indistinguishable from access to all of memory. A domain that
-    // exists but is not the one this capability names is NO_CAP: an authority question.
-    let live = *core::ptr::addr_of!(DEVICE_DOMAIN_ID);
-    if live == 0 {
+    // No domain at all is NO_MEM: there is nothing here that could bound DMA, and a "granted"
+    // mapping would be indistinguishable from access to all of memory. A domain that exists
+    // but is not the one this capability names is NO_CAP: an authority question.
+    let ids = domain_ids();
+    if ids.iter().all(|&id| id == 0) {
         return abi::syserr::NO_MEM;
     }
-    if !domain_named_is_live(domain, live) {
+    let Some(di) = domain_lookup(&ids, domain) else {
         return abi::syserr::NO_CAP;
-    }
-    let Some(l1) = *core::ptr::addr_of!(IOMMU_L1) else {
+    };
+    let Some(l1) = domain_l1(domain) else {
         return abi::syserr::NO_MEM;
     };
     let Some(ri) = region_index(region_id) else {
@@ -2061,11 +2165,12 @@ unsafe fn map_dma(domain: u64, region_id: u64, rights: abi::CapRights) -> u64 {
     for k in 0..npages {
         let frame = (*core::ptr::addr_of!(REGIONS[ri])).frames[k as usize].as_u64();
         let iova = (first + k) * abi::PAGE_SIZE;
-        // The grant is issued HERE, with the rights of the capability that asked. `map` still
-        // decides — it refuses rights wider than the grant — but the grant now records an
-        // actual request rather than the fact that memory was once allocated.
-        device_domain().grant(frame >> abi::PAGE_SHIFT, rights);
-        if device_domain()
+        // The grant is issued HERE, with the rights of the capability that asked, INTO THE
+        // DOMAIN THAT CAPABILITY NAMES. `map` still decides — it refuses rights wider than the
+        // grant — but the grant now records an actual request rather than the fact that memory
+        // was once allocated.
+        domain_at(di).grant(frame >> abi::PAGE_SHIFT, rights);
+        if domain_at(di)
             .map(iova, frame >> abi::PAGE_SHIFT, rights)
             .is_err()
         {
@@ -2074,8 +2179,8 @@ unsafe fn map_dma(domain: u64, region_id: u64, rights: abi::CapRights) -> u64 {
             for done in 0..=k {
                 let back = (first + done) * abi::PAGE_SIZE;
                 let f = (*core::ptr::addr_of!(REGIONS[ri])).frames[done as usize].as_u64();
-                device_domain().unmap(back);
-                device_domain().revoke(f >> abi::PAGE_SHIFT);
+                domain_at(di).unmap(back);
+                domain_at(di).revoke(f >> abi::PAGE_SHIFT);
                 core::ptr::write_volatile((l1 + (first + done) * 8) as *mut u64, 0);
             }
             return abi::syserr::NO_CAP;
@@ -2099,13 +2204,14 @@ unsafe fn map_dma(domain: u64, region_id: u64, rights: abi::CapRights) -> u64 {
 /// # Safety
 /// Single-CPU, non-reentrant.
 #[cfg(target_arch = "x86_64")]
-unsafe fn clear_io_mappings_of(pfn: u64) -> bool {
-    let Some(l1) = *core::ptr::addr_of!(IOMMU_L1) else {
-        return false;
+unsafe fn clear_io_mappings_in(di: usize, pfn: u64) -> bool {
+    let l1 = match (*core::ptr::addr_of!(DOMAIN_SLOTS[di])).l1 {
+        0 => return false,
+        l1 => l1,
     };
     let mut iovas = [0u64; REGION_MAX_PAGES as usize * 2];
     let mut n = 0;
-    for (iova, frame, _) in device_domain().reachable() {
+    for (iova, frame, _) in domain_at(di).reachable() {
         if frame == pfn && n < iovas.len() {
             iovas[n] = iova;
             n += 1;
@@ -2117,47 +2223,64 @@ unsafe fn clear_io_mappings_of(pfn: u64) -> bool {
     n > 0
 }
 
+/// The same, across EVERY domain.
+///
+/// Freeing memory has to reach all of them. A frame may be mapped by more than one device, and
+/// the region being destroyed knows nothing about which domains took it — so a sweep that
+/// stopped at the first would return a frame to the allocator while another device still
+/// reached it, which is the bug this whole path exists to prevent, one domain over.
+///
+/// # Safety
+/// Single-CPU, non-reentrant.
+#[cfg(target_arch = "x86_64")]
+unsafe fn clear_io_mappings_of(pfn: u64) -> bool {
+    let mut any = false;
+    for di in 0..MAX_DOMAINS {
+        any |= clear_io_mappings_in(di, pfn);
+    }
+    any
+}
+
 /// Withdraw every DMA mapping of a region, and TELL THE UNIT.
 ///
 /// # Safety
 /// Single-CPU, non-reentrant.
 #[cfg(target_arch = "x86_64")]
 unsafe fn unmap_dma(domain: u64, region_id: u64) -> u64 {
-    let live = *core::ptr::addr_of!(DEVICE_DOMAIN_ID);
-    if live == 0 {
+    let ids = domain_ids();
+    if ids.iter().all(|&id| id == 0) {
         return abi::syserr::NO_MEM;
     }
-    if !domain_named_is_live(domain, live) {
+    let Some(di) = domain_lookup(&ids, domain) else {
         return abi::syserr::NO_CAP;
-    }
-    let Some(l1) = *core::ptr::addr_of!(IOMMU_L1) else {
-        return abi::syserr::NO_MEM;
     };
     let Some(ri) = region_index(region_id) else {
         return abi::syserr::NO_CAP;
     };
-    let _ = l1;
     let npages = (*core::ptr::addr_of!(REGIONS[ri])).npages;
     for k in 0..npages {
         let pfn =
             (*core::ptr::addr_of!(REGIONS[ri])).frames[k as usize].as_u64() >> abi::PAGE_SHIFT;
         // Hardware first, then the model — the model is the index that finds the hardware.
-        clear_io_mappings_of(pfn);
+        // Only THIS domain: unmapping through one device's capability must not tear down
+        // another device's mapping of the same frame, which is the mirror of the property
+        // that one capability cannot install a mapping in another's table.
+        clear_io_mappings_in(di, pfn);
         let mut iovas = [0u64; REGION_MAX_PAGES as usize * 2];
         let mut n = 0;
-        for (iova, frame, _) in device_domain().reachable() {
+        for (iova, frame, _) in domain_at(di).reachable() {
             if frame == pfn && n < iovas.len() {
                 iovas[n] = iova;
                 n += 1;
             }
         }
         for &iova in iovas.iter().take(n) {
-            device_domain().unmap(iova);
+            domain_at(di).unmap(iova);
         }
         // And the grant, which `MAP_DMA` issued. Leaving it would make the domain hold
         // authority for a frame nothing can reach — harmless for containment, but it would
         // outlive the request that created it and accumulate for the life of the boot.
-        device_domain().revoke(pfn);
+        domain_at(di).revoke(pfn);
     }
     // Clearing the table is not revocation while the unit still holds a translation it has
     // already performed. Measured on the rig: without this the device kept reaching the frame.
@@ -2349,8 +2472,6 @@ unsafe fn prove_containment<A: Arch>(
     const PR: u64 = 1 << 0; // present
     const IR: u64 = 1 << 61; // device may read
     const IW: u64 = 1 << 62; // device may write
-    const NEXT_LEVEL_2: u64 = 2 << 9;
-    const NEXT_LEVEL_1: u64 = 1 << 9;
     const LEAF: u64 = 0 << 9;
     const IOVA: u64 = 0x1000;
     const IOVA_SRC: u64 = 0x2000;
@@ -2643,6 +2764,84 @@ unsafe fn prove_containment<A: Arch>(
                 "[iommu] (bug) STALE MAPPING: a withdrawn IOVA still reached its frame \
                  ({after_withdraw:#018x}) — the table was cleared but the unit was not told"
             );
+        }
+    }
+
+    // ---- PER-DEVICE CONTAINMENT: one device's domain is not another's ----
+    //
+    // Domain 2 belongs to the other DMA-capable function and has its own page table. A frame
+    // mapped there must not become reachable by `edu`, whose domain is 1. Both halves are the
+    // same transfer by the same device with exactly one thing changed — WHICH TABLE the leaf
+    // was written into — so "refused" and "reached" are one measurement rather than two
+    // stories. Without the second half, a wall would look like containment.
+    if let Some(other) = fa.alloc_frame().map(|f| zero_frame(f)) {
+        let l1_two = (*core::ptr::addr_of!(DOMAIN_SLOTS[1])).l1;
+        let l1_one = (*core::ptr::addr_of!(DOMAIN_SLOTS[0])).l1;
+        if l1_two != 0 && l1_one != 0 {
+            const IOVA_OTHER: u64 = 0x8000;
+            let slot = (IOVA_OTHER >> abi::PAGE_SHIFT) & 0x1FF;
+            let rw = abi::CapRights(0b011);
+            let pfn = other.as_u64() >> abi::PAGE_SHIFT;
+            for i in 0..8u64 {
+                core::ptr::write_volatile((other.as_u64() + i * 8) as *mut u64, SENTINEL);
+            }
+
+            // Granted and mapped in domain 2 ONLY.
+            domain_at(1).grant(pfn, rw);
+            let mapped_two = domain_at(1).map(IOVA_OTHER, pfn, rw).is_ok();
+            core::ptr::write_volatile(
+                (l1_two + slot * 8) as *mut u64,
+                iopte::leaf(other.as_u64(), rw),
+            );
+            let _ = run(0x4_0000, IOVA_OTHER, true);
+            let across = first_disturbed(other.as_u64(), SENTINEL);
+
+            // Now the SAME frame at the SAME IOVA in edu's own domain: the control that says
+            // the refusal above was the table and not the transfer.
+            domain_at(0).grant(pfn, rw);
+            let mapped_one = domain_at(0).map(IOVA_OTHER, pfn, rw).is_ok();
+            core::ptr::write_volatile(
+                (l1_one + slot * 8) as *mut u64,
+                iopte::leaf(other.as_u64(), rw),
+            );
+            let _ = run(0x4_0000, IOVA_OTHER, true);
+            let within = first_disturbed(other.as_u64(), SENTINEL);
+
+            let _ = writeln!(
+                con,
+                "[iommu] cross-domain: mapped in 2 {} / in 1 {} | through 2 only the frame \
+                 reads {across:#018x}, once 1 maps it {within:#018x}",
+                if mapped_two { "yes" } else { "NO" },
+                if mapped_one { "yes" } else { "NO" }
+            );
+            if across == SENTINEL && within != SENTINEL {
+                let _ = writeln!(
+                    con,
+                    "[iommu] PER-DEVICE: a frame mapped in another device's domain stayed \
+                     UNREACHABLE, and became reachable only when this device's own domain \
+                     mapped it"
+                );
+            } else if across != SENTINEL {
+                let _ = writeln!(
+                    con,
+                    "[iommu] (bug) CROSS-DOMAIN REACH: the device read through a mapping that \
+                     belongs to another device's domain"
+                );
+            } else {
+                let _ = writeln!(
+                    con,
+                    "[iommu] (bug) the device could not reach its OWN domain's mapping — the \
+                     refusal above shows nothing"
+                );
+            }
+
+            // Withdraw both, hardware first, and tell the unit.
+            for (di, l1) in [(0usize, l1_one), (1usize, l1_two)] {
+                core::ptr::write_volatile((l1 + slot * 8) as *mut u64, 0);
+                domain_at(di).unmap(IOVA_OTHER);
+                domain_at(di).revoke(pfn);
+            }
+            iommu_invalidate(base);
         }
     }
 
@@ -4008,12 +4207,14 @@ unsafe fn make_region<A: Arch>(owner: usize, pages: u64, rights: abi::CapRights)
     // been freed and its grants revoked with it. Measured — that mutant survived both of them.
     // An `assert!` and not `debug_assert!`: the release build is the one that boots.
     for k in 0..pages as usize {
-        assert!(
-            device_domain()
-                .granted(frames[k].as_u64() >> abi::PAGE_SHIFT)
-                .is_none(),
-            "MAKE_REGION handed a device DMA authority for a frame nobody asked to map"
-        );
+        for di in 0..MAX_DOMAINS {
+            assert!(
+                domain_at(di)
+                    .granted(frames[k].as_u64() >> abi::PAGE_SHIFT)
+                    .is_none(),
+                "MAKE_REGION handed a device DMA authority for a frame nobody asked to map"
+            );
+        }
     }
     *(&mut *core::ptr::addr_of_mut!(REGIONS[idx])) = Region {
         live: true,
@@ -4624,30 +4825,44 @@ mod tests {
         );
     }
 
-    /// A capability's domain OBJECT must name a domain that exists.
+    /// A capability's domain OBJECT must name a domain that EXISTS, and resolve to that one.
     ///
-    /// This shipped decorative: `map_dma` took no domain at all and always used the single
-    /// global one, so a capability naming domain 999 granted DMA reach and the boot passed.
+    /// This shipped decorative once: `map_dma` took no domain at all, so a capability naming
+    /// domain 999 granted DMA reach into the real one and the boot passed.
     #[test]
-    fn a_capability_must_name_a_domain_that_exists() {
-        assert!(domain_named_is_live(1, 1), "the live domain must be usable");
-        assert!(
-            !domain_named_is_live(2, 1),
-            "a capability naming another domain acted on the live one"
+    fn a_capability_resolves_to_the_domain_it_names_and_no_other() {
+        let ids = [1u64, 2];
+        assert_eq!(domain_lookup(&ids, 1), Some(0));
+        assert_eq!(
+            domain_lookup(&ids, 2),
+            Some(1),
+            "the second domain is reachable"
         );
-        assert!(
-            !domain_named_is_live(999, 1),
-            "an arbitrary object resolved to the live domain"
+        assert_eq!(domain_lookup(&ids, 3), None, "an unknown object resolved");
+        assert_eq!(domain_lookup(&ids, 999), None);
+
+        // Unclaimed slots carry 0, and so does a zeroed capability. That coincidence must
+        // never become authority — over an empty table or a partly filled one.
+        assert_eq!(
+            domain_lookup(&[0, 0], 0),
+            None,
+            "domain 0 resolved on an empty table"
         );
-        // Before any device table entry exists there is no domain, and nothing names one —
-        // including a capability whose object is 0, which is the value an uninitialised or
-        // zeroed slot carries. That coincidence must not become authority.
-        for named in [0u64, 1, 2, 999] {
-            assert!(
-                !domain_named_is_live(named, 0),
+        assert_eq!(
+            domain_lookup(&[1, 0], 0),
+            None,
+            "domain 0 resolved to an unclaimed slot"
+        );
+        for named in [1u64, 2, 999] {
+            assert_eq!(
+                domain_lookup(&[0, 0], named),
+                None,
                 "domain {named} was usable before any domain existed"
             );
         }
+        // A slot that exists must not answer for its neighbour.
+        assert_eq!(domain_lookup(&[1, 0], 2), None);
+        assert_eq!(domain_lookup(&[0, 2], 2), Some(1));
     }
 
     /// The two Region gates, both of which the boot cannot see (measured: deleting either
