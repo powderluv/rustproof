@@ -342,6 +342,17 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ]; then
             echo "  the process, or the window mapped was not the device"
             exit 1
         fi
+        # And the process DRIVING it: an untrusted program commands a real bus master, and the
+        # transfer lands exactly in the memory one of its own capabilities asked MAP_DMA for.
+        if ! echo "$OUT" | grep -q 'dev: WE drove the device'; then
+            echo "RESULT: FAIL — the process could not move data through an IOVA it was granted"
+            exit 1
+        fi
+        if ! echo "$OUT" | grep -q 'dev: a transfer aimed at an IOVA we were never granted'; then
+            echo "RESULT: FAIL — an ungranted IOVA reached the process's memory, or the check"
+            echo "  for it never ran"
+            exit 1
+        fi
     elif ! echo "$OUT" | grep -q 'dev: no bounded device on this machine'; then
         echo "RESULT: FAIL — a real bus-mastering BAR was handed to an untrusted process on a"
         echo "  machine where nothing bounds its DMA"

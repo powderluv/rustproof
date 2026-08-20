@@ -51,6 +51,38 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-20 — an untrusted process DRIVES the device, and reaches only what it was granted
+
+The whole story, end to end, in one process that holds no privilege of any kind:
+
+```
+[proc 2] dev: mapped the REAL device BAR and read its identification register
+         dev: WE drove the device and our data came back through the IOVA we were granted
+         dev: a transfer aimed at an IOVA we were never granted changed nothing we own
+```
+
+It creates a region, asks `MAP_DMA` for an IOVA, writes a pattern through its own CPU mapping,
+programs the device's source/destination/count/command registers to move those bytes out to the
+device and back, clobbers its copy first so anything that returns must have come from the device,
+and reads the pattern back. Every address it touches came from a capability it holds.
+
+**What the negative establishes, stated precisely.** A transfer aimed at an IOVA nobody granted
+it changed nothing it owns. It is NOT a claim that the device could not reach that memory by some
+other route — the process cannot even NAME the memory to try, which is the point. From ring 3 an
+address is an IOVA, and the only IOVAs that resolve are the ones `MAP_DMA` handed back.
+
+Containment is exact at page granularity: the mutant that aims the round-trip ONE PAGE past the
+single-page grant fails with "the device did not return our data".
+
+The bug worth recording is the observer, not the mechanism. The first version borrowed the
+demo's mailbox region and its address — but the demo had already `UNMAP_REGION`'d it, so the
+address was stale, and a later `MAP_REGION` handed that freed share slot to a different region.
+Both windows became the same page. The transfer had been working the whole time; the check was
+reading the wrong memory, and it reported "the device reached a region we never offered it",
+which is about as alarming as a false negative gets. Diagnostics printing the two addresses
+side by side settled it in one run — `mva == qva`. The test is self-contained now: it makes its
+own regions and maps them itself, borrowing no state from the demo around it.
+
 ## 2026-08-19 (sixth) — an untrusted process holds a REAL bus-mastering device
 
 `MAP_BAR` mapped a kernel RAM frame with a signature in it. That stand-in was deliberate:

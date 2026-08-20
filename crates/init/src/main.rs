@@ -479,6 +479,108 @@ fn poll_irq(cap: u64) -> u64 {
     unsafe { syscall1(sysno::POLL_IRQ, cap) }
 }
 
+/// Command the real device to move our data through an IOVA we were granted, and show it lands
+/// exactly there and nowhere else we own.
+///
+/// This is the nucleus's whole point in one function: an UNTRUSTED process programs a live
+/// bus-mastering device, and the transfer reaches precisely the memory some capability of ours
+/// asked `MAP_DMA` to expose. Nothing here is privileged — `bar` is a window an `Mmio`
+/// capability bought, the IOVA is what `MAP_DMA` returned, and the CPU mapping is our own, so
+/// we can see what the device did.
+///
+/// Self-contained on purpose. The first version borrowed the demo's mailbox region and its
+/// address, which the demo had already unmapped — so the address was stale, a later
+/// `MAP_REGION` handed the freed share slot to a different region, and both windows became the
+/// same memory. The transfer was fine; the observer was looking at the wrong page.
+fn drive_device(bar: u64) {
+    const PAT: u64 = 0xC0FF_EE00_C0FF_EE00;
+    const QUIET: u64 = 0x5151_5151_5151_5151;
+
+    let bad = |c: u64| c == syserr::NO_CAP || c == syserr::NO_MEM;
+
+    let mine = make_region(2, 1);
+    let quiet = make_region(2, 1);
+    if bad(mine) || bad(quiet) {
+        dw!(b"dev: could not obtain regions to drive the device with (bug)\n");
+        return;
+    }
+    let mva = map_region(mine);
+    let qva = map_region(quiet);
+    let iova = map_dma(8, mine);
+    if bad(mva) || bad(qva) || bad(iova) {
+        dw!(b"dev: could not map our own memory for the device (bug)\n");
+        return;
+    }
+
+    // SAFETY: both windows were mapped for us by the kernel, one page each.
+    unsafe {
+        for i in 0..8u64 {
+            core::ptr::write_volatile((mva + i * 8) as *mut u64, PAT);
+            core::ptr::write_volatile((qva + i * 8) as *mut u64, QUIET);
+        }
+    }
+
+    // edu: 0x80 source, 0x88 destination, 0x90 count, 0x98 command (bit0 start, bit1 direction).
+    // 0x40000 is the device's own buffer. Poll the command register rather than sleeping a
+    // guessed interval — the transfer is deferred, so a fixed spin is a race.
+    let run = |src: u64, dst: u64, to_ram: bool| -> bool {
+        // SAFETY: `bar` is our mapped register window; these four offsets are inside its page.
+        unsafe {
+            core::ptr::write_volatile((bar + 0x80) as *mut u64, src);
+            core::ptr::write_volatile((bar + 0x88) as *mut u64, dst);
+            core::ptr::write_volatile((bar + 0x90) as *mut u64, 64);
+            core::ptr::write_volatile((bar + 0x98) as *mut u64, if to_ram { 0x3 } else { 0x1 });
+            for _ in 0..200_000_000u64 {
+                if core::ptr::read_volatile((bar + 0x98) as *const u64) & 1 == 0 {
+                    return true;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        false
+    };
+
+    let up = run(iova, 0x4_0000, false);
+    // Clobber our copy, so whatever comes back must have come from the device.
+    // SAFETY: as above.
+    unsafe {
+        for i in 0..8u64 {
+            core::ptr::write_volatile((mva + i * 8) as *mut u64, 0);
+        }
+    }
+    let down = run(0x4_0000, iova, true);
+    // And a transfer aimed at an IOVA nobody granted us, which must reach nothing of ours.
+    let stray = run(0x4_0000, iova.wrapping_add(0x10_0000), true);
+
+    // SAFETY: as above.
+    let (back, quiet_now) = unsafe {
+        (
+            core::ptr::read_volatile(mva as *const u64),
+            core::ptr::read_volatile(qva as *const u64),
+        )
+    };
+
+    if up && down && back == PAT {
+        dw!(b"dev: WE drove the device and our data came back through the IOVA we were granted\n");
+    } else {
+        dw!(b"dev: the device did not return our data through its granted IOVA (bug)\n");
+    }
+    // What this establishes, precisely: a transfer we aimed at an IOVA nobody granted us
+    // changed nothing we own. It is not a claim that the device could not reach that memory by
+    // some other route — we cannot even NAME the memory to try, which is the point. From here
+    // an address is an IOVA, and the only IOVAs that resolve are the ones MAP_DMA handed back.
+    if quiet_now == QUIET && back == PAT {
+        dw!(b"dev: a transfer aimed at an IOVA we were never granted changed nothing we own\n");
+    } else {
+        dw!(b"dev: an ungranted IOVA reached memory of ours (bug)\n");
+    }
+    let _ = stray;
+
+    unmap_dma(8, mine);
+    free_region(mine);
+    free_region(quiet);
+}
+
 /// Create a shareable region of `pages` pages, paid for with `Untyped` capability `cap`.
 /// Returns the new `Region` capability's id, or a `syserr`.
 fn make_region(cap: u64, pages: u64) -> u64 {
@@ -913,6 +1015,7 @@ fn compute(id: u64) -> ! {
                 let ident = unsafe { core::ptr::read_volatile(resp.user_va as *const u32) };
                 if ident == 0x0100_00ed {
                     dw!(b"dev: mapped the REAL device BAR and read its identification register\n");
+                    drive_device(resp.user_va);
                 } else {
                     // A real aperture, but not the one whose signature we know. Reporting it
                     // rather than calling it a bug: which device the nucleus bounded is its
