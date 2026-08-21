@@ -376,6 +376,15 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ]; then
         fi
         # Required only where a domain EXISTS: with no unit every domain capability is refused
         # for that reason alone, and the object would never be looked at.
+        # Default DENY: every PCI function has a valid device-table entry. An entry with V=0 is
+        # PASSTHROUGH in this unit, so a function the nucleus never enumerated has unrestricted
+        # DMA while the boot claims to bound it — and the rig really does have more DMA-capable
+        # functions than there are domains for.
+        if ! echo "$OUT" | grep -qE '\[iommu\] [0-9]+ other function\(s\) given an EMPTY table; [0-9]+ present, 0 still passed through'; then
+            echo "RESULT: FAIL — a PCI function was left without a valid device-table entry,"
+            echo "  which this unit treats as passthrough"
+            exit 1
+        fi
         # Invalidation must name the domain it is flushing. There is no PAYLOAD oracle for the
         # second domain — its device cannot be driven from here — so the witness is the
         # emulator's own report of what the unit was told. Checked only when tracing is on,

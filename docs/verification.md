@@ -51,6 +51,36 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-21 (later still) — the default was PASSTHROUGH, and most of the bus was outside the claim
+
+A device-table entry with `V = 0` is **passthrough**, not deny. The nucleus programmed entries
+for the devices it had domains for, enabled the unit, and left every other function at zero — so
+they had UNRESTRICTED DMA while the boot reported containment.
+
+Not a corner case on this rig. Measured, before the change:
+
+```
+[iommu] 3 DMA-capable function(s) present; room to bound 2
+[iommu] 7 other function(s) given an EMPTY table; 9 present, 7 still passed through
+```
+
+Nine PCI functions, two bounded, **seven passed through** — including a third DMA-capable
+function the enumeration silently dropped past `MAX_DOMAINS`. Every claim this arc made about
+bounding DMA was a claim about the two devices that happened to fit.
+
+Every remaining function now gets a VALID entry pointing at an EMPTY page table, with a DomainID
+of its own so a flush for a bounded device never speaks for it: the walk reaches a not-present
+level and the transfer is refused. Reaching nothing is the right default for a device nobody has
+asked to use.
+
+The check is a READ-BACK, not a count of writes: a store that did not take leaves `V = 0`, which
+is the passthrough being removed, and counting writes would report success either way. The boot
+now requires `0 still passed through` and the mutant that skips the sweep reports 7 and fails.
+
+This is the same shape as the arc's other findings, one level up. Containment was demonstrated
+for the device we can drive, and generalised — silently — to "the nucleus bounds DMA". What the
+generalisation skipped over was every device the enumeration never reached.
+
 ## 2026-08-21 (later) — the adversarial review of the DMA arc: four real ones
 
 Twenty agents over the seven-commit arc. Four findings survived refutation and were acted on;

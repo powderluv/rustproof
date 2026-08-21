@@ -388,6 +388,10 @@ Client-side typed-cap signatures are shown as comments for readability; the wire
      Updated 2026-08-19 (later): there are now TWO domains, one per DMA-capable function, each
      with its OWN I/O page table, and a capability naming one cannot install a mapping in the
      other's — demonstrated on the rig, both halves, by the device the nucleus can drive.
+     Extended 2026-08-21: the unit now runs DEFAULT-DENY. An entry with `V = 0` is passthrough,
+     so every PCI function without a domain gets a valid entry over an EMPTY table rather than
+     none at all — before that, seven of nine functions on the rig had unrestricted DMA while
+     the boot reported containment.
      SATISFIED 2026-08-19: an `Mmio` capability can now name the bounded device's REAL register
      aperture, and a ring-3 process maps it and reads the device's identification register back.
      The precondition is ENFORCED, not stated: the capability resolves to nothing unless that

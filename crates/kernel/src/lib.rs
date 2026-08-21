@@ -1938,6 +1938,12 @@ unsafe fn program_dte<A: Arch>(
     // drive — so every hardware oracle in the demo is written against a domain that can answer.
     let mut devs = [pci::Function::EMPTY; MAX_DOMAINS];
     let found = pci::find_dma_devices(&mut devs);
+    let total = pci::count_dma_devices();
+    let _ = writeln!(
+        con,
+        "[iommu] {total} DMA-capable function(s) present; room to bound {}",
+        MAX_DOMAINS
+    );
     let mut live = 0usize;
     let mut dev0_w0 = 0u64;
     for (i, f) in devs[..found].iter().enumerate() {
@@ -2011,6 +2017,70 @@ unsafe fn program_dte<A: Arch>(
         let _ = writeln!(
             con,
             "[iommu] no domain could be built — leaving the unit disabled"
+        );
+        return;
+    }
+
+    // ---- DEFAULT DENY for everything else on the bus ----
+    //
+    // An entry with V = 0 is PASSTHROUGH, not deny. So enabling the unit while programming
+    // entries only for the devices we have domains for leaves every other function with
+    // UNRESTRICTED access to memory — and the machine really does have more than we can bound:
+    // the rig reports three DMA-capable functions and there is room for two. The nucleus was
+    // claiming to bound DMA while a bus master sat outside the claim.
+    //
+    // Every remaining function therefore gets a VALID entry pointing at an EMPTY table: the
+    // walk reaches a not-present level and the transfer is refused. Reaching nothing is the
+    // right default for a device nobody has asked to use.
+    if let Some(deny) = fa.alloc_frame().map(|f| zero_frame(f)) {
+        let deny_w0 = V | TV | MODE_3_LEVEL | (deny.as_u64() & 0x000F_FFFF_FFFF_F000) | IR | IW;
+        let mut all = [pci::Function::EMPTY; 32];
+        let present = pci::present_functions(&mut all);
+        let mut denied = 0usize;
+        for f in all[..present].iter() {
+            let bdf = f.bdf();
+            if (0..MAX_DOMAINS).any(|i| {
+                let sl = *core::ptr::addr_of!(DOMAIN_SLOTS[i]);
+                sl.id != 0 && sl.bdf == bdf
+            }) {
+                continue;
+            }
+            let dte = (dt + bdf as u64 * 32) as *mut u64;
+            core::ptr::write_volatile(dte, deny_w0);
+            // A DomainID of its own, so a flush for a bounded device never speaks for it.
+            core::ptr::write_volatile(dte.add(1), MAX_DOMAINS as u64);
+            core::ptr::write_volatile(dte.add(2), 0);
+            core::ptr::write_volatile(dte.add(3), 0);
+            denied += 1;
+        }
+        // Read every present function's entry back. A store that did not take leaves V = 0,
+        // which is the passthrough this whole block exists to remove — and a count of writes
+        // says nothing about whether any of them landed.
+        let mut passthrough = 0usize;
+        for f in all[..present].iter() {
+            let w0 = core::ptr::read_volatile((dt + f.bdf() as u64 * 32) as *const u64);
+            if w0 & (V | TV) != V | TV {
+                passthrough += 1;
+            }
+        }
+        let _ = writeln!(
+            con,
+            "[iommu] {denied} other function(s) given an EMPTY table; {present} present, \
+             {passthrough} still passed through"
+        );
+        if passthrough > 0 {
+            let _ = writeln!(
+                con,
+                "\n[iommu] (bug) {passthrough} PCI function(s) have no valid device-table entry \
+                 — with the unit enabled that is unrestricted DMA, not containment"
+            );
+            A::exit(false);
+        }
+    } else {
+        let _ = writeln!(
+            con,
+            "\n[iommu] (bug) no frame for the deny table — every unbound function would be \
+             passed through"
         );
         return;
     }

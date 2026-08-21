@@ -366,6 +366,63 @@ pub unsafe fn find_dma_devices(out: &mut [Function]) -> usize {
     n
 }
 
+/// How many DMA-capable functions exist, regardless of how many we have room to bound.
+///
+/// [`find_dma_devices`] stops at the caller's array, so it cannot answer this — and the
+/// difference matters: a device-table entry with `V = 0` is PASSTHROUGH, not deny, so a
+/// DMA-capable function the nucleus never enumerated has unrestricted access to memory while
+/// the unit is enabled.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn count_dma_devices() -> usize {
+    let mut n = 0;
+    for dev in 0..32u8 {
+        for func in 0..8u8 {
+            let id = read32(0, dev, func, 0x00);
+            let vendor = (id & 0xFFFF) as u16;
+            if vendor == 0xFFFF {
+                continue;
+            }
+            let class = read32(0, dev, func, 0x08) >> 16;
+            let is_edu = vendor == EDU_VENDOR && (id >> 16) as u16 == EDU_DEVICE;
+            if is_edu || class == CLASS_ETHERNET as u32 {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Every PCI function present on bus 0, up to `out.len()`. Returns how many were written.
+///
+/// Not just the DMA-capable ones: any function can be made a bus master by whoever holds its
+/// registers, and an entry with `V = 0` is passthrough. What the unit needs is an entry for
+/// everything, so the default is DENY.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn present_functions(out: &mut [Function]) -> usize {
+    let mut n = 0;
+    for dev in 0..32u8 {
+        for func in 0..8u8 {
+            if n >= out.len() {
+                return n;
+            }
+            let id = read32(0, dev, func, 0x00);
+            let vendor = (id & 0xFFFF) as u16;
+            if vendor == 0xFFFF {
+                continue;
+            }
+            out[n] = Function {
+                bus: 0,
+                dev,
+                func,
+                vendor,
+                device: (id >> 16) as u16,
+            };
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Is this function the one we know how to drive into a DMA?
 #[cfg(target_arch = "x86_64")]
 pub fn is_edu(f: &Function) -> bool {
