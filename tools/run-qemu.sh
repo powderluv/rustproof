@@ -376,6 +376,15 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ]; then
         fi
         # Required only where a domain EXISTS: with no unit every domain capability is refused
         # for that reason alone, and the object would never be looked at.
+        # Teardown must withdraw a DMA mapping the process never unmapped, BY ATTRIBUTION.
+        # The demo deliberately exits holding one. A count of zero means either the probe did
+        # not run or the path does not — and both look identical from the outside, which is why
+        # the count is asserted rather than the absence of a complaint.
+        if ! echo "$OUT" | grep -qE '\[iommu\] teardown withdrew [1-9][0-9]* DMA mapping'; then
+            echo "RESULT: FAIL — a process exited holding a DMA mapping and teardown withdrew"
+            echo "  nothing by attribution"
+            exit 1
+        fi
         # Per-device containment, both halves. The second is what makes the first mean
         # anything: a device that reaches nothing is not contained, it is broken.
         if ! echo "$OUT" | grep -q '\[iommu\] PER-DEVICE:'; then

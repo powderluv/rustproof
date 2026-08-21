@@ -289,6 +289,16 @@ struct Process {
     /// This is also the kernel's only reverse index from a region to the spaces that map
     /// it: destroying a region scans every process's `shares` to unmap it everywhere.
     shares: [u64; SHARE_SLOTS],
+    /// DMA mappings this process ASKED FOR, as `(region id, domain id)`; `(0, _)` is free.
+    ///
+    /// Mappings were anonymous: `MAP_DMA` recorded nothing about who requested one, so nothing
+    /// could withdraw them per process even in principle. Teardown appeared to handle it only
+    /// because a process happens to OWN the regions it maps in this demo — destroying those
+    /// regions clears their entries as a side effect. Map a BORROWED region and the reach
+    /// outlives the process. Attribution is what makes the teardown true by construction
+    /// rather than by luck, and it is what lets `REVOKE` withdraw DMA the way it already
+    /// withdraws a device window, a share window and interrupt credits.
+    dma: [(u64, u64); SHARE_SLOTS],
 }
 
 impl Process {
@@ -302,6 +312,7 @@ impl Process {
         frames: [abi::PhysAddr(0); MAX_PROC_FRAMES],
         nframes: 0,
         shares: [0; SHARE_SLOTS],
+        dma: [(0, 0); SHARE_SLOTS],
         irq_pending: [0; MAX_IRQ_LINES],
         msg: [0; abi::MAX_MSG_BYTES],
         msg_len: 0,
@@ -457,6 +468,11 @@ static mut DEVICE_PHYS: u64 = 0;
 #[cfg(target_arch = "x86_64")]
 static mut DEVICE_BAR: u64 = 0;
 
+/// DMA mappings withdrawn by process teardown, rather than by an explicit `UNMAP_DMA` or by the
+/// destruction of a region. Reported at shutdown so the attribution path is shown to RUN.
+#[cfg(target_arch = "x86_64")]
+static mut DMA_WITHDRAWN_AT_EXIT: u64 = 0;
+
 /// Grant-table selector meaning "the bounded device's real BAR" (see [`DEVICE_BAR`]). Any other
 /// `Mmio` object selects the RAM stand-in.
 const MMIO_DEVICE_BAR: u64 = 1;
@@ -582,6 +598,33 @@ unsafe fn revoke_delegations<A: Arch>(root_proc: usize, root_cap: usize) {
                     let id = proc_at(d.proc).shares[slot];
                     if id != 0 && !holds_region(d.proc, id, abi::CapRights::READ) {
                         unmap_region_from::<A>(d.proc, id);
+                    }
+                }
+                // Same doctrine for DMA, which was the one authority this function did not
+                // cover. A mapping IS the reach the capability granted: a holder that has lost
+                // the `Region` capability, or the `IommuDomain` capability it mapped through,
+                // must lose the device's reach as well — otherwise revocation takes the name
+                // and leaves the access, in the one place where the access is a bus master
+                // writing memory directly.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let mut any = false;
+                    for slot in 0..SHARE_SLOTS {
+                        let (region, domain) = proc_at(d.proc).dma[slot];
+                        if region == 0 {
+                            continue;
+                        }
+                        let keeps = holds_region(d.proc, region, abi::CapRights::READ)
+                            && holds_domain(d.proc, domain, abi::CapRights::WRITE);
+                        if !keeps {
+                            any |= withdraw_dma_slot(d.proc, slot);
+                        }
+                    }
+                    if any {
+                        let base = *core::ptr::addr_of!(AMDVI_BASE);
+                        if base != 0 {
+                            iommu_invalidate(base);
+                        }
                     }
                 }
                 // Same doctrine for interrupts: credits accrued under a capability are
@@ -1092,6 +1135,20 @@ unsafe fn holds_irq(proc: usize, line: u64) -> bool {
     caps_hold_irq(&proc_at(proc).caps, line)
 }
 
+/// Does process `proc` still hold an `IommuDomain` capability for `domain` with `needed`?
+///
+/// # Safety
+/// Single-CPU, non-reentrant: no other live borrow of the process table.
+unsafe fn holds_domain(proc: usize, domain: u64, needed: abi::CapRights) -> bool {
+    (0..CAP_SLOTS).any(|i| {
+        proc_at(proc).caps.lookup(abi::CapId(i)).is_some_and(|sl| {
+            sl.cap_type == abi::CapType::IommuDomain
+                && sl.object == domain
+                && sl.rights.contains(needed)
+        })
+    })
+}
+
 /// Does process `proc` still hold ANY `Mmio` capability carrying `READ` — i.e. any
 /// remaining authority to have the device window mapped at all?
 ///
@@ -1513,6 +1570,14 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
             );
             A::exit(false);
         }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let n = *core::ptr::addr_of!(DMA_WITHDRAWN_AT_EXIT);
+        let _ = writeln!(
+            con,
+            "[iommu] teardown withdrew {n} DMA mapping(s) by attribution"
+        );
     }
     let parks = *core::ptr::addr_of!(PARKS);
     let _ = writeln!(con, "[kernel] parked for an interrupt {} time(s)", parks);
@@ -2182,7 +2247,7 @@ unsafe fn region_index(id: u64) -> Option<usize> {
 /// # Safety
 /// Single-CPU, non-reentrant.
 #[cfg(target_arch = "x86_64")]
-unsafe fn map_dma(domain: u64, region_id: u64, rights: abi::CapRights) -> u64 {
+unsafe fn map_dma(who: usize, domain: u64, region_id: u64, rights: abi::CapRights) -> u64 {
     // The capability's object has to name a domain that EXISTS. Without this the object is
     // decorative: measured, a capability naming domain 999 mapped into the real one.
     // Two different refusals, kept apart because they mean different things to the caller.
@@ -2222,6 +2287,12 @@ unsafe fn map_dma(domain: u64, region_id: u64, rights: abi::CapRights) -> u64 {
     let Some(first) = first else {
         return abi::syserr::NO_MEM;
     };
+    // A slot to record it in, BEFORE installing anything. An untracked mapping is one nothing
+    // can withdraw when this process dies or loses the capability, which is precisely the hole
+    // attribution exists to close — so refusing is the only honest answer when the table is full.
+    let Some(rec) = (0..SHARE_SLOTS).find(|&i| proc_at(who).dma[i].0 == 0) else {
+        return abi::syserr::NO_MEM;
+    };
 
     for k in 0..npages {
         let frame = (*core::ptr::addr_of!(REGIONS[ri])).frames[k as usize].as_u64();
@@ -2251,6 +2322,7 @@ unsafe fn map_dma(domain: u64, region_id: u64, rights: abi::CapRights) -> u64 {
             iopte::leaf(frame, rights),
         );
     }
+    proc_at(who).dma[rec] = (region_id, domain);
     first * abi::PAGE_SIZE
 }
 
@@ -2302,31 +2374,21 @@ unsafe fn clear_io_mappings_of(pfn: u64) -> bool {
     any
 }
 
-/// Withdraw every DMA mapping of a region, and TELL THE UNIT.
+/// Withdraw a region's mappings from ONE domain: hardware first, then the model, then the grant.
+///
+/// Returns whether anything was cleared, so a caller withdrawing several can invalidate once.
 ///
 /// # Safety
 /// Single-CPU, non-reentrant.
 #[cfg(target_arch = "x86_64")]
-unsafe fn unmap_dma(domain: u64, region_id: u64) -> u64 {
-    let ids = domain_ids();
-    if ids.iter().all(|&id| id == 0) {
-        return abi::syserr::NO_MEM;
-    }
-    let Some(di) = domain_lookup(&ids, domain) else {
-        return abi::syserr::NO_CAP;
-    };
-    let Some(ri) = region_index(region_id) else {
-        return abi::syserr::NO_CAP;
-    };
+unsafe fn withdraw_region_from_domain(di: usize, ri: usize) -> bool {
     let npages = (*core::ptr::addr_of!(REGIONS[ri])).npages;
+    let mut any = false;
     for k in 0..npages {
         let pfn =
             (*core::ptr::addr_of!(REGIONS[ri])).frames[k as usize].as_u64() >> abi::PAGE_SHIFT;
-        // Hardware first, then the model — the model is the index that finds the hardware.
-        // Only THIS domain: unmapping through one device's capability must not tear down
-        // another device's mapping of the same frame, which is the mirror of the property
-        // that one capability cannot install a mapping in another's table.
-        clear_io_mappings_in(di, pfn);
+        // Hardware first — the model is the index that finds the hardware.
+        any |= clear_io_mappings_in(di, pfn);
         let mut iovas = [0u64; REGION_MAX_PAGES as usize * 2];
         let mut n = 0;
         for (iova, frame, _) in domain_at(di).reachable() {
@@ -2338,10 +2400,76 @@ unsafe fn unmap_dma(domain: u64, region_id: u64) -> u64 {
         for &iova in iovas.iter().take(n) {
             domain_at(di).unmap(iova);
         }
-        // And the grant, which `MAP_DMA` issued. Leaving it would make the domain hold
-        // authority for a frame nothing can reach — harmless for containment, but it would
-        // outlive the request that created it and accumulate for the life of the boot.
         domain_at(di).revoke(pfn);
+    }
+    any
+}
+
+/// Withdraw one DMA mapping this process asked for, by its slot in `Process::dma`.
+///
+/// # Safety
+/// Single-CPU, non-reentrant.
+#[cfg(target_arch = "x86_64")]
+unsafe fn withdraw_dma_slot(who: usize, slot: usize) -> bool {
+    let (region_id, domain) = proc_at(who).dma[slot];
+    if region_id == 0 {
+        return false;
+    }
+    proc_at(who).dma[slot] = (0, 0);
+    let Some(di) = domain_lookup(&domain_ids(), domain) else {
+        return false;
+    };
+    let Some(ri) = region_index(region_id) else {
+        // The region is already gone, which means `Release` cleared its entries on the way out.
+        return false;
+    };
+    withdraw_region_from_domain(di, ri)
+}
+
+/// Withdraw every DMA mapping `who` asked for, and tell the unit once.
+///
+/// # Safety
+/// Single-CPU, non-reentrant.
+#[cfg(target_arch = "x86_64")]
+unsafe fn withdraw_all_dma_of(who: usize) {
+    let mut any = false;
+    for slot in 0..SHARE_SLOTS {
+        if withdraw_dma_slot(who, slot) {
+            any = true;
+            DMA_WITHDRAWN_AT_EXIT += 1;
+        }
+    }
+    if any {
+        let base = *core::ptr::addr_of!(AMDVI_BASE);
+        if base != 0 {
+            iommu_invalidate(base);
+        }
+    }
+}
+
+/// Withdraw every DMA mapping of a region, and TELL THE UNIT.
+///
+/// # Safety
+/// Single-CPU, non-reentrant.
+#[cfg(target_arch = "x86_64")]
+unsafe fn unmap_dma(who: usize, domain: u64, region_id: u64) -> u64 {
+    let ids = domain_ids();
+    if ids.iter().all(|&id| id == 0) {
+        return abi::syserr::NO_MEM;
+    }
+    let Some(di) = domain_lookup(&ids, domain) else {
+        return abi::syserr::NO_CAP;
+    };
+    let Some(ri) = region_index(region_id) else {
+        return abi::syserr::NO_CAP;
+    };
+    withdraw_region_from_domain(di, ri);
+    // Drop the record too: the mapping is gone, so nothing should later try to withdraw it
+    // again — and the slot has to come back or a process could exhaust its own table.
+    for i in 0..SHARE_SLOTS {
+        if proc_at(who).dma[i] == (region_id, domain) {
+            proc_at(who).dma[i] = (0, 0);
+        }
     }
     // Clearing the table is not revocation while the unit still holds a translation it has
     // already performed. Measured on the rig: without this the device kept reaching the frame.
@@ -3566,6 +3694,12 @@ unsafe fn teardown_process<A: Arch>(idx: usize) {
     // One plan covers both halves — destroying the regions this process OWNS, and dropping
     // its own mappings of everyone else's — in an order the `regions` crate is responsible
     // for and checks over every configuration it can be handed.
+    // Withdraw the DMA this process asked for FIRST, and do it by attribution rather than by
+    // ownership. Destroying the regions it OWNS clears their entries as a side effect, which is
+    // why this looked handled — but a mapping of a BORROWED region belongs to no region this
+    // process owns, and outlived it. Correct by construction now instead of by luck.
+    #[cfg(target_arch = "x86_64")]
+    withdraw_all_dma_of(idx);
     destroy_regions_owned_by::<A>(idx, dying_id);
     // Reclaim the process's frames (page tables + stack + ELF + any DMA frames) before
     // freeing the slot, so a spawn/exit cycle does not leak an address space.
@@ -4039,7 +4173,7 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                 (Some(domain), Some((region, rights))) => {
                     #[cfg(target_arch = "x86_64")]
                     {
-                        map_dma(domain, region, rights)
+                        map_dma(cur, domain, region, rights)
                     }
                     #[cfg(not(target_arch = "x86_64"))]
                     {
@@ -4062,7 +4196,7 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                 (Some(domain), Some((region, _))) => {
                     #[cfg(target_arch = "x86_64")]
                     {
-                        unmap_dma(domain, region)
+                        unmap_dma(cur, domain, region)
                     }
                     #[cfg(not(target_arch = "x86_64"))]
                     {

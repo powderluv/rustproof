@@ -1346,6 +1346,17 @@ fn compute(id: u64) -> ! {
         tag(id);
         if c != syserr::NO_CAP && c != syserr::NO_MEM {
             dw!(b"region: freed one, the next request is granted\n");
+            // And leave a DMA mapping on it LIVE at exit, deliberately. Teardown must withdraw
+            // that by ATTRIBUTION — this process asked for it — rather than as a side effect of
+            // destroying a region it happens to own. Here the two coincide, which is exactly
+            // why the distinction was invisible; the boot reports a count so the attribution
+            // path is shown to RUN rather than merely to exist.
+            tag(id);
+            if map_dma(8, c) < syserr::FAULT {
+                dw!(b"dma: leaving a mapping live at exit for teardown to withdraw\n");
+            } else {
+                dw!(b"dma: no unit here, so nothing to leave mapped at exit\n");
+            }
         } else {
             dw!(b"region: freeing one did not return quota (bug)\n");
         }

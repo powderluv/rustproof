@@ -51,6 +51,43 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-21 — DMA reach was the one authority revocation did not withdraw
+
+`revoke_delegations` states its doctrine three times in its own body — "a capability going away
+must take the AUTHORITY it conferred with it, not merely the slot" — and withdraws the MMIO
+device window, shared-region CPU mappings, and interrupt credits. It said nothing about DMA,
+which is the newest and by far the most powerful authority in the tree: a bus master writing
+memory directly. Revoking a `Region` capability tore down the holder's CPU window and left the
+device's reach to those same frames.
+
+Underneath that: `MAP_DMA` recorded nothing about who asked. Mappings were ANONYMOUS, so nothing
+could withdraw them per process even in principle. Process teardown appeared to handle it only
+because a process happens to OWN the regions it maps here — destroying those regions clears their
+entries as a side effect. Map a BORROWED region and the reach outlives the process. That is the
+"works by luck" shape this project keeps finding in itself.
+
+Fixed by attribution: `Process::dma` records `(region, domain)` per mapping, `MAP_DMA` REFUSES
+rather than install one it cannot track, and one withdrawal routine now serves `UNMAP_DMA`,
+process teardown and `REVOKE`. Teardown withdraws what the process asked for, whoever owns the
+memory; `REVOKE` withdraws any mapping whose holder no longer has both the `Region` and the
+`IommuDomain` capability it was made through.
+
+**Reachability, stated plainly.** The borrowed-region case cannot be reached today: `SPAWN`
+delegates exactly ONE capability, a spawned process's role grants nothing, and `MAP_DMA` needs
+TWO — so no process can both hold the pair and be a revocation target. This is therefore
+HARDENING, not a live defect, and it is not claimed as one. What it buys is that the property
+holds by construction instead of by an ownership coincidence, and that the doctrine no longer has
+an exception carved out for its most dangerous member.
+
+The path is shown to RUN rather than merely to exist: the demo deliberately exits still holding a
+mapping, and the boot reports `teardown withdrew 1 DMA mapping(s) by attribution`. Removing the
+teardown call takes that to 0 and fails the run — a count is asserted, not the absence of a
+complaint, because "the probe did not run" and "the path does not work" look identical from
+outside.
+
+One consequence worth recording: DMA mappings are now capped per process at `SHARE_SLOTS` (4),
+because an untracked mapping is one nothing can withdraw. `MAP_DMA` returns `NO_MEM` past that.
+
 ## 2026-08-20 — an untrusted process DRIVES the device, and reaches only what it was granted
 
 The whole story, end to end, in one process that holds no privilege of any kind:
