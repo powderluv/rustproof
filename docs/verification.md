@@ -51,6 +51,64 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-21 (later) — the adversarial review of the DMA arc: four real ones
+
+Twenty agents over the seven-commit arc. Four findings survived refutation and were acted on;
+the sharpest was a live containment breach reachable from an unprivileged process.
+
+**1. `MAP_DMA`'s rollback stranded hardware mappings — a device reaching reclaimed memory.**
+`Domain::revoke(frame)` is frame-scoped and withdraws EVERY model mapping of that frame,
+including ones earlier calls installed at other IOVAs, while the rollback zeroed only the single
+leaf it was mid-write on. The surviving leaves then became invisible to every withdrawal path in
+the tree, because `clear_io_mappings_in` was driven by `domain.reachable()` — the model the
+rollback had just emptied. `UNMAP_DMA` returned OK having cleared nothing, `FREE_REGION` returned
+the frames to the allocator, and the device could write into a region minted afterwards.
+`contained()` stayed true throughout: the model was self-consistent and only the hardware
+disagreed, which is precisely the shape a model-only check cannot see.
+
+Reachable from the shipped ABI: `Domain<_, 8>` and `REGION_MAX_PAGES = 4` mean two 4-page
+mappings fill the domain exactly, and nothing refuses a re-map of an already-mapped region. The
+per-process cap of 4 added earlier the same day does NOT mask it — the domain's 8 slots fill
+first. Two independent oracles agreed: the tree's own shutdown scan reported the stale leaves,
+and a ring-3 probe drove the real device into a freshly-minted region through them.
+
+Fixed twice over, and measured to be independently sufficient:
+  - the rollback now undoes exactly what that call installed, revoking a grant only where no
+    mapping still rests on it;
+  - `clear_io_mappings_in` is now driven by the TABLE, scanning the level the device actually
+    walks, so a model that has forgotten cannot strand anything.
+Reverting either one alone still passes; reverting BOTH reproduces the breach. Belt and braces,
+stated as such rather than dressed up as one fix with two mutants.
+
+**2. Invalidation named the wrong domain.** Every `iommu_invalidate` hardcoded DomainID 0 and
+the first device's BDF, while `program_dte` gives each device-table entry its own DomainID. So
+withdrawing from domain 2 cleared its leaves and then flushed domain 1's caches. The emulator's
+trace showed it exactly: seven page-invalidations, all `domain 0x0`, seven device-table
+invalidations, all `00:05.0`. Now `0x0` ×7 AND `0x1` ×4, both BDFs.
+
+There is no payload oracle for this — the second device cannot be driven from here — so the
+witness is the emulator's own report, gated only when `QEMU_TRACE` is set. That is the honest
+scope: with tracing off, this property is unverified, and the gate says so by only existing
+there.
+
+**3. The rights oracle could not fail.** `wider_refused` attempted the wider mapping at the SAME
+IOVA already mapped read-only, so `IovaInUse` refused it whatever its rights were. Deleting
+`Domain::map`'s rights check left all five modes PASS with byte-identical output — "wider rights
+refused" and "RIGHTS ENFORCED" included. The attempt now uses a fresh IOVA, and the device is
+aimed at it, so the same mutant fails with `(bug) WRITE-THROUGH: a READ-only mapping accepted a
+device write`.
+
+**4. The `stray` witness was computed and discarded.** `let _ = stray` threw away the one value
+that separates "the device REFUSED it" from "the command never ran" — the device reports
+completion in its own register either way. The end-to-end assertion now requires it.
+
+Also corrected: §0's `iommu` row still said "there is no hardware half — nothing maps", which
+this arc is precisely what closed.
+
+Refuted, and worth recording as such: a claimed vacuity in the rights→PTE derivation (the mutant
+survives but is EQUIVALENT — every call site passes the same rights, so both versions emit
+identical words), and a claimed MAP_BAR index defect (real but vestigial: edu exposes one BAR).
+
 ## 2026-08-21 — DMA reach was the one authority revocation did not withdraw
 
 `revoke_delegations` states its doctrine three times in its own body — "a capability going away
@@ -775,7 +833,7 @@ repeatedly, and the searches below still hold real axes constant:
 | `runstate` | every state vector of length 1..=6 × 7 predicates | endpoint/line values ∈ {0,1}; 7 of the boolean functions over the reachable domain |
 | `regions` | 20,736 configs × 7 plans at `P=6`/`S=4`/`N=52` (tables both compacted and with a dead entry first), plus the worst-case teardown at `MAX_REGIONS=12` | region ARITY (≤2 live) — but measured: `take(1)`/`take(2)` on the teardown loop is already caught, so arity is covered and it was the COMPACTION that was not |
 | `capabilities` | rights bits, every slot of `CapSpace<16>`, occupancy under a NONE-rights slot, two slots on one object | cap TYPE is thin here (5 of 11 variants) — but measured: covered at the repo level by `kernel`'s Region tests |
-| `iommu` | every 3-op sequence over grant/revoke/map/unmap (21,952 sequences, invariant checked after EVERY step; plus deployed-shape tests that reach the LAST slot, which the search itself never occupies) | there is no hardware half — nothing maps, so the containment side is satisfied trivially IN THE KERNEL (the crate's own search does exercise it) |
+| `iommu` | every 3-op sequence over grant/revoke/map/unmap (21,952 sequences, invariant checked after EVERY step; plus deployed-shape tests that reach the LAST slot, which the search itself never occupies, and rejection tests so `contained` is shown to REFUSE) | the hardware half now EXISTS and is exercised: the boot programs a device-table entry per device, `MAP_DMA` writes real I/O page-table leaves, and the shutdown walks the real table requiring every present leaf to be grant-covered. What the model still cannot see is anything the page tables do that no leaf records |
 | `mm` | `partition_holds_for_every_dma_top` (1,040 configs), every **3**-region map shape over unaligned starts/lengths/kinds asserting the exact allocatable SET (110,592 configs), and 5×4000-step arbitrary alloc/free interleavings | maps are 3 regions, not arbitrary-length |
 | `kernel` | boot grant tables, every authority predicate, the PVH map bound (17 properties) | everything else in ~2400 lines — a foothold, not coverage |
 

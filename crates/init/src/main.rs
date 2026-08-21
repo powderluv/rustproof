@@ -569,12 +569,20 @@ fn drive_device(bar: u64) {
     // changed nothing we own. It is not a claim that the device could not reach that memory by
     // some other route — we cannot even NAME the memory to try, which is the point. From here
     // an address is an IOVA, and the only IOVAs that resolve are the ones MAP_DMA handed back.
-    if quiet_now == QUIET && back == PAT {
-        dw!(b"dev: a transfer aimed at an IOVA we were never granted changed nothing we own\n");
+    // `stray` is the witness that separates "the device REFUSED it" from "the command never
+    // ran": the device reports completion in its own command register whether or not the
+    // transfer reached memory. It used to be computed and thrown away with `let _ = stray`,
+    // which left the refusal inferred from an unchanged frame alone.
+    if stray && quiet_now == QUIET && back == PAT {
+        dw!(
+            b"dev: a transfer aimed at an IOVA we were never granted COMPLETED at the device \
+              and changed nothing we own\n"
+        );
+    } else if !stray {
+        dw!(b"dev: the ungranted-IOVA transfer never ran, so its refusal shows nothing (bug)\n");
     } else {
         dw!(b"dev: an ungranted IOVA reached memory of ours (bug)\n");
     }
-    let _ = stray;
 
     unmap_dma(8, mine);
     free_region(mine);
@@ -1024,6 +1032,31 @@ fn compute(id: u64) -> ! {
                 }
             }
             Err(_) => dw!(b"dev: no bounded device on this machine, so no BAR to map\n"),
+        }
+
+        // A REFUSAL must undo exactly what it installed, and nothing else. Exhaust the
+        // DOMAIN's mapping slots with a multi-page region: the rollback revokes the frames'
+        // grants, and `Domain::revoke` withdraws EVERY model mapping of a frame — including
+        // ones earlier calls made at other IOVAs — while the rollback zeroes only the leaf it
+        // was mid-write on. The model then no longer knows where the others are, so nothing can
+        // ever clear them, and the frames return to the allocator still reachable.
+        tag(id);
+        let big = make_region(2, 4);
+        if big == syserr::NO_CAP || big == syserr::NO_MEM {
+            dw!(b"dma: no multi-page region for the rollback probe (bug)\n");
+        } else {
+            let mut ok = 0u64;
+            while ok < 8 {
+                if map_dma(8, big) >= syserr::FAULT {
+                    break;
+                }
+                ok += 1;
+            }
+            dw!(b"dma: filled the domain after ");
+            dbg_dec(ok);
+            dw!(b" mapping(s), then a refusal rolled back\n");
+            unmap_dma(8, big);
+            free_region(big);
         }
 
         // Freeing a region must withdraw the device's reach to it. Nothing in the ABI obliges

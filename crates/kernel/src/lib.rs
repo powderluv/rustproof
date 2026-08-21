@@ -623,7 +623,7 @@ unsafe fn revoke_delegations<A: Arch>(root_proc: usize, root_cap: usize) {
                     if any {
                         let base = *core::ptr::addr_of!(AMDVI_BASE);
                         if base != 0 {
-                            iommu_invalidate(base);
+                            invalidate_all_domains(base);
                         }
                     }
                 }
@@ -914,7 +914,7 @@ unsafe fn run_region_plan<A: Arch>(plan: &regions::Plan<PLAN_STEPS>) {
                     if touched {
                         let base = *core::ptr::addr_of!(AMDVI_BASE);
                         if base != 0 {
-                            iommu_invalidate(base);
+                            invalidate_all_domains(base);
                         }
                     }
                     let _ = touched;
@@ -2160,7 +2160,7 @@ unsafe fn iommu_cmd(base: u64, cmd: [u32; 4]) -> bool {
 /// Completion is observed, not assumed: these commands are asynchronous, so a reachability
 /// check run before the invalidation landed would report withdrawn or stale purely by timing.
 #[cfg(target_arch = "x86_64")]
-unsafe fn iommu_invalidate(base: u64) -> bool {
+unsafe fn iommu_invalidate(base: u64, di: usize) -> bool {
     let store = *core::ptr::addr_of!(CMD_STORE);
     if store == 0 {
         return false;
@@ -2168,12 +2168,22 @@ unsafe fn iommu_invalidate(base: u64) -> bool {
     const DONE: u64 = 0x5A5A_5A5A_A5A5_A5A5;
     core::ptr::write_volatile(store as *mut u64, 0);
 
-    // INVALIDATE_IOMMU_PAGES: domain 0, S=1 with an all-ones address means the whole domain.
-    if !iommu_cmd(base, [0, 0x3 << 28, 0xFFFF_F000 | 1, 0x7FFF_FFFF]) {
+    // INVALIDATE_IOMMU_PAGES for THIS domain, S=1 with an all-ones address meaning all of it.
+    // The DomainID is load-bearing and was hardcoded to 0: each device-table entry carries its
+    // own (`i`), so every invalidation named the FIRST device's domain while the second's leaves
+    // were the ones being cleared. Measured in the emulator's own trace — seven page
+    // invalidations, all "domain 0x0", and seven device-table invalidations, all 00:05.0 —
+    // while UNMAP_DMA and FREE_REGION were clearing entries in the other domain.
+    let dom_id = di as u32 & 0xFFFF;
+    if !iommu_cmd(
+        base,
+        [0, (0x3 << 28) | dom_id, 0xFFFF_F000 | 1, 0x7FFF_FFFF],
+    ) {
         return false;
     }
-    // The device-table entry is cacheable in its own right, so it is invalidated too.
-    let bdf = *core::ptr::addr_of!(TARGET_BDF) & 0xFFFF;
+    // The device-table entry is cacheable in its own right, so it is invalidated too — for the
+    // device this domain is bound to, not for whichever one the scan happened to find first.
+    let bdf = (*core::ptr::addr_of!(DOMAIN_SLOTS[di])).bdf as u32;
     if !iommu_cmd(base, [bdf, 0x2 << 28, 0, 0]) {
         return false;
     }
@@ -2308,12 +2318,29 @@ unsafe fn map_dma(who: usize, domain: u64, region_id: u64, rights: abi::CapRight
         {
             // All or nothing. A half-mapped region would leave the device reaching part of
             // something the caller was told it could not reach at all.
+            // Undo exactly what THIS call installed, and nothing else. `Domain::revoke` is far
+            // too broad here: it withdraws EVERY model mapping of a frame — including ones
+            // earlier calls made at other IOVAs — while this loop can only zero the leaves it
+            // wrote itself. That combination STRANDED present hardware entries the model had
+            // just forgotten about, so no later `UNMAP_DMA`, `FREE_REGION` or teardown could
+            // find them, and the frames went back to the allocator still reachable by the
+            // device. `contained()` stayed true throughout: the model was self-consistent and
+            // only the hardware disagreed, which is the one shape a model-only check misses.
             for done in 0..=k {
-                let back = (first + done) * abi::PAGE_SIZE;
-                let f = (*core::ptr::addr_of!(REGIONS[ri])).frames[done as usize].as_u64();
-                domain_at(di).unmap(back);
-                domain_at(di).revoke(f >> abi::PAGE_SHIFT);
+                domain_at(di).unmap((first + done) * abi::PAGE_SIZE);
                 core::ptr::write_volatile((l1 + (first + done) * 8) as *mut u64, 0);
+            }
+            // A grant goes only where nothing still rests on it. (A grant this call WIDENED for
+            // a frame an earlier mapping still holds keeps the wider rights — a model-level
+            // residue with no hardware consequence, since reach is decided by the page-table
+            // entries, and re-granting needs the caller's own capability rights anyway.)
+            for done in 0..=k {
+                let f = (*core::ptr::addr_of!(REGIONS[ri])).frames[done as usize].as_u64()
+                    >> abi::PAGE_SHIFT;
+                let still = domain_at(di).reachable().any(|(_, frame, _)| frame == f);
+                if !still {
+                    domain_at(di).revoke(f);
+                }
             }
             return abi::syserr::NO_CAP;
         }
@@ -2342,18 +2369,21 @@ unsafe fn clear_io_mappings_in(di: usize, pfn: u64) -> bool {
         0 => return false,
         l1 => l1,
     };
-    let mut iovas = [0u64; REGION_MAX_PAGES as usize * 2];
-    let mut n = 0;
-    for (iova, frame, _) in domain_at(di).reachable() {
-        if frame == pfn && n < iovas.len() {
-            iovas[n] = iova;
-            n += 1;
+    // Driven by the TABLE, not by the model's index of it. Asking the model where a frame is
+    // mapped works only while the two agree, and the one time they did not — a rollback that
+    // revoked a grant and dropped mappings it had not cleared — the entries became invisible to
+    // every withdrawal path in the tree. Scanning the level the device actually walks cannot be
+    // fooled that way: whatever is present here is what the device can reach.
+    let mut any = false;
+    for slot in 0..512u64 {
+        let at = l1 + slot * 8;
+        let pte = core::ptr::read_volatile(at as *const u64);
+        if pte & iopte::PR != 0 && (pte & iopte::ADDR) >> abi::PAGE_SHIFT == pfn {
+            core::ptr::write_volatile(at as *mut u64, 0);
+            any = true;
         }
     }
-    for &iova in iovas.iter().take(n) {
-        core::ptr::write_volatile((l1 + (iova >> abi::PAGE_SHIFT) * 8) as *mut u64, 0);
-    }
-    n > 0
+    any
 }
 
 /// The same, across EVERY domain.
@@ -2426,6 +2456,19 @@ unsafe fn withdraw_dma_slot(who: usize, slot: usize) -> bool {
     withdraw_region_from_domain(di, ri)
 }
 
+/// Flush every live domain. Used where a sweep may have touched more than one.
+///
+/// # Safety
+/// Single-CPU, non-reentrant.
+#[cfg(target_arch = "x86_64")]
+unsafe fn invalidate_all_domains(base: u64) {
+    for di in 0..MAX_DOMAINS {
+        if (*core::ptr::addr_of!(DOMAIN_SLOTS[di])).id != 0 {
+            iommu_invalidate(base, di);
+        }
+    }
+}
+
 /// Withdraw every DMA mapping `who` asked for, and tell the unit once.
 ///
 /// # Safety
@@ -2442,7 +2485,7 @@ unsafe fn withdraw_all_dma_of(who: usize) {
     if any {
         let base = *core::ptr::addr_of!(AMDVI_BASE);
         if base != 0 {
-            iommu_invalidate(base);
+            invalidate_all_domains(base);
         }
     }
 }
@@ -2475,7 +2518,7 @@ unsafe fn unmap_dma(who: usize, domain: u64, region_id: u64) -> u64 {
     // already performed. Measured on the rig: without this the device kept reaching the frame.
     let base = *core::ptr::addr_of!(AMDVI_BASE);
     if base != 0 {
-        iommu_invalidate(base);
+        iommu_invalidate(base, di);
     }
     abi::syserr::OK
 }
@@ -2666,6 +2709,12 @@ unsafe fn prove_containment<A: Arch>(
     const IOVA_SRC: u64 = 0x2000;
     const IOVA_UNGRANTED: u64 = 0x3000;
     const IOVA_RO: u64 = 0x5000;
+    /// A FRESH IOVA for the wider-rights attempt. It used to reuse `IOVA_RO`, where the mapping
+    /// already installed made `IovaInUse` refuse the request whatever its rights were — so the
+    /// refusal was over-determined and the rights check untested. Measured: deleting
+    /// `Domain::map`'s rights check left all five rig modes PASS with byte-identical output,
+    /// "wider rights refused" and "RIGHTS ENFORCED" included.
+    const IOVA_WIDER: u64 = 0x6000;
 
     // BOTH directions need a mapping. The first attempt mapped only the destination and got
     // "NOT TRANSLATED" — because the inbound RAM->device transfer that loads the pattern was
@@ -2781,9 +2830,13 @@ unsafe fn prove_containment<A: Arch>(
         // rather than calling the model directly, so a wrongly-allowed map would write a real
         // WRITABLE entry to the same IOVA — meaning the device write below would land and
         // `ro_seen` would catch it. The check and the consequence are the same code path.
-        let wider_refused = !leaf(IOVA_RO, ro.as_u64(), rw);
+        let wider_refused = !leaf(IOVA_WIDER, ro.as_u64(), rw);
         let tail_ro_before = core::ptr::read_volatile((base + 0x2018) as *const u64);
         let ro_done = run(0x4_0000, IOVA_RO, true);
+        // And through the wider mapping, which must not exist. With the rights check gone the
+        // leaf above IS written, this write lands, and `ro_seen` catches it — which is what
+        // makes the check load-bearing instead of merely present.
+        let _ = run(0x4_0000, IOVA_WIDER, true);
         let ro_seen = first_disturbed(ro.as_u64(), SENTINEL);
         // And aim one at the ungranted IOVA, so "refused" is something the DEVICE demonstrates.
         let _ = run(0x4_0000, IOVA_UNGRANTED, true);
@@ -2895,9 +2948,11 @@ unsafe fn prove_containment<A: Arch>(
         let dom = device_domain();
         dom.revoke(ro.frame >> abi::PAGE_SHIFT);
         {
-            let idx = ((IOVA_RO >> 12) & 0x1FF) as u64;
             if let Some(l1) = *core::ptr::addr_of!(IOMMU_L1) {
-                core::ptr::write_volatile((l1 + idx * 8) as *mut u64, 0);
+                for iova in [IOVA_RO, IOVA_WIDER] {
+                    let idx = ((iova >> 12) & 0x1FF) as u64;
+                    core::ptr::write_volatile((l1 + idx * 8) as *mut u64, 0);
+                }
             }
         }
         for (iova, frame) in [(IOVA, dst_phys), (IOVA_SRC, src.as_u64())] {
@@ -2925,7 +2980,7 @@ unsafe fn prove_containment<A: Arch>(
         //
         // Re-fill with the sentinel and tell the device to write there again. If the pattern
         // comes back, a withdrawn mapping is still being honoured.
-        let flushed = iommu_invalidate(base);
+        let flushed = iommu_invalidate(base, 0);
         let _ = writeln!(
             con,
             "[iommu] invalidation {}",
@@ -3030,7 +3085,7 @@ unsafe fn prove_containment<A: Arch>(
                 domain_at(di).unmap(IOVA_OTHER);
                 domain_at(di).revoke(pfn);
             }
-            iommu_invalidate(base);
+            invalidate_all_domains(base);
         }
     }
 

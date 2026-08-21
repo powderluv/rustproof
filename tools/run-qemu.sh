@@ -376,6 +376,20 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ]; then
         fi
         # Required only where a domain EXISTS: with no unit every domain capability is refused
         # for that reason alone, and the object would never be looked at.
+        # Invalidation must name the domain it is flushing. There is no PAYLOAD oracle for the
+        # second domain — its device cannot be driven from here — so the witness is the
+        # emulator's own report of what the unit was told. Checked only when tracing is on,
+        # which is the honest scope: with QEMU_TRACE unset this property is unverified.
+        if [ -n "${QEMU_TRACE:-}" ] && [ -f "${QEMU_TRACE_FILE:-/tmp/qemu-amdvi-trace.log}" ]; then
+            TR="${QEMU_TRACE_FILE:-/tmp/qemu-amdvi-trace.log}"
+            for dom in '0x0' '0x1'; do
+                if ! grep -qa "amdvi_pages_inval AMD-Vi pages for domain $dom" "$TR"; then
+                    echo "RESULT: FAIL — no invalidation ever named domain $dom, so a domain's"
+                    echo "  withdrawals were flushed under another domain's id"
+                    exit 1
+                fi
+            done
+        fi
         # Teardown must withdraw a DMA mapping the process never unmapped, BY ATTRIBUTION.
         # The demo deliberately exits holding one. A count of zero means either the probe did
         # not run or the path does not — and both look identical from the outside, which is why
