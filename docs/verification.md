@@ -51,6 +51,38 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-22 (later still) — a gate that fired at random, and a property the boot cannot pin
+
+A `(bug)` line could fire on a healthy boot. `poll_irq(6); poll_irq(7)` then "if not (ticks > 0
+and bytes == 0) it leaked" — but `ticks == 0` merely means no timer tick landed between the
+preceding blocking wait and the poll, which is a matter of timing. Three distinct facts shared
+one message, so the run failed announcing a leak that had not happened.
+
+A gate that fires at random is worse than no gate: it teaches you to discount failures, and every
+"all modes PASS" line above was reported against a suite that could cry wolf. The timer is now
+waited on rather than polled, and each condition says which one it is. Six consecutive
+firmware-rig runs give the same verdict.
+
+**Then the sharper half.** Mutating the kernel so a capability reads a FIXED line — authority
+still checked, only the count taken from the wrong place — did NOT trip this assertion. Reading
+DRAINS, so a capability wrongly reading the timer finds zero moments after the wait emptied it,
+and the check passes for the wrong reason. The property "a capability for one line can never read
+or clear another's" is not pinnable from ring 3 for that reason, and the boot comment now says so
+instead of implying otherwise.
+
+The draining that makes it untestable from outside makes it trivial from inside. `collect_irq` is
+extracted, and a host test loads every line with a distinct count and collects each in turn: a
+collector that reads a fixed line, or clears more than one, is caught whichever line is asked
+for. The fixed-line mutant that survives the boot fails that test.
+
+Two mutants misled me on the way there, both by tripping an EARLIER assertion than the one under
+test, which looks like success and is not. A mutation that fails the run has not necessarily
+exercised the check you are aiming at; read which assertion actually fired.
+
+Also fixed: `load_process` reset `shares` for a recycled slot but not the new `dma` table. Stale
+records are harmless today — region ids are monotonic, so one names a dead region and the
+withdrawal clears it — but that is an argument two hops from the code, and the reset is one line.
+
 ## 2026-08-22 (later) — the review's other findings, including one about my own reporting
 
 **`ARCH=riscv64 tools/run-qemu.sh` never ran riscv64.** It built `x86_64-unknown-none` and booted

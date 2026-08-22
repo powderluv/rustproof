@@ -1525,15 +1525,34 @@ fn compute(id: u64) -> ! {
     // clear another's" was true purely because there was no other line. The timer has been
     // firing throughout; the console has not fired at all. So CapId(7) must read ZERO while
     // CapId(6) reads a real count, and neither may drain the other.
-    let ticks = poll_irq(6);
+    //
+    // WAIT, not poll, for the timer. Polling raced: whether a tick landed between the previous
+    // blocking wait and this call is a matter of timing, so `ticks == 0` was reachable on a
+    // healthy boot — and it fell into the same branch as a real leak, which reported
+    // "one line's count leaked into the other (bug)" and failed the run for no reason. A gate
+    // that fires at random is worse than no gate: it teaches you to discount failures.
+    let ticks = wait_irq(6);
     let bytes = poll_irq(7);
     tag(id);
-    if ticks > 0 && ticks != syserr::NO_CAP && bytes == 0 {
-        dw!(b"irq: two lines stay separate (timer counted, console still quiet)\n");
+    // Each condition says which one it is. Three distinct facts shared one message before, so
+    // the message could not be believed even when it was right.
+    //
+    // What this does NOT establish: that a capability reads its OWN line's count. Reading
+    // drains, so a capability wrongly reading the timer finds zero moments after the wait above
+    // emptied it, and this passes for the wrong reason — measured, with exactly that mutant
+    // surviving. Draining is what makes the property untestable from out here, and trivial to
+    // test from inside: `collect_irq` has a host test that loads every line with a distinct
+    // count and catches a collector that reads or clears the wrong one.
+    if ticks == syserr::NO_CAP {
+        dw!(b"irq: no authority for the timer line (bug)\n");
     } else if bytes == syserr::NO_CAP {
         dw!(b"irq: no authority for the console line (bug)\n");
+    } else if bytes != 0 {
+        dw!(b"irq: the console capability returned a count the console never generated (bug)\n");
+    } else if ticks == 0 {
+        dw!(b"irq: WAIT_IRQ returned without a credit (bug)\n");
     } else {
-        dw!(b"irq: one line's count leaked into the other (bug)\n");
+        dw!(b"irq: two lines stay separate (timer counted, console still quiet)\n");
     }
 
     // A BOUNDED wait, built from what already exists rather than from a new syscall.

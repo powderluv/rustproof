@@ -446,6 +446,20 @@ const MAX_IRQ_LINES: usize = 8;
 const DELIVERED_IRQ_LINES: u64 = (1 << IRQ_TIMER) | (1 << IRQ_CONSOLE);
 
 /// Does the kernel deliver `line` at all? See [`DELIVERED_IRQ_LINES`].
+/// Take and clear the credits for ONE line, leaving every other line untouched.
+///
+/// Extracted so the per-line property has a home where it can be checked DETERMINISTICALLY.
+/// The boot cannot pin it: reading a line drains it, so a capability that wrongly read the
+/// timer's count would find zero right after a blocking wait had emptied it and the assertion
+/// would pass for the wrong reason — measured, with a mutant that read a fixed line surviving
+/// the boot's own check. Draining is exactly what makes the property untestable from outside
+/// and trivial to test from inside.
+fn collect_irq(pending: &mut [u64; MAX_IRQ_LINES], line: usize) -> u64 {
+    let n = pending[line];
+    pending[line] = 0;
+    n
+}
+
 const fn delivers_irq(line: u64) -> bool {
     // The bound is load-bearing, not defensive: it keeps the shift in range.
     line < MAX_IRQ_LINES as u64 && DELIVERED_IRQ_LINES & (1 << line) != 0
@@ -1758,6 +1772,12 @@ unsafe fn load_process<A: Arch>(
             // this process appear to hold a mapping it does not have, and the next
             // `destroy_region` would unmap a window it never mapped.
             s.shares = [0; SHARE_SLOTS];
+            // And the DMA attribution table, for the same reason `shares` is reset: this slot
+            // is recycled, and a fresh process must inherit nothing from its former occupant.
+            // Stale records happen to be harmless today — region ids are monotonic, so one
+            // names a dead region and the withdrawal clears it — but that is an argument two
+            // hops away from the code, and resetting the array is one line.
+            s.dma = [(0, 0); SHARE_SLOTS];
             s.pending_len = 0;
             s.token = token;
             s.frame = A::frame_init(entry, A::USER_STACK_TOP, id_arg);
@@ -4523,8 +4543,7 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                 // must never return or clear another's count.
                 Some(line) if line < MAX_IRQ_LINES as u64 => {
                     let p = proc_at(cur);
-                    let n = p.irq_pending[line as usize];
-                    p.irq_pending[line as usize] = 0;
+                    let n = collect_irq(&mut p.irq_pending, line as usize);
                     A::frame_set_ret(&mut f, n);
                 }
                 // Real authority, but a line the kernel does not account for: no interrupts
@@ -5281,6 +5300,39 @@ mod tests {
                 "a {:?} capability on object 3 answered an endpoint query",
                 wrong
             );
+        }
+    }
+
+    /// Collecting one line's credits must leave every other line exactly as it was.
+    ///
+    /// The boot cannot check this — reading drains, so a wrong-line read finds zero moments
+    /// after a blocking wait emptied it, and the assertion passes for the wrong reason. Here
+    /// every line is loaded with a distinct count first, so a collector that reads or clears a
+    /// FIXED line, or clears more than one, is caught whichever line is asked for.
+    #[test]
+    fn collecting_one_line_leaves_the_others_untouched() {
+        for line in 0..MAX_IRQ_LINES {
+            let mut pending = [0u64; MAX_IRQ_LINES];
+            for (i, slot) in pending.iter_mut().enumerate() {
+                *slot = (i as u64 + 1) * 10;
+            }
+            let got = collect_irq(&mut pending, line);
+            assert_eq!(
+                got,
+                (line as u64 + 1) * 10,
+                "collecting line {line} returned another line's count"
+            );
+            assert_eq!(pending[line], 0, "line {line} was not cleared");
+            for other in 0..MAX_IRQ_LINES {
+                if other == line {
+                    continue;
+                }
+                assert_eq!(
+                    pending[other],
+                    (other as u64 + 1) * 10,
+                    "collecting line {line} disturbed line {other}"
+                );
+            }
         }
     }
 
