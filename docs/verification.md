@@ -51,6 +51,40 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-21 (fourth) — a proxy published before the property it stood for
+
+Whether ring 3 may hold a real bus-mastering BAR, and whether `MAP_DMA` may hand out an IOVA,
+were both decided by "is a domain slot populated". That slot was published where the page tables
+were WRITTEN — before the unit was enabled. And the enable can fail: its branch printed a line
+and the boot carried on.
+
+So a boot where `CTRL` did not take handed an untrusted process a live bus master and DMA
+addresses from a unit that was passing everything through. Demonstrated with two mutations,
+publish-early plus never-enable:
+
+```
+[proc 2] dma: the device can now reach our region by DMA
+[proc 2] dev: mapped the REAL device BAR and read its identification register
+```
+
+Domains are now STAGED and committed only once `CTRL` reads back with `IommuEn` set. The same
+mutation against the fixed tree gives:
+
+```
+[iommu] CTRL write did not take: 0x…1004 — no domain is published, so no process can be
+        handed a bus master or a DMA mapping
+[proc 2] dma: no IOMMU on this machine, so MAP_DMA refuses to hand out reach
+[proc 2] dev: no bounded device on this machine, so no BAR to map
+```
+
+The `domain N bound to …` line moved with it, from where the tables were written to after the
+commit: "bound" is a statement about a unit that translates, and until that store none of them
+did. A log line that runs ahead of the fact it reports is how a proxy gets mistaken for its
+property in the first place.
+
+This was the review's remaining PARTIAL finding, and it is the same shape as the arc's others:
+the check was real, the thing it checked was not quite the thing claimed.
+
 ## 2026-08-21 (later still) — the default was PASSTHROUGH, and most of the bus was outside the claim
 
 A device-table entry with `V = 0` is **passthrough**, not deny. The nucleus programmed entries

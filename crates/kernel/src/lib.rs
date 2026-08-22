@@ -1946,6 +1946,13 @@ unsafe fn program_dte<A: Arch>(
     );
     let mut live = 0usize;
     let mut dev0_w0 = 0u64;
+    // STAGED, not published. A domain slot is what `MAP_DMA` and the real-BAR capability both
+    // consult to decide whether a device's DMA is bounded — but until the unit is ENABLED
+    // nothing translates, and the enable can fail: its branch prints a line and the boot
+    // carries on. Publishing here handed ring 3 a live bus master and IOVAs from a unit that
+    // was passing everything through. A proxy for a property, published before the property
+    // held; the two are committed together below.
+    let mut staged = [DomainSlot::EMPTY; MAX_DOMAINS];
     for (i, f) in devs[..found].iter().enumerate() {
         let bdf = f.bdf() as u64;
         let Some(root) = fa.alloc_frame().map(|f| zero_frame(f)) else {
@@ -1993,7 +2000,7 @@ unsafe fn program_dte<A: Arch>(
         // The domain exists only now that there is a device table entry AND a table under it.
         // Claiming it earlier would let `MAP_DMA` accept a capability for a domain that could
         // not yet hold a mapping.
-        DOMAIN_SLOTS[i] = DomainSlot {
+        staged[i] = DomainSlot {
             id: (i + 1) as u64,
             bdf: f.bdf(),
             l1: l1.as_u64(),
@@ -2005,13 +2012,6 @@ unsafe fn program_dte<A: Arch>(
             DEVICE_TABLE_ENTRY = dte as u64;
             dev0_w0 = w0;
         }
-        let _ = writeln!(
-            con,
-            "[iommu] domain {} bound to {:#06x} with its own page table {:#x}",
-            i + 1,
-            f.bdf(),
-            l1.as_u64()
-        );
     }
     if live == 0 {
         let _ = writeln!(
@@ -2039,10 +2039,7 @@ unsafe fn program_dte<A: Arch>(
         let mut denied = 0usize;
         for f in all[..present].iter() {
             let bdf = f.bdf();
-            if (0..MAX_DOMAINS).any(|i| {
-                let sl = *core::ptr::addr_of!(DOMAIN_SLOTS[i]);
-                sl.id != 0 && sl.bdf == bdf
-            }) {
+            if staged.iter().any(|sl| sl.id != 0 && sl.bdf == bdf) {
                 continue;
             }
             let dte = (dt + bdf as u64 * 32) as *mut u64;
@@ -2166,6 +2163,21 @@ unsafe fn program_dte<A: Arch>(
     let after = core::ptr::read_volatile(ctrl as *const u64);
 
     if after & IOMMU_EN != 0 {
+        // The unit translates, so the domains become real NOW. Everything that treats a domain
+        // as evidence that a device's DMA is bounded — `MAP_DMA`, and the capability naming the
+        // real BAR — is gated on this store, not on the earlier table writes.
+        for i in 0..MAX_DOMAINS {
+            DOMAIN_SLOTS[i] = staged[i];
+            if staged[i].id != 0 {
+                // Reported HERE, not where the tables were written: "bound" is a statement
+                // about a unit that translates, and until this store none of them did.
+                let _ = writeln!(
+                    con,
+                    "[iommu] domain {} bound to {:#06x} with its own page table {:#x}",
+                    staged[i].id, staged[i].bdf, staged[i].l1
+                );
+            }
+        }
         let _ = writeln!(
             con,
             "[iommu] DTE[{bdf:#06x}] = {w0:#018x} (V TV mode=3 root={:#x}); unit ENABLED, \
@@ -2178,7 +2190,11 @@ unsafe fn program_dte<A: Arch>(
         );
         prove_containment::<A>(con, fa, base);
     } else {
-        let _ = writeln!(con, "[iommu] CTRL write did not take: {after:#018x}");
+        let _ = writeln!(
+            con,
+            "[iommu] CTRL write did not take: {after:#018x} — no domain is published, so no \
+             process can be handed a bus master or a DMA mapping"
+        );
     }
 }
 
