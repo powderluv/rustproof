@@ -51,6 +51,27 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-22 (fourth) — none of the containment work ran in CI
+
+CI ran `IOMMU=1` and never `FIRMWARE=1`. Booting through SeaBIOS is what assigns PCI BARs, and
+a DMA-capable device needs a BAR before it can be told to transfer — so without it the device
+probe bails and every gate it feeds is skipped. Which means the whole containment story
+(CONTAINED, TRANSLATED, RIGHTS ENFORCED, UNREACHABLE, REVOKED, PER-DEVICE, DENY WORKS, the real
+BAR, ring 3 driving the device, default-deny, and every `dma:` gate) was verified by hand, on
+this machine, and by nothing else. Weeks of gates, none of them automated.
+
+Added: the containment rig, the bridged topology, the traced run — the only witness that an
+invalidation names the domain it is flushing, since the second device cannot be driven — and a
+step asserting that `run-qemu.sh` REFUSES a non-x86 `ARCH` rather than quietly booting x86 with
+four gate blocks switched off.
+
+**What this is evidenced by, precisely.** The whole sequence passes on this machine (QEMU 8.2.1).
+The containment step is additionally evidenced on Ubuntu with the apt QEMU 8.2.2 that
+`ubuntu-latest` carries — shark-a ran it repeatedly through this work — and `objcopy`, the
+firmware path's only extra dependency, is present there. The bridged and traced steps have NOT
+been run on Ubuntu; `pcie-pci-bridge` and `-trace` are standard in `qemu-system-x86`, but that is
+reasoning, not a run. If CI disagrees, that is CI doing its job.
+
 ## 2026-08-22 (later still) — a gate that fired at random, and a property the boot cannot pin
 
 A `(bug)` line could fire on a healthy boot. `poll_irq(6); poll_irq(7)` then "if not (ticks > 0

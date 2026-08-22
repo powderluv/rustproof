@@ -24,6 +24,35 @@ jobs:
       - name: IOMMU rig (q35 + emulated AMD-Vi; the nucleus must locate the unit)
         run: IOMMU=1 tools/run-qemu.sh
 
+      # Everything below runs ONLY under FIRMWARE=1, and CI never set it — so the whole
+      # containment story was verified by hand and by nothing else. Booting through SeaBIOS is
+      # what assigns PCI BARs, which is what a DMA-capable device needs before it can transfer,
+      # so without it the device probe bails and every gate it feeds is skipped.
+      - name: Containment rig (SeaBIOS + edu; CONTAINED / TRANSLATED / RIGHTS / REVOKED /
+          PER-DEVICE / DENY, the real BAR, and ring 3 driving the device)
+        run: IOMMU=1 FIRMWARE=1 tools/run-qemu.sh
+
+      # A DMA-capable function behind a bridge. The flat rig cannot show that the scan follows
+      # bridges, and a function it never reaches gets no device-table entry — which this unit
+      # treats as passthrough.
+      - name: Containment rig, bridged topology
+        run: BRIDGE=1 IOMMU=1 FIRMWARE=1 tools/run-qemu.sh
+
+      # The only witness that an invalidation names the domain it is flushing: the second
+      # device cannot be driven from here, so the emulator's own trace is the oracle, and the
+      # gate for it exists only when tracing is on.
+      - name: Containment rig, per-domain invalidation (emulator trace)
+        run: QEMU_TRACE='amdvi_*' IOMMU=1 FIRMWARE=1 tools/run-qemu.sh
+
+      # riscv64 has its own runner; this one builds x86 only and must say so rather than
+      # quietly booting x86 with four gate blocks switched off, which is what it used to do.
+      - name: run-qemu.sh refuses a non-x86 ARCH
+        run: |
+          if ARCH=riscv64 tools/run-qemu.sh; then
+            echo "run-qemu.sh accepted ARCH=riscv64 and would have booted x86" >&2
+            exit 1
+          fi
+
   riscv64:
     name: riscv64 — build + boot under QEMU (OpenSBI)
     runs-on: ubuntu-latest
