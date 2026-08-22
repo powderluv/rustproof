@@ -384,6 +384,13 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ]; then
         fi
         # Required only where a domain EXISTS: with no unit every domain capability is refused
         # for that reason alone, and the object would never be looked at.
+        # The deny entry must actually DENY, shown with the device we can drive rather than
+        # asserted from the word we wrote. Nothing else in the boot aims a device at one.
+        if ! echo "$OUT" | grep -q '\[iommu\] DENY WORKS:'; then
+            echo "RESULT: FAIL — the entry every unbound function gets was never shown to deny,"
+            echo "  or a device holding it still reached memory"
+            exit 1
+        fi
         # With a bridge attached, the scan must actually go THROUGH it. The read-back below
         # cannot catch this: it only checks the functions the scan found, so a walk that stops
         # at bus 0 reports "0 passed through" over a set that excludes the device it missed.

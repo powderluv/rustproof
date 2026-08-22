@@ -51,6 +51,42 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-22 — "0 still passed through" was two bits of a sixty-four-bit word
+
+The default-deny read-back checked `V | TV`. That says an entry EXISTS; it says nothing about
+what the entry DOES. The review found two ways to satisfy it while handing every unbound
+function unrestricted DMA, and demonstrated both with a payload:
+
+- **Mode 0 is passthrough.** `V | TV | root` without `MODE_3_LEVEL` means translation disabled.
+  The boot printed `9 present, 0 still passed through` and `RESULT: PASS`, and a device holding
+  that entry wrote a kernel frame no capability granted.
+- **A root aimed at a LIVE table.** Point every "deny" entry at domain 1's page table — the one
+  ring 3's `MAP_DMA` writes leaves into — and the read-back is just as satisfied.
+
+Two fixes, because the check was weak in two different ways.
+
+**The read-back is now the WHOLE word.** A bound device is compared against its own entry, an
+unbound one against the deny word exactly. But note what that alone cannot do: it compares the
+table against what the code INTENDED to write, so mutating the intention passes trivially. A
+read-back can only catch a store that did not take.
+
+**So the deny entry is now aimed at a device.** Nothing in the boot had ever done that — the
+sweep wrote an entry it BELIEVED reached nothing, and no device ever held one. The driveable
+device is now pointed at that exact word, the unit invalidated, and the transfer attempted
+against the frame `TRANSLATED` had reached moments earlier; then it is put back. Only the
+device-table entry changed.
+
+That probe was wrong on its first attempt, in a way worth recording. It aimed only at the
+translated IOVA, and the mode-0 mutant PASSED it — because under passthrough an IOVA is a
+physical address, so the device wrote to physical `0x1000` and left the watched frame alone.
+"Untouched" was true for the wrong reason. It now aims at BOTH the translated IOVA and the
+frame's own address, since the two failure directions are each invisible to the other's address.
+Both mutants die.
+
+The general lesson, third time in this arc: a check written against one way of being wrong is
+silent about the others, and the way to find out is to break the mechanism in each direction and
+watch which breakages the check sleeps through.
+
 ## 2026-08-21 (fifth) — default-deny was a claim about a FLAT bus
 
 The sweep that gave every unbound PCI function an empty table enumerated bus 0 and stopped

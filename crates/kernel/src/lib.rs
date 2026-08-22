@@ -468,6 +468,13 @@ static mut DEVICE_PHYS: u64 = 0;
 #[cfg(target_arch = "x86_64")]
 static mut DEVICE_BAR: u64 = 0;
 
+/// The exact device-table word the deny sweep writes, and the driveable device's real one, so
+/// the boot can point that device at the deny entry and find out whether it actually denies.
+#[cfg(target_arch = "x86_64")]
+static mut DENY_DTE_W0: u64 = 0;
+#[cfg(target_arch = "x86_64")]
+static mut DEVICE_DTE_W0: u64 = 0;
+
 /// DMA mappings withdrawn by process teardown, rather than by an explicit `UNMAP_DMA` or by the
 /// destruction of a region. Reported at shutdown so the attribution path is shown to RUN.
 #[cfg(target_arch = "x86_64")]
@@ -2055,6 +2062,7 @@ unsafe fn program_dte<A: Arch>(
             IOMMU_PT_ROOT = root.as_u64();
             IOMMU_L1 = Some(l1.as_u64());
             DEVICE_TABLE_ENTRY = dte as u64;
+            DEVICE_DTE_W0 = w0;
             dev0_w0 = w0;
         }
     }
@@ -2096,10 +2104,27 @@ unsafe fn program_dte<A: Arch>(
         // Read every present function's entry back. A store that did not take leaves V = 0,
         // which is the passthrough this whole block exists to remove — and a count of writes
         // says nothing about whether any of them landed.
+        // SAFETY: single-CPU boot path.
+        DENY_DTE_W0 = deny_w0;
+        // The WHOLE word, not two bits of it. `V | TV` says an entry exists; it says nothing
+        // about what the entry DOES. Mode 0 means translation disabled — passthrough, the very
+        // thing this sweep removes — and satisfies `V | TV` perfectly; so does a root pointer
+        // aimed at another domain's live page table. Both were measured to survive the old
+        // check with the boot reporting "0 still passed through" and PASSing, and in one of
+        // them a bus master wrote a kernel frame no capability granted.
         let mut passthrough = 0usize;
         for f in all[..present].iter() {
-            let w0 = core::ptr::read_volatile((dt + f.bdf() as u64 * 32) as *const u64);
-            if w0 & (V | TV) != V | TV {
+            let bdf = f.bdf();
+            let w0 = core::ptr::read_volatile((dt + bdf as u64 * 32) as *const u64);
+            let want = match (0..MAX_DOMAINS).find(|&i| {
+                let sl = staged[i];
+                sl.id != 0 && sl.bdf == bdf
+            }) {
+                // A bound device carries its own root; an unbound one carries the deny root.
+                Some(_) => continue,
+                None => deny_w0,
+            };
+            if w0 != want {
                 passthrough += 1;
             }
         }
@@ -3021,6 +3046,54 @@ unsafe fn prove_containment<A: Arch>(
     // it could — the stale-mapping hazard `crates/iommu`'s exhaustive search exists to
     // prevent, which would be a poor thing to demonstrate and then commit here.
     if let Some((_, _, dst_phys, ro)) = translated {
+        // ---- does the DENY entry actually DENY? ----
+        //
+        // The sweep hands every unbound function an entry it BELIEVES reaches nothing, and this
+        // boot never aimed a device at one — so the deny table's emptiness was demonstrated
+        // nowhere, and the check that it had been installed looked at two bits of the word.
+        // Point the device we CAN drive at that exact entry and find out. The frame and the
+        // IOVA are the pair TRANSLATED reached a moment ago, so the ONE thing that changed is
+        // the device-table entry.
+        let dte = *core::ptr::addr_of!(DEVICE_TABLE_ENTRY);
+        let deny = *core::ptr::addr_of!(DENY_DTE_W0);
+        let mine = *core::ptr::addr_of!(DEVICE_DTE_W0);
+        if dte != 0 && deny != 0 && mine != 0 {
+            for i in 0..8u64 {
+                core::ptr::write_volatile((dst_phys + i * 8) as *mut u64, SENTINEL);
+            }
+            core::ptr::write_volatile(dte as *mut u64, deny);
+            iommu_invalidate(base, 0);
+            // TWO transfers, because the entry can fail in two different directions and each
+            // is invisible to the other's address:
+            //   - a root aimed at a LIVE table translates IOVA 0x1000 to this frame, so aiming
+            //     there catches it;
+            //   - mode 0 is PASSTHROUGH, where an IOVA is a physical address and 0x1000 lands
+            //     nowhere near this frame — so that one is caught only by aiming at the frame's
+            //     OWN address, where passthrough is an identity map.
+            // Measured: with only the first, the mode-0 mutant passed and the boot said "0 still
+            // passed through", because the device wrote to physical 0x1000 instead.
+            let done = run(0x4_0000, IOVA, true) && run(0x4_0000, dst_phys, true);
+            let seen = first_disturbed(dst_phys, SENTINEL);
+            // Put the device back before anything else runs, and tell the unit.
+            core::ptr::write_volatile(dte as *mut u64, mine);
+            iommu_invalidate(base, 0);
+            if seen == SENTINEL {
+                let _ = writeln!(
+                    con,
+                    "[iommu] DENY WORKS: holding the entry every unbound function gets, the \
+                     device reached this frame through NEITHER the IOVA it had just reached NOR \
+                     the frame's own address (transfers {})",
+                    if done { "completed" } else { "stuck" }
+                );
+            } else {
+                let _ = writeln!(
+                    con,
+                    "[iommu] (bug) the DENY entry does not deny: the device still reached \
+                     {seen:#018x}"
+                );
+            }
+        }
+
         let _ = writeln!(
             con,
             "[iommu] read-only grant: mapped {} | wider rights {} | device write {} | frame \
