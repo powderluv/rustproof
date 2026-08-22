@@ -12,3 +12,9 @@
 channel = "1.95.0"
 targets = ["x86_64-unknown-none"]
 profile = "minimal"
+# `minimal` installs no rustfmt, and CI's FIRST step is `cargo fmt --all --check` — so every run
+# died on step one with "'cargo-fmt' is not installed for the toolchain '1.95.0'". Forty runs
+# back, to 2026-08-14, not one was green: the whole DMA/IOMMU arc was pushed against a CI that
+# had never once reported on it. Naming the component here fixes it everywhere the pin is
+# honoured rather than only on the runner.
+components = ["rustfmt"]
