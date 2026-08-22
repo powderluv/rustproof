@@ -1034,6 +1034,40 @@ fn compute(id: u64) -> ! {
             Err(_) => dw!(b"dev: no bounded device on this machine, so no BAR to map\n"),
         }
 
+        // MAP_DMA must survive map-then-free cycles. Freeing a region withdraws its mappings,
+        // but the ATTRIBUTION slot that named it is a separate record, and `UNMAP_DMA` cannot
+        // clear it — that resolves the region first, and a freed region resolves to nothing. If
+        // the slot leaks, a process's DMA table fills with records for regions that no longer
+        // exist and MAP_DMA answers NO_MEM for ever, with nothing mapped anywhere.
+        tag(id);
+        let mut cycles = 0u64;
+        let mut no_unit = false;
+        while cycles < 6 {
+            let r = make_region(2, 1);
+            if r == syserr::NO_CAP || r == syserr::NO_MEM {
+                break;
+            }
+            let got = map_dma(8, r);
+            free_region(r);
+            if got >= syserr::FAULT {
+                // Refused on the FIRST attempt means no unit to bound DMA at all, which is a
+                // different fact from a table that fills up. A leak refuses only once the slots
+                // are gone, and by then some cycles have already succeeded.
+                no_unit = cycles == 0;
+                break;
+            }
+            cycles += 1;
+        }
+        if no_unit {
+            dw!(b"dma: no unit here, so there are no map-then-free cycles to test\n");
+        } else if cycles == 6 {
+            dw!(b"dma: six map-then-free cycles and MAP_DMA still works\n");
+        } else {
+            dw!(b"dma: MAP_DMA stopped working after ");
+            dbg_dec(cycles);
+            dw!(b" map-then-free cycle(s) (bug)\n");
+        }
+
         // A REFUSAL must undo exactly what it installed, and nothing else. Exhaust the
         // DOMAIN's mapping slots with a multi-page region: the rollback revokes the frames'
         // grants, and `Domain::revoke` withdraws EVERY model mapping of a frame — including
@@ -1385,7 +1419,12 @@ fn compute(id: u64) -> ! {
             // why the distinction was invisible; the boot reports a count so the attribution
             // path is shown to RUN rather than merely to exist.
             tag(id);
-            if map_dma(8, c) < syserr::FAULT {
+            // In the SECOND domain deliberately. With everything in domain 1 the (region,
+            // domain) pair is over-determined, and a teardown that ignored the domain half
+            // withdrew from the right place by luck — a mutant that did exactly that survived
+            // every gate. Now getting the domain wrong leaves domain 2's leaves behind, and
+            // the shutdown walk of the real tables finds them.
+            if map_dma(11, c) < syserr::FAULT {
                 dw!(b"dma: leaving a mapping live at exit for teardown to withdraw\n");
             } else {
                 dw!(b"dma: no unit here, so nothing to leave mapped at exit\n");

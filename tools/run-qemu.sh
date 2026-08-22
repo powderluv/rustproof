@@ -7,6 +7,15 @@
 #   PROFILE=debug tools/run-qemu.sh      # debug profile (default: release)
 # note: no `-u` — bash 3.2 (macOS) errors on empty-array expansion under nounset
 set -eo pipefail
+
+# ARCH is not a dispatch here. This script builds x86_64-unknown-none and runs
+# qemu-system-x86_64, full stop; riscv64 has its own runner. `ARCH=riscv64 tools/run-qemu.sh`
+# used to boot the x86 image while switching four gate blocks off — a second x86 run reported
+# as riscv coverage, and weaker than the plain one. Refuse it rather than quietly comply.
+if [ -n "${ARCH:-}" ] && [ "${ARCH}" != "x86_64" ]; then
+    echo "run-qemu.sh builds x86_64 only; for riscv64 use tools/run-qemu-riscv.sh" >&2
+    exit 2
+fi
 cd "$(dirname "$0")/.."   # repo root
 
 TARGET=x86_64-unknown-none
@@ -324,7 +333,7 @@ fi
 for want in \
     'dma: an IommuDomain cap without WRITE cannot grant DMA reach' \
     'role: producer cannot grant DMA reach (no domain capability at all)'; do
-    if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ] \
+    if [ "${PROVOKE_FAULT:-0}" != "1" ] \
         && ! echo "$OUT" | grep -qF "$want"; then
         echo "RESULT: FAIL — a required assertion never ran: $want"
         exit 1
@@ -333,7 +342,7 @@ done
 # Freeing a region must withdraw the device's reach, whether or not the caller unmapped first.
 # The probe that exercises it has to have RUN — the scan it feeds only reports a stale entry if
 # something created one, so a missing probe is a silently weaker boot, not a passing one.
-if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ] \
+if [ "${PROVOKE_FAULT:-0}" != "1" ] \
     && ! echo "$OUT" | grep -qE 'dma: freed a region (while the device still had it mapped|that no unit could reach anyway)'; then
     echo "RESULT: FAIL — the free-while-DMA-mapped probe never ran"
     exit 1
@@ -343,7 +352,7 @@ fi
 # bounded. Both directions are required, keyed on whether the boot bound a domain — because
 # QEMU's default machine has an e1000, so a boot with no IOMMU still HAS a real bus master for
 # the scan to find, and the refusal is the whole point there.
-if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ]; then
+if [ "${PROVOKE_FAULT:-0}" != "1" ]; then
     if echo "$OUT" | grep -q '\[iommu\] domain 1 bound to'; then
         if ! echo "$OUT" | grep -q 'dev: mapped the REAL device BAR'; then
             echo "RESULT: FAIL — the device's DMA is bounded, yet its registers never reached"
@@ -372,7 +381,7 @@ fi
 # the machine, not on what the env flags imply about it. Keying it on IOMMU=1 && FIRMWARE=1 was
 # wrong: `IOMMU=1` alone also finds IVRS and enables the unit, so the run that was supposed to
 # demonstrate the refusal was demonstrating the mapping, and the gate failed a working boot.
-if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ]; then
+if [ "${PROVOKE_FAULT:-0}" != "1" ]; then
     if echo "$OUT" | grep -q 'unit ENABLED'; then
         if ! echo "$OUT" | grep -q 'dma: the device can now reach our region by DMA'; then
             echo "RESULT: FAIL — MAP_DMA did not hand out reach on a rig that HAS an IOMMU"
@@ -422,6 +431,13 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ]; then
                     exit 1
                 fi
             done
+        fi
+        # MAP_DMA must survive map-then-free cycles: the attribution slot is a separate record
+        # from the mapping, and UNMAP_DMA cannot clear it once the region is gone.
+        if ! echo "$OUT" | grep -qE 'dma: (six map-then-free cycles and MAP_DMA still works|no unit here, so there are no map-then-free cycles)'; then
+            echo "RESULT: FAIL — MAP_DMA stopped working after a few map-then-free cycles, or"
+            echo "  the probe for it never ran"
+            exit 1
         fi
         # Teardown must withdraw a DMA mapping the process never unmapped, BY ATTRIBUTION.
         # The demo deliberately exits holding one. A count of zero means either the probe did

@@ -51,6 +51,43 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-22 (later) — the review's other findings, including one about my own reporting
+
+**`ARCH=riscv64 tools/run-qemu.sh` never ran riscv64.** It built `x86_64-unknown-none` and booted
+`qemu-system-x86_64`. The script has no dispatch on `ARCH` at all — the variable exists only in
+four gate conditions this DMA arc added, so setting it produced a SECOND x86 run with four gate
+blocks silently switched off: weaker than the plain run, and reported as riscv coverage.
+`git log -S ARCH` shows the variable arriving with those commits. Every "all five modes PASS"
+line in the entries above should be read as four x86 modes and one x86 rerun.
+
+The riscv64 port itself is fine — `tools/run-qemu-riscv.sh` builds `nucleus-riscv`, boots
+`qemu-system-riscv64` under OpenSBI, and passes. The port was never in doubt; the EVIDENCE cited
+for it was wrong. `run-qemu.sh` now refuses a non-x86 `ARCH` before doing any work, and the dead
+conditions are gone.
+
+**A released region leaked its attribution slot.** `Process::dma` records `(region, domain)`, and
+`Release` cleared the mappings but not the records — while `UNMAP_DMA` cannot clear them either,
+because it resolves the region first and a freed region resolves to nothing. Four map-then-free
+cycles filled the table with records for regions that no longer existed and `MAP_DMA` answered
+`NO_MEM` for ever after, with nothing mapped anywhere. Reachable from the unprivileged ABI with
+capabilities the demo role already holds. The demo now runs six cycles; against the old code it
+stops after four.
+
+**Teardown could ignore the domain half of the record.** Everything in the demo mapped into
+domain 1, so `(region, domain)` was over-determined and a teardown that looked the domain up
+wrongly still withdrew from the right table by luck — the mutant survived every gate. The
+mapping deliberately left live at exit is now in the SECOND domain, so getting the domain wrong
+leaves domain 2's leaves behind and the shutdown walk finds them.
+
+**"0 still passed through" was satisfied by an enumeration that found nothing.** No functions
+examined, none counted, the line printed over an empty set. A machine with an IOMMU has PCI
+functions, so finding none means the scan failed — the one case where reporting success is worst.
+
+One process note: the cycle probe was wrong on its first run, in the same way as the last two
+probes. It treated "no unit, so MAP_DMA refuses" as failure, and broke every boot without an
+IOMMU. A refusal on the FIRST attempt is a different fact from a table that fills up, and the
+probe now distinguishes them.
+
 ## 2026-08-22 — "0 still passed through" was two bits of a sixty-four-bit word
 
 The default-deny read-back checked `V | TV`. That says an entry EXISTS; it says nothing about

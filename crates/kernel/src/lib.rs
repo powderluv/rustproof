@@ -925,6 +925,22 @@ unsafe fn run_region_plan<A: Arch>(plan: &regions::Plan<PLAN_STEPS>) {
                         }
                     }
                     let _ = touched;
+                    // And the ATTRIBUTION slots that named it. The mappings are gone, so
+                    // nothing will ever withdraw these records — and `UNMAP_DMA` cannot clear
+                    // them either, because it resolves the region first and a freed region
+                    // resolves to nothing. Four map-then-free cycles and a process's DMA table
+                    // is full of records for regions that no longer exist, with zero live
+                    // mappings and `MAP_DMA` answering NO_MEM for ever after.
+                    for p in 0..MAX_PROCS {
+                        if proc_at(p).state == ProcState::Free {
+                            continue;
+                        }
+                        for slot in 0..SHARE_SLOTS {
+                            if proc_at(p).dma[slot].0 == region {
+                                proc_at(p).dma[slot] = (0, 0);
+                            }
+                        }
+                    }
                     if let Some(fa) = (*core::ptr::addr_of_mut!(FA)).as_mut() {
                         use abi::FrameAllocator as _;
                         for k in 0..r.npages as usize {
@@ -2133,6 +2149,18 @@ unsafe fn program_dte<A: Arch>(
             "[iommu] {denied} other function(s) given an EMPTY table; {present} present, \
              {passthrough} still passed through"
         );
+        // An enumeration that found nothing satisfies the loop above trivially: no functions
+        // examined, no passthrough counted, "0 still passed through" printed over an empty set.
+        // A machine with an IOMMU has PCI functions, so finding none means the scan failed —
+        // which is the one case where reporting success is worst.
+        if present == 0 {
+            let _ = writeln!(
+                con,
+                "\n[iommu] (bug) the PCI scan found no functions at all, so 'none passed \
+                 through' is a statement about an empty set"
+            );
+            A::exit(false);
+        }
         if passthrough > 0 {
             let _ = writeln!(
                 con,
