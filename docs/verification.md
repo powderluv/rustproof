@@ -51,6 +51,37 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-21 (fifth) — default-deny was a claim about a FLAT bus
+
+The sweep that gave every unbound PCI function an empty table enumerated bus 0 and stopped
+there. Three separate scans all did. So a DMA-capable function behind a bridge was in none of the
+answers, got no device-table entry, and was therefore PASSED THROUGH — the same hole that sweep
+had just closed, one topology over.
+
+The rig could not show it, so the rig grew a `BRIDGE=1` mode that puts a DMA-capable function
+behind a PCI bridge. With one enumeration that follows bridges:
+
+```
+[iommu] 11 PCI function(s) across 2 bus(es), 4 DMA-capable; room to bound 2
+[iommu] 9 other function(s) given an EMPTY table; 11 present, 0 still passed through
+```
+
+**The read-back could not have caught this, and that is the part worth keeping.** It checks the
+functions the scan FOUND, so a walk that stops early reports "0 still passed through" over a set
+that excludes exactly what it missed — a check whose subject is chosen by the thing it is
+checking. The mutant that stops at bus 0 shows it precisely: `10 PCI function(s) across 1
+bus(es), 3 DMA-capable`, with the bridge itself enumerated and the device behind it invisible,
+and the read-back still perfectly satisfied.
+
+What moves is the BUS COUNT, so that is what the boot reports and what the bridged rig gates on.
+An enumeration that truncates now also refuses to publish any domain at all, rather than
+reporting success over the part it managed to see.
+
+Three bus-0 scans became one: the kernel enumerates once, follows every bridge breadth-first
+through a bounded worklist (a looping topology cannot run away), and derives from that single
+list which devices to bind and which to deny. It also stops probing functions 1..7 of a
+single-function device, which the old scans did not.
+
 ## 2026-08-21 (fourth) — a proxy published before the property it stood for
 
 Whether ring 3 may hold a real bus-mastering BAR, and whether `MAP_DMA` may hand out an IOVA,

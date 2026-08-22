@@ -317,110 +317,82 @@ pub unsafe fn find_dma_device() -> Option<Function> {
     find_class(CLASS_ETHERNET)
 }
 
-/// Collect every DMA-capable function, `edu` first, into `out`. Returns how many were found.
+/// Every PCI function present on ANY reachable bus, up to `out.len()`.
 ///
-/// `find_dma_device` returns only the first, which was enough while one domain existed. Per-device
-/// containment needs them all: a domain bound to one BDF says nothing about what another device
-/// can reach, and the second device is what makes "a capability for A's domain cannot grant reach
-/// into B's" a claim with two sides rather than one.
+/// Returns `(written, truncated)`. Bus 0 is where the scan starts; every bridge found is
+/// followed to its secondary bus, because a device behind a bridge is exactly as capable of
+/// bus-mastering as one in front of it — and a function this never reaches gets no device-table
+/// entry, which this unit treats as PASSTHROUGH. Enumerating only bus 0 made "every function is
+/// bounded" a statement about a flat topology.
+///
+/// `truncated` matters as much as the count: silently dropping the tail would leave functions
+/// unbounded while the caller reported success over the ones it happened to see.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn find_dma_devices(out: &mut [Function]) -> usize {
-    let mut n = 0;
-    // `edu` first, deliberately: it is the one this nucleus can drive into a transfer, so it is
-    // the device every hardware oracle here is written against, and it should be domain 1
-    // regardless of where it sits in the bus scan.
-    if let Some(f) = find_dma_device() {
-        if n < out.len() {
-            out[n] = f;
-            n += 1;
+pub unsafe fn enumerate(out: &mut [Function]) -> (usize, bool) {
+    // Bridges are followed breadth-first through a fixed worklist. A malformed or looping
+    // topology cannot run away: a bus already queued is never queued twice, and the list is
+    // bounded, so the walk terminates whatever config space reports.
+    let mut buses = [0u8; 16];
+    let mut nbuses = 1usize;
+    let mut next = 0usize;
+    let mut n = 0usize;
+    let mut truncated = false;
+    while next < nbuses {
+        let bus = buses[next];
+        next += 1;
+        for dev in 0..32u8 {
+            for func in 0..8u8 {
+                let id = read32(bus, dev, func, 0x00);
+                let vendor = (id & 0xFFFF) as u16;
+                if vendor == 0xFFFF {
+                    continue;
+                }
+                let header = (read32(bus, dev, func, 0x0C) >> 16) as u8;
+                if header & 0x7F == 1 {
+                    let secondary = ((read32(bus, dev, func, 0x18) >> 8) & 0xFF) as u8;
+                    let known = buses[..nbuses].iter().any(|&b| b == secondary);
+                    if secondary != 0 && !known {
+                        if nbuses < buses.len() {
+                            buses[nbuses] = secondary;
+                            nbuses += 1;
+                        } else {
+                            truncated = true;
+                        }
+                    }
+                }
+                if n < out.len() {
+                    out[n] = Function {
+                        bus,
+                        dev,
+                        func,
+                        vendor,
+                        device: (id >> 16) as u16,
+                    };
+                    n += 1;
+                } else {
+                    truncated = true;
+                }
+                // A single-function device does not answer for functions 1..7.
+                if func == 0 && header & 0x80 == 0 {
+                    break;
+                }
+            }
         }
     }
-    for dev in 0..32u8 {
-        for func in 0..8u8 {
-            if n >= out.len() {
-                return n;
-            }
-            let id = read32(0, dev, func, 0x00);
-            let vendor = (id & 0xFFFF) as u16;
-            if vendor == 0xFFFF {
-                continue;
-            }
-            let class = read32(0, dev, func, 0x08) >> 16;
-            if class != CLASS_ETHERNET as u32 {
-                continue;
-            }
-            let f = Function {
-                bus: 0,
-                dev,
-                func,
-                vendor,
-                device: (id >> 16) as u16,
-            };
-            if out[..n].iter().any(|g| g.bdf() == f.bdf()) {
-                continue;
-            }
-            out[n] = f;
-            n += 1;
-        }
-    }
-    n
+    (n, truncated)
 }
 
-/// How many DMA-capable functions exist, regardless of how many we have room to bound.
+/// Could this function master the bus? `edu` by identity, anything Ethernet by class.
 ///
-/// [`find_dma_devices`] stops at the caller's array, so it cannot answer this — and the
-/// difference matters: a device-table entry with `V = 0` is PASSTHROUGH, not deny, so a
-/// DMA-capable function the nucleus never enumerated has unrestricted access to memory while
-/// the unit is enabled.
+/// Deliberately a small, named set rather than "anything with the bus-master bit set": the bit
+/// is writable by whoever holds the registers, so it says what a device is doing, not what it
+/// COULD do. Everything outside this set is denied by default anyway.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn count_dma_devices() -> usize {
-    let mut n = 0;
-    for dev in 0..32u8 {
-        for func in 0..8u8 {
-            let id = read32(0, dev, func, 0x00);
-            let vendor = (id & 0xFFFF) as u16;
-            if vendor == 0xFFFF {
-                continue;
-            }
-            let class = read32(0, dev, func, 0x08) >> 16;
-            let is_edu = vendor == EDU_VENDOR && (id >> 16) as u16 == EDU_DEVICE;
-            if is_edu || class == CLASS_ETHERNET as u32 {
-                n += 1;
-            }
-        }
+pub unsafe fn is_dma_capable(f: &Function) -> bool {
+    if f.vendor == EDU_VENDOR && f.device == EDU_DEVICE {
+        return true;
     }
-    n
-}
-
-/// Every PCI function present on bus 0, up to `out.len()`. Returns how many were written.
-///
-/// Not just the DMA-capable ones: any function can be made a bus master by whoever holds its
-/// registers, and an entry with `V = 0` is passthrough. What the unit needs is an entry for
-/// everything, so the default is DENY.
-#[cfg(target_arch = "x86_64")]
-pub unsafe fn present_functions(out: &mut [Function]) -> usize {
-    let mut n = 0;
-    for dev in 0..32u8 {
-        for func in 0..8u8 {
-            if n >= out.len() {
-                return n;
-            }
-            let id = read32(0, dev, func, 0x00);
-            let vendor = (id & 0xFFFF) as u16;
-            if vendor == 0xFFFF {
-                continue;
-            }
-            out[n] = Function {
-                bus: 0,
-                dev,
-                func,
-                vendor,
-                device: (id >> 16) as u16,
-            };
-            n += 1;
-        }
-    }
-    n
+    (read32(f.bus, f.dev, f.func, 0x08) >> 16) == CLASS_ETHERNET as u32
 }
 
 /// Is this function the one we know how to drive into a DMA?

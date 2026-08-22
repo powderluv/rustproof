@@ -108,6 +108,14 @@ if [ "${IOMMU:-0}" = "1" ]; then
     # containment proof drives. The e1000 stays as a second DMA-capable function so the scan
     # has to distinguish them rather than take whatever it finds first.
     MACHINE=(-machine q35 -device amd-iommu -device e1000,bus=pcie.0 -device edu,bus=pcie.0)
+    # A DMA-capable function BEHIND A BRIDGE. The bus scan started at bus 0 and stopped there,
+    # so a device on a secondary bus was enumerated by nothing, got no device-table entry, and
+    # was therefore PASSED THROUGH — the same hole the default-deny sweep closes on bus 0. The
+    # flat rig cannot show that; this one can.
+    if [ "${BRIDGE:-0}" = "1" ]; then
+        MACHINE+=(-device pcie-pci-bridge,id=br0,bus=pcie.0 -device e1000,bus=br0,addr=1)
+        echo "== plus a DMA-capable function behind a PCI bridge =="
+    fi
     echo "== IOMMU rig: q35 + emulated AMD-Vi =="
 fi
 
@@ -376,6 +384,15 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ] && [ "${ARCH:-x86_64}" = "x86_64" ]; then
         fi
         # Required only where a domain EXISTS: with no unit every domain capability is refused
         # for that reason alone, and the object would never be looked at.
+        # With a bridge attached, the scan must actually go THROUGH it. The read-back below
+        # cannot catch this: it only checks the functions the scan found, so a walk that stops
+        # at bus 0 reports "0 passed through" over a set that excludes the device it missed.
+        # The bus count is the number that moves.
+        if [ "${BRIDGE:-0}" = "1" ] && ! echo "$OUT" | grep -qE 'PCI function\(s\) across [2-9][0-9]* bus\(es\)'; then
+            echo "RESULT: FAIL — a bridge is present but the scan never left bus 0, so whatever"
+            echo "  is behind it has no device-table entry and is passed through"
+            exit 1
+        fi
         # Default DENY: every PCI function has a valid device-table entry. An entry with V=0 is
         # PASSTHROUGH in this unit, so a function the nucleus never enumerated has unrestricted
         # DMA while the boot claims to bound it — and the rig really does have more DMA-capable

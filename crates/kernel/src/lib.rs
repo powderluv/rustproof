@@ -1936,14 +1936,59 @@ unsafe fn program_dte<A: Arch>(
     // their models said, so separate tables are what makes per-device containment a fact about
     // the machine rather than bookkeeping. Domain 1 is `edu` — the device this nucleus can
     // drive — so every hardware oracle in the demo is written against a domain that can answer.
-    let mut devs = [pci::Function::EMPTY; MAX_DOMAINS];
-    let found = pci::find_dma_devices(&mut devs);
-    let total = pci::count_dma_devices();
+    // ONE enumeration, following bridges, used for everything below: which devices to bind,
+    // and which to deny. Three separate scans of bus 0 answered three questions about a flat
+    // topology — and a function behind a bridge was in none of the answers, so it got no
+    // device-table entry at all, which this unit reads as passthrough.
+    let mut all = [pci::Function::EMPTY; 32];
+    let (present, truncated) = pci::enumerate(&mut all);
+    if truncated {
+        let _ = writeln!(
+            con,
+            "\n[iommu] (bug) more PCI functions than this scan can hold — the ones it never \
+             reached would be passed through, so no domain is published"
+        );
+        return;
+    }
+    let total = all[..present]
+        .iter()
+        .filter(|f| pci::is_dma_capable(f))
+        .count();
+    // How many BUSES the scan reached, not just how many functions. The read-back below can
+    // only check the set it wrote, so it is blind to whatever the scan never reached — and
+    // "every function is bounded" is exactly the claim a truncated scan makes vacuously true.
+    // The bus count is the one number that moves when the walk stops early.
+    let mut buses_seen = 0usize;
+    for i in 0..present {
+        if !all[..i].iter().any(|g| g.bus == all[i].bus) {
+            buses_seen += 1;
+        }
+    }
     let _ = writeln!(
         con,
-        "[iommu] {total} DMA-capable function(s) present; room to bound {}",
+        "[iommu] {present} PCI function(s) across {buses_seen} bus(es), {total} DMA-capable; \
+         room to bound {}",
         MAX_DOMAINS
     );
+    // `edu` first, so the device every hardware oracle is written against is domain 1 whatever
+    // order the bus scan returns.
+    let mut devs = [pci::Function::EMPTY; MAX_DOMAINS];
+    let mut found = 0usize;
+    for f in all[..present].iter().filter(|f| pci::is_edu(f)) {
+        if found < devs.len() {
+            devs[found] = *f;
+            found += 1;
+        }
+    }
+    for f in all[..present]
+        .iter()
+        .filter(|f| pci::is_dma_capable(f) && !pci::is_edu(f))
+    {
+        if found < devs.len() {
+            devs[found] = *f;
+            found += 1;
+        }
+    }
     let mut live = 0usize;
     let mut dev0_w0 = 0u64;
     // STAGED, not published. A domain slot is what `MAP_DMA` and the real-BAR capability both
@@ -2034,8 +2079,6 @@ unsafe fn program_dte<A: Arch>(
     // right default for a device nobody has asked to use.
     if let Some(deny) = fa.alloc_frame().map(|f| zero_frame(f)) {
         let deny_w0 = V | TV | MODE_3_LEVEL | (deny.as_u64() & 0x000F_FFFF_FFFF_F000) | IR | IW;
-        let mut all = [pci::Function::EMPTY; 32];
-        let present = pci::present_functions(&mut all);
         let mut denied = 0usize;
         for f in all[..present].iter() {
             let bdf = f.bdf();
