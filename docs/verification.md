@@ -65,12 +65,20 @@ invalidation names the domain it is flushing, since the second device cannot be 
 step asserting that `run-qemu.sh` REFUSES a non-x86 `ARCH` rather than quietly booting x86 with
 four gate blocks switched off.
 
-**What this is evidenced by, precisely.** The whole sequence passes on this machine (QEMU 8.2.1).
-The containment step is additionally evidenced on Ubuntu with the apt QEMU 8.2.2 that
-`ubuntu-latest` carries — shark-a ran it repeatedly through this work — and `objcopy`, the
-firmware path's only extra dependency, is present there. The bridged and traced steps have NOT
-been run on Ubuntu; `pcie-pci-bridge` and `-trace` are standard in `qemu-system-x86`, but that is
-reasoning, not a run. If CI disagrees, that is CI doing its job.
+**And CI had never once been green.** Not "was failing recently" — forty runs back, to
+2026-08-14, not one success. Every run died on step ONE: `cargo fmt --all --check` against a pin
+that says `profile = "minimal"`, which installs no rustfmt. Both date to the initial scaffold.
+
+So the entire DMA/IOMMU arc was pushed against automation that had never reported on it, while I
+read my own local runs as though they were the automated signal. The gates were real; the thing
+that was supposed to run them was not, and I did not look until now. Naming `rustfmt` in the pin
+fixes it everywhere the pin is honoured.
+
+Run 32606071609 is the first green one, and it is green including the three new rigs: the
+containment rig, the bridged topology, and the traced run all pass on `ubuntu-latest`, as does
+the step asserting a non-x86 `ARCH` is refused. The caveat this entry originally carried — that
+the bridged and traced steps were reasoned about rather than run on Ubuntu — is now discharged by
+measurement.
 
 ## 2026-08-22 (later still) — a gate that fired at random, and a property the boot cannot pin
 
