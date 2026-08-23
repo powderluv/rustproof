@@ -2032,11 +2032,45 @@ unsafe fn program_dte<A: Arch>(
          room to bound {}",
         MAX_DOMAINS
     );
+    // ROOT BUS ONLY, and this is a correctness rule rather than a convenience.
+    //
+    // A device-table entry is indexed by the REQUESTER ID the unit sees, and for a function
+    // behind a PCI-to-PCI bridge that is not its own BDF — the bridge forwards the transaction
+    // as itself, which is why Linux has IOMMU groups and `pci_for_each_dma_alias`. Binding a
+    // domain at the enumerated BDF therefore programs an entry the unit never consults for that
+    // device: measured, with a domain bound to 0x0108 while every translation the device
+    // performed arrived under a different id, and the granted IOVA did not reach its frame.
+    // Worse, several functions behind one bridge share a requester id, so "one table per
+    // device" would silently become one table for all of them.
+    //
+    // Until aliases are modelled, a device whose requester id is not its BDF does not get a
+    // domain. It still gets a DENY entry like every other unbound function, and so does the
+    // bridge it sits behind — so it reaches nothing, which is the safe direction. The
+    // enumeration must still cross bridges: those functions need entries, and that is what
+    // following bridges buys. What it does not buy is the right to BIND them.
+    let mut behind_bridge = 0usize;
+    let bindable = |f: &pci::Function| f.bus == 0 && pci::is_dma_capable(f);
+    for f in all[..present].iter() {
+        if f.bus != 0 && pci::is_dma_capable(f) {
+            behind_bridge += 1;
+        }
+    }
+    if behind_bridge > 0 {
+        let _ = writeln!(
+            con,
+            "[iommu] {behind_bridge} DMA-capable function(s) are not on the root bus; their \
+             requester id is not their BDF, so they are DENIED rather than bound"
+        );
+    }
+
     // `edu` first, so the device every hardware oracle is written against is domain 1 whatever
     // order the bus scan returns.
     let mut devs = [pci::Function::EMPTY; MAX_DOMAINS];
     let mut found = 0usize;
-    for f in all[..present].iter().filter(|f| pci::is_edu(f)) {
+    for f in all[..present]
+        .iter()
+        .filter(|f| pci::is_edu(f) && bindable(f))
+    {
         if found < devs.len() {
             devs[found] = *f;
             found += 1;
@@ -2044,7 +2078,7 @@ unsafe fn program_dte<A: Arch>(
     }
     for f in all[..present]
         .iter()
-        .filter(|f| pci::is_dma_capable(f) && !pci::is_edu(f))
+        .filter(|f| bindable(f) && !pci::is_edu(f))
     {
         if found < devs.len() {
             devs[found] = *f;
@@ -2302,6 +2336,13 @@ unsafe fn program_dte<A: Arch>(
         // as evidence that a device's DMA is bounded — `MAP_DMA`, and the capability naming the
         // real BAR — is gated on this store, not on the earlier table writes.
         for i in 0..MAX_DOMAINS {
+            // A bound domain's BDF must be a ROOT-BUS one, because that is the only case where
+            // the requester id the unit sees equals the BDF this entry is indexed by. Anything
+            // else programs a table the device never consults.
+            assert!(
+                staged[i].id == 0 || staged[i].bdf < 0x100,
+                "a domain was bound to a device whose requester id is not its BDF"
+            );
             DOMAIN_SLOTS[i] = staged[i];
             if staged[i].id != 0 {
                 // Reported HERE, not where the tables were written: "bound" is a statement

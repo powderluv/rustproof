@@ -60,6 +60,44 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-23 — a domain bound to a BDF the unit never consults
+
+A PCI-to-PCI bridge forwards its children's transactions as ITSELF. So for a function behind a
+bridge, the requester id the IOMMU sees is not the BDF the scan read out of config space — which
+is why Linux has IOMMU groups and `pci_for_each_dma_alias`. The nucleus indexed the device table
+by the enumerated BDF and bound domains there, so a domain bound to a behind-bridge device
+programmed an entry the unit never consults for it. Measured: a domain bound at `0x0108` while
+every translation that device performed arrived under a different id, and the granted IOVA did
+not reach its frame. Several functions behind one bridge share a requester id, so "one table per
+device" would silently have become one table for all of them.
+
+Fixed by declining: a domain is bound only to a ROOT-BUS device, where requester id and BDF
+coincide. Anything behind a bridge is DENIED like every other unbound function — and so is the
+bridge, so it reaches nothing, which is the safe direction. An assertion refuses to publish a
+domain whose BDF is not a root-bus one, and the bridged rig now MOVES the second DMA-capable
+device behind the bridge (with `-net none`, since QEMU's default NIC would otherwise fill the
+slot and the question would never arise) so that mutant is caught in CI.
+
+**And the justification I wrote for crossing bridges was wrong.** The entry above dated
+2026-08-21 says a DMA-capable function behind a bridge "got no device-table entry, and was
+therefore PASSED THROUGH". On this emulator it was not: its requester id aliases to the host
+bridge at `00:00.0`, which the bus-0 scan DID enumerate and therefore did deny. The refutation
+ran that case at the pre-fix commit and the device reached nothing. Crossing bridges is still
+right — the functions need entries, and on hardware whose aliasing differs the passthrough case
+is real — but the specific thing I claimed to have closed was not open here. The commit did
+something worth doing for a reason that did not hold.
+
+Two smaller consequences, both about assertions that had quietly become claims about the RIG:
+
+- The demo asserted a second device domain exists. How many domains a machine has is a property
+  of its device list, so the demo now says when there is only one, and the runner requires the
+  second-domain checks only when the boot reports a second domain bound. It also prefers domain 2
+  for the mapping left live at exit and falls back to domain 1, so the teardown path is exercised
+  on both topologies.
+- `find_dma_device` — which picks the one device with a payload oracle — still scans bus 0 only.
+  That is now CORRECT rather than an oversight, since only root-bus devices are bindable, but the
+  commit message for 602891b said "Three bus-0 scans became one" and there were four.
+
 ## 2026-08-22 (fifth) — checking a claim I had just written down
 
 Writing the V5 row forced a question the code had not been asked: is "invalidated to completion"
@@ -220,6 +258,12 @@ silent about the others, and the way to find out is to break the mechanism in ea
 watch which breakages the check sleeps through.
 
 ## 2026-08-21 (fifth) — default-deny was a claim about a FLAT bus
+
+> CORRECTION (2026-08-23): the passthrough this entry claims to have closed was not open on this
+> emulator — a behind-bridge function's requester id aliases to the host bridge, which the bus-0
+> scan already denied. Crossing bridges remains right for enumeration coverage; see the
+> 2026-08-23 entry, which also fixes the unsoundness this change introduced by BINDING domains
+> to behind-bridge BDFs.
 
 The sweep that gave every unbound PCI function an empty table enumerated bus 0 and stopped
 there. Three separate scans all did. So a DMA-capable function behind a bridge was in none of the

@@ -116,14 +116,21 @@ if [ "${IOMMU:-0}" = "1" ]; then
     # `edu` is a register-driven DMA engine (source/dest/count/command) — the device the
     # containment proof drives. The e1000 stays as a second DMA-capable function so the scan
     # has to distinguish them rather than take whatever it finds first.
-    MACHINE=(-machine q35 -device amd-iommu -device e1000,bus=pcie.0 -device edu,bus=pcie.0)
-    # A DMA-capable function BEHIND A BRIDGE. The bus scan started at bus 0 and stopped there,
-    # so a device on a secondary bus was enumerated by nothing, got no device-table entry, and
-    # was therefore PASSED THROUGH — the same hole the default-deny sweep closes on bus 0. The
-    # flat rig cannot show that; this one can.
+    # BRIDGE=1 MOVES the second DMA-capable function behind a bridge rather than adding a third,
+    # so the behind-bridge one is the device that WOULD otherwise be bound to a domain. That is
+    # what makes the rig able to see the thing that matters: a bridge forwards its children's
+    # transactions as ITSELF, so the requester id the unit sees is not the enumerated BDF, and a
+    # domain bound at that BDF governs nothing. With a bus-0 e1000 also present the domain slots
+    # fill from the root bus and the question never arises.
     if [ "${BRIDGE:-0}" = "1" ]; then
-        MACHINE+=(-device pcie-pci-bridge,id=br0,bus=pcie.0 -device e1000,bus=br0,addr=1)
-        echo "== plus a DMA-capable function behind a PCI bridge =="
+        # `-net none` as well: QEMU adds a default NIC, which is itself DMA-capable and on the
+        # root bus, so it would fill the second domain slot and the behind-bridge device would
+        # never be a candidate — the rig would pass without ever asking the question.
+        MACHINE=(-machine q35 -device amd-iommu -net none -device edu,bus=pcie.0
+                 -device pcie-pci-bridge,id=br0,bus=pcie.0 -device e1000,bus=br0,addr=1)
+        echo "== the second DMA-capable function sits behind a PCI bridge =="
+    else
+        MACHINE=(-machine q35 -device amd-iommu -device e1000,bus=pcie.0 -device edu,bus=pcie.0)
     fi
     echo "== IOMMU rig: q35 + emulated AMD-Vi =="
 fi
@@ -409,6 +416,14 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ]; then
             echo "  is behind it has no device-table entry and is passed through"
             exit 1
         fi
+        # And it must be DENIED rather than bound: its requester id is the bridge's, so an entry
+        # written at its own BDF governs nothing.
+        if [ "${BRIDGE:-0}" = "1" ] \
+            && ! echo "$OUT" | grep -q 'DMA-capable function(s) are not on the root bus'; then
+            echo "RESULT: FAIL — a DMA-capable function behind a bridge was bound to a domain at"
+            echo "  its own BDF, which is not the requester id the unit will see"
+            exit 1
+        fi
         # Default DENY: every PCI function has a valid device-table entry. An entry with V=0 is
         # PASSTHROUGH in this unit, so a function the nucleus never enumerated has unrestricted
         # DMA while the boot claims to bound it — and the rig really does have more DMA-capable
@@ -448,15 +463,22 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ]; then
             echo "  nothing by attribution"
             exit 1
         fi
-        # Per-device containment, both halves. The second is what makes the first mean
-        # anything: a device that reaches nothing is not contained, it is broken.
-        if ! echo "$OUT" | grep -q '\[iommu\] PER-DEVICE:'; then
-            echo "RESULT: FAIL — a frame mapped in another device's domain was reachable, or"
-            echo "  the device could not reach its own domain's mapping"
-            exit 1
-        fi
-        if ! echo "$OUT" | grep -q "dma: the second device's domain is a separate authority"; then
-            echo "RESULT: FAIL — the second domain's capability was refused, or never used"
+        # Per-device containment, both halves — required only where a SECOND domain exists,
+        # which is a property of the machine's device list rather than an invariant. Keyed on
+        # the boot's own report, so a board with one bindable device is not a failure and a
+        # board with two cannot skip the check.
+        if echo "$OUT" | grep -q '\[iommu\] domain 2 bound to'; then
+            if ! echo "$OUT" | grep -q '\[iommu\] PER-DEVICE:'; then
+                echo "RESULT: FAIL — a frame mapped in another device's domain was reachable, or"
+                echo "  the device could not reach its own domain's mapping"
+                exit 1
+            fi
+            if ! echo "$OUT" | grep -q "dma: the second device's domain is a separate authority"; then
+                echo "RESULT: FAIL — the second domain's capability was refused, or never used"
+                exit 1
+            fi
+        elif ! echo "$OUT" | grep -q 'dma: this machine has no second device domain'; then
+            echo "RESULT: FAIL — only one domain was bound, but the demo did not say so"
             exit 1
         fi
         if ! echo "$OUT" | grep -q 'dma: a cap naming a domain that does not exist is refused'; then

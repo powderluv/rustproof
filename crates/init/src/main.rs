@@ -993,7 +993,11 @@ fn compute(id: u64) -> ! {
             tag(id);
             let other = map_dma(11, mbox);
             if other == syserr::NO_CAP || other == syserr::NO_MEM {
-                dw!(b"dma: a capability for the second device's domain was refused (bug)\n");
+                // How many domains exist is a property of the MACHINE, not an invariant: a
+                // board with one bindable DMA-capable device has one. Saying so is honest;
+                // calling it a bug made the assertion depend on the rig's device list. The
+                // runner requires the success line only when the boot reports a second domain.
+                dw!(b"dma: this machine has no second device domain\n");
             } else {
                 dw!(b"dma: the second device's domain is a separate authority we also hold\n");
                 if unmap_dma(11, mbox) != syserr::OK {
@@ -1424,7 +1428,17 @@ fn compute(id: u64) -> ! {
             // withdrew from the right place by luck — a mutant that did exactly that survived
             // every gate. Now getting the domain wrong leaves domain 2's leaves behind, and
             // the shutdown walk of the real tables finds them.
-            if map_dma(11, c) < syserr::FAULT {
+            // The SECOND domain by preference — with everything in domain 1 the (region,
+            // domain) pair is over-determined and a teardown that ignored the domain half
+            // withdrew from the right place by luck. Falling back to domain 1 where no second
+            // domain exists, because whether a machine HAS two is a property of its device
+            // list, and the teardown path should be exercised either way.
+            let parting = if map_dma(11, c) < syserr::FAULT {
+                true
+            } else {
+                map_dma(8, c) < syserr::FAULT
+            };
+            if parting {
                 dw!(b"dma: leaving a mapping live at exit for teardown to withdraw\n");
             } else {
                 dw!(b"dma: no unit here, so nothing to leave mapped at exit\n");
