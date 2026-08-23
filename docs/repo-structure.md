@@ -319,7 +319,7 @@ We do **not** touch that logic. We add a Rustproof domain and a thin wrapper:
 
 The guest's serial port is wired to a host file/pty in the domain XML; that serial is the only channel the M0 smoke test needs (`nucleus` prints, `init` prints, `driver-host` prints `M0: WAVE OK`).
 
-**M0–M2 isolation note (do not conflate):** under plain VFIO the *host* programs the physical IOMMU, so guest isolation at M0–M2 is host-enforced; there is NO IOMMU code in this tree at all (the `iommu-amdvi` stub was deleted 2026-08-12), so nothing here is load-bearing. It first matters at **M3** (emulated vIOMMU inside the guest) and **M4** (bare-metal, nucleus programs real AMD-Vi). When that work starts it needs a real crate written from scratch; the deleted stub reserved a name and nothing else.
+**M0–M2 isolation note (do not conflate):** under plain VFIO the *host* programs the physical IOMMU, so guest isolation at M0–M2 is host-enforced and nothing in this tree is load-bearing there. Updated 2026-08-22: there IS IOMMU code now — `crates/iommu` (the authority model) plus AMD-Vi programming in `crates/kernel`, written from scratch as this note anticipated, not resurrected from the deleted stub. It is exercised against an EMULATED AMD-Vi (QEMU `-device amd-iommu`) with a toy DMA device, which is **M3 territory**; **M4** (bare-metal, real silicon) is untouched. The distinction that matters: the code exists and is demonstrated, on an emulator, with no GPU anywhere near it.
 
 ---
 
@@ -342,7 +342,7 @@ The guest's serial port is wired to a host file/pty in the domain XML; that seri
 
   The vendored C++ `#include`s resolve to `driver-shim/include/shim.h` (a tiny `<unistd.h>`/`<sys/mman.h>` replacement) plus `abi/include/rustproof_abi.h` (the cbindgen-generated capability/IPC ABI). Net effect: the C++ compiles unmodified against the shim; the `open`/`ioctl`/`mmap` calls it makes are re-pointed at nucleus IPC instead of a Linux kernel.
 
-- **GPUVM stays untrusted.** The driver builds GPUVM page tables and emits **IOVAs only**. It cannot touch the AMD-Vi tables; those belong to the nucleus (`iommu-amdvi`). At M0–M2 the host IOMMU contains any bad IOVA; from M3 the nucleus-owned tables do, and the DMA-reach proof is what guarantees a driver-produced IOVA can only resolve to physical frames owned by the driver's own address space.
+- **GPUVM stays untrusted.** The driver builds GPUVM page tables and emits **IOVAs only**. It cannot touch the AMD-Vi tables; those belong to the nucleus (`crates/iommu` plus the AMD-Vi programming in `crates/kernel`). At M0–M2 the host IOMMU contains any bad IOVA; from M3 the nucleus-owned tables do, and the DMA-reach proof is what guarantees a driver-produced IOVA can only resolve to physical frames owned by the driver's own address space.
 
 ---
 
@@ -358,7 +358,7 @@ Goal at scaffold: `cargo xtask build` produces a bootable image, `cargo xtask ru
 | `nucleus` (bin) | **Builds + boots** | Limine handoff → serial init → GDT/IDT → paging from the Limine memory map → trivial capability table → one IPC round-trip → hand off to `init` |
 | `nucleus-core` | **Builds; proofs partial** | real state/`invariants.rs` types; M1 memory-safety lemmas start as `#[verifier::external_body]`/admitted and get discharged during M1 |
 | `capabilities`, `vspace`, `ipc` | **Builds; proofs partial** | real types + `spec fn` models compile and pass a *trivial* proof; the substantive lemmas (walk refinement, isolation) are admitted stubs until M1/M2 |
-| `iommu-amdvi` | **Builds; proof STUBBED** | real DTE/IO-PTE types and the `reachable_spa` **spec**; `dma_reach.rs` proof is `admit()`-guarded and **not load-bearing** (host IOMMU covers M0–M2). Becomes real at M3/M4 |
+| `iommu` (was `iommu-amdvi`) | **Builds + runs; NOT proven** | the crate is the authority MODEL — grants, mappings, and `contained()` — exhaustively searched over every 3-op sequence and shown to REJECT from every slot. The AMD-Vi hardware half (device tables, I/O page tables, command buffer, invalidation) lives in `crates/kernel` and is demonstrated on the emulated rig. No Verus, no `admit()`, no spec: the word this row has earned is TESTED |
 | `userland-rt`, `init` | **Builds + runs** | `init` parses the boot module list, spawns `driver-host`, grants the three GPU caps |
 | `driver-shim` | **Builds** | shim compiles; the handful of ops are real for the M0 path (map MMIO/DMA cap, IRQ endpoint, log) |
 | `driver-host` + `vendor/rocr-lite` | **Builds; single-wave path only** | CMake builds `libamd_lite.a`; `driver-host` links it and runs exactly the "dispatch one wave" flow. The Python probes are **not** in-guest. Broader driver surface is gated behind post-M0 features |

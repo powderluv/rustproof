@@ -41,11 +41,20 @@ widens the one axis every other `mm` test held constant. See §0 below.
 
 ---
 
-Status of the rest of this document: **design sketch for a system that does not exist yet.** The
-ladder below is keyed to milestones M0–M5 (VFIO → vIOMMU → bare-metal AMD-Vi) that have no code in
-this tree — `crates/iommu-amdvi` is seven lines of doc comment with no functions, no tests, and no
-dependents, and `toolchain/verus.lock` / `toolchain/fetch-verus.sh` are placeholders (`REPLACE_ME`,
-`exit 1`). Read §1 onward as intent, not as a description of the repo.
+Status of the rest of this document, updated 2026-08-22: **partly built, none of it PROVEN.**
+The DMA-containment half is no longer a sketch. `crates/iommu-amdvi` — the seven-line stub this
+paragraph used to point at — does not exist; what exists is `crates/iommu` (the authority model,
+exhaustively tested) plus AMD-Vi programming in `crates/kernel`: a device-table entry per device,
+per-device I/O page tables, a command buffer with invalidation waited to completion, and
+default-deny for every function the scan reaches. An untrusted ring-3 process holds a real
+bus-mastering device and reaches only what `MAP_DMA` gave it, demonstrated on the rig.
+
+What is still a sketch: everything about SILICON and everything about PROOF. All of the above is
+QEMU with an emulated AMD-Vi and a toy DMA device; no gfx1201, no VFIO, no real GPU. And
+`toolchain/verus.lock` / `toolchain/fetch-verus.sh` remain placeholders (`REPLACE_ME`, `exit 1`) —
+in-tree Verus was DECLINED on 2026-08-11 with a written reversal condition. Nothing below is
+machine-PROVEN; the strongest word this tree has earned is TESTED, and for the hardware half,
+DEMONSTRATED. Read the milestone framing as intent.
 
 Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DMA-containment**. GPU compute correctness is permanently out of scope. The C++ `lite::` gfx1201 driver and its GPUVM are **untrusted user processes** that emit only IOVAs; the nucleus owns the AMD-Vi IOMMU tables. Under plain VFIO (M0–M2) the *host* programs the physical IOMMU, so the nucleus IOMMU proof is not load-bearing until **M3 (emulated vIOMMU)** and **M4 (bare-metal AMD-Vi)**.
 
@@ -1160,9 +1169,9 @@ Each rung is a machine-checked property of the nucleus. Lower rungs are lemmas t
 |----|----------|-----------------|-----------|-------|
 | **V1** | Nucleus-core memory safety: no UB in safe nucleus code; every `unsafe` sits behind a trusted, spec'd boundary | M1 | Verus default (ownership + `PointsTo` permissions), big-lock | not started |
 | **V2** | `reachable(AS) == capabilitied(AS)` for every address space, **preserved** across `map/unmap/grant/revoke` | M2 | Flat permission map + ghost `path`/`subtree` fields to de-recursify the radix tree | not started |
-| **V3** | `dma_reach(GPU_domain) ⊆ authorized(GPU_domain)` — the crux | M3, hardened M4 | Same flat-map machinery over the **IO** page tables; `authorized` = GPU domain's frame caps | **no subsystem exists** (`crates/iommu-amdvi` is a 7-line stub) |
-| **V4** | DTE-config invariant: for the GPU's BDF, `V=1 ∧ TV=1 ∧ translation-on ∧ bypass-off ∧ ATS-off ∧ root==our-tables` | M3/M4 | Struct invariant on the trusted DTE model; bridges V3 to hardware axioms A1/A3 | **no subsystem exists** (same stub) |
-| **V5** | Reclaim / stale-IOTLB safety: a frame is returned to the free pool only after it is unmapped from **all** IO/CPU tables **and** the IOTLB/DTE cache is invalidated to completion | M4 | Ghost "in-flight invalidation" token; frame free-list disjoint from any live `dma_reach` | **no subsystem exists** (no IO page tables, no IOTLB code) |
+| **V3** | `dma_reach(GPU_domain) ⊆ authorized(GPU_domain)` — the crux | M3, hardened M4 | Same flat-map machinery over the **IO** page tables; `authorized` = GPU domain's frame caps | subsystem EXISTS, property TESTED not proven: `Domain::contained` is the predicate, exhaustively searched over every 3-op sequence AND shown to REJECT from every slot; the boot walks the real I/O tables requiring every present leaf to be grant-covered; a device reaches its granted frame and not an ungranted one, on the rig |
+| **V4** | DTE-config invariant: for the GPU's BDF, `V=1 ∧ TV=1 ∧ translation-on ∧ bypass-off ∧ ATS-off ∧ root==our-tables` | M3/M4 | Struct invariant on the trusted DTE model; bridges V3 to hardware axioms A1/A3 | subsystem EXISTS, partly CHECKED not proven: every entry is read back as a WHOLE WORD (V\|TV alone admitted mode-0 passthrough and a root aimed at a live table — both measured), domains are published only once `CTRL` reads back with `IommuEn`, and the deny entry is shown to deny by aiming a device at it. ATS-off is NOT checked; the field is untouched and unexamined |
+| **V5** | Reclaim / stale-IOTLB safety: a frame is returned to the free pool only after it is unmapped from **all** IO/CPU tables **and** the IOTLB/DTE cache is invalidated to completion | M4 | Ghost "in-flight invalidation" token; frame free-list disjoint from any live `dma_reach` | subsystem EXISTS, property TESTED not proven: command buffer with INVALIDATE_IOMMU_PAGES + INVALIDATE_DEVTAB_ENTRY + COMPLETION_WAIT **waited to completion**; `FREE_REGION` clears hardware across every domain BEFORE the frames are reissued, and the boot fails on any present leaf no grant covers. Measured both ways — without the invalidation the device kept reaching a withdrawn frame. The second domain's invalidation has no payload oracle (its device cannot be driven); the emulator's trace is the only witness |
 | **V6** | No IPC authority amplification: a message transfer never yields the receiver a capability the sender did not already hold (grant is monotone-down) | M2/M5 | Cap-set monotonicity lemma over the IPC transition relation | not started |
 | **V7** | *(optional)* host-submission well-formedness: ring/doorbell descriptors the nucleus forwards are bounds- and type-checked | M5 | Bounded structural predicate; mostly Kani-territory | optional |
 
@@ -1191,10 +1200,13 @@ above:
   tuning, and vstd glue are elided)". Unverifiable code in a document is indistinguishable from
   verified code to a reader skimming for status, and this project has already paid a full design
   cycle for exactly that confusion (`CapType::Untyped` importing seL4's contract by name alone).
-- It specified **page tables and IOMMU device tables that do not exist in this tree**. V3 and V4
-  are properties of `crates/iommu-amdvi`, which is seven lines of doc comment with no functions,
-  no tests, and no dependents. A spec for absent code cannot be wrong, which is precisely what
-  makes it worthless: there is nothing it can fail against.
+- It specified **page tables and IOMMU device tables that did not exist in this tree**. V3 and V4
+  were properties of `crates/iommu-amdvi`: seven lines of doc comment, no functions, no tests, no
+  dependents. A spec for absent code cannot be wrong, which is precisely what made it worthless —
+  there was nothing it could fail against. (That crate is gone; the code those properties describe
+  now exists in `crates/iommu` and `crates/kernel`, and the ladder's V3/V4/V5 rows say what is
+  tested and what is not. The lesson stands unchanged: write the spec against code that can fail
+  it.)
 
 When there is IO page-table code, write the spec against that code, and gate it on spec mutation
 (§DECISION item 5) rather than on an obligation count. Until then the honest statement is that
