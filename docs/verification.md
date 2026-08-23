@@ -60,6 +60,31 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-22 (fifth) — checking a claim I had just written down
+
+Writing the V5 row forced a question the code had not been asked: is "invalidated to completion"
+actually established? `iommu_invalidate` returns whether COMPLETION_WAIT came back, and EVERY
+call site discarded it. On a timeout the caller carried on regardless — so the acknowledgement
+that is the whole of the reclaim story was hoped for rather than checked, in the one place where
+being wrong means frames reissued while the unit still holds a translation for them.
+
+Now counted and asserted: the boot fails on any invalidation the unit did not acknowledge. The
+mutant that never observes the acknowledgement reports 24 of them and fails.
+
+Also checked rather than assumed, since the same row claims it: the shutdown walk really does
+cover EVERY domain's table, not just domain 1's. A planted present leaf in domain 2 is caught
+(`STALE HARDWARE MAPPING … first at IOVA 0x12c000`).
+
+And the CI steps added earlier: `tools/run-qemu.sh` exits nonzero on `RESULT: FAIL`, so those
+steps gate rather than decorate — verified by breaking a gated property and reading the exit
+code. Worth noting the shape of the result: the traced step failed and the untraced one did NOT,
+which is correct, because that property is gated only under `QEMU_TRACE`. A step passing is only
+meaningful together with knowing which properties it is in a position to see.
+
+The general point, and the reason this entry exists: rewriting the accounting was not a
+documentation task. Two of the sentences I wrote turned out to be claims the code had never been
+asked to support, and one of them was false.
+
 ## 2026-08-22 (fourth) — none of the containment work ran in CI
 
 CI ran `IOMMU=1` and never `FIRMWARE=1`. Booting through SeaBIOS is what assigns PCI BARs, and
@@ -1171,7 +1196,7 @@ Each rung is a machine-checked property of the nucleus. Lower rungs are lemmas t
 | **V2** | `reachable(AS) == capabilitied(AS)` for every address space, **preserved** across `map/unmap/grant/revoke` | M2 | Flat permission map + ghost `path`/`subtree` fields to de-recursify the radix tree | not started |
 | **V3** | `dma_reach(GPU_domain) ⊆ authorized(GPU_domain)` — the crux | M3, hardened M4 | Same flat-map machinery over the **IO** page tables; `authorized` = GPU domain's frame caps | subsystem EXISTS, property TESTED not proven: `Domain::contained` is the predicate, exhaustively searched over every 3-op sequence AND shown to REJECT from every slot; the boot walks the real I/O tables requiring every present leaf to be grant-covered; a device reaches its granted frame and not an ungranted one, on the rig |
 | **V4** | DTE-config invariant: for the GPU's BDF, `V=1 ∧ TV=1 ∧ translation-on ∧ bypass-off ∧ ATS-off ∧ root==our-tables` | M3/M4 | Struct invariant on the trusted DTE model; bridges V3 to hardware axioms A1/A3 | subsystem EXISTS, partly CHECKED not proven: every entry is read back as a WHOLE WORD (V\|TV alone admitted mode-0 passthrough and a root aimed at a live table — both measured), domains are published only once `CTRL` reads back with `IommuEn`, and the deny entry is shown to deny by aiming a device at it. ATS-off is NOT checked; the field is untouched and unexamined |
-| **V5** | Reclaim / stale-IOTLB safety: a frame is returned to the free pool only after it is unmapped from **all** IO/CPU tables **and** the IOTLB/DTE cache is invalidated to completion | M4 | Ghost "in-flight invalidation" token; frame free-list disjoint from any live `dma_reach` | subsystem EXISTS, property TESTED not proven: command buffer with INVALIDATE_IOMMU_PAGES + INVALIDATE_DEVTAB_ENTRY + COMPLETION_WAIT **waited to completion**; `FREE_REGION` clears hardware across every domain BEFORE the frames are reissued, and the boot fails on any present leaf no grant covers. Measured both ways — without the invalidation the device kept reaching a withdrawn frame. The second domain's invalidation has no payload oracle (its device cannot be driven); the emulator's trace is the only witness |
+| **V5** | Reclaim / stale-IOTLB safety: a frame is returned to the free pool only after it is unmapped from **all** IO/CPU tables **and** the IOTLB/DTE cache is invalidated to completion | M4 | Ghost "in-flight invalidation" token; frame free-list disjoint from any live `dma_reach` | subsystem EXISTS, property TESTED not proven: command buffer with INVALIDATE_IOMMU_PAGES + INVALIDATE_DEVTAB_ENTRY + COMPLETION_WAIT, and the acknowledgement is now CHECKED at every call site — it was returned and discarded everywhere, so "to completion" was hoped for rather than established; the boot fails on any invalidation the unit did not acknowledge; `FREE_REGION` clears hardware across every domain BEFORE the frames are reissued, and the boot fails on any present leaf no grant covers. Measured both ways — without the invalidation the device kept reaching a withdrawn frame. The second domain's invalidation has no payload oracle (its device cannot be driven); the emulator's trace is the only witness |
 | **V6** | No IPC authority amplification: a message transfer never yields the receiver a capability the sender did not already hold (grant is monotone-down) | M2/M5 | Cap-set monotonicity lemma over the IPC transition relation | not started |
 | **V7** | *(optional)* host-submission well-formedness: ring/doorbell descriptors the nucleus forwards are bounds- and type-checked | M5 | Bounded structural predicate; mostly Kani-territory | optional |
 

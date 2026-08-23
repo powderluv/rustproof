@@ -482,6 +482,13 @@ static mut DEVICE_PHYS: u64 = 0;
 #[cfg(target_arch = "x86_64")]
 static mut DEVICE_BAR: u64 = 0;
 
+/// Invalidations the unit never acknowledged. `iommu_invalidate` returns whether COMPLETION_WAIT
+/// came back, and every caller discarded it — so "invalidated to completion", which is the whole
+/// of V5's reclaim safety, was hoped for rather than checked. A timeout means frames may be
+/// reissued while the unit still holds a translation for them.
+#[cfg(target_arch = "x86_64")]
+static mut INVALIDATE_TIMEOUTS: u64 = 0;
+
 /// The exact device-table word the deny sweep writes, and the driveable device's real one, so
 /// the boot can point that device at the deny entry and find out whether it actually denies.
 #[cfg(target_arch = "x86_64")]
@@ -1610,6 +1617,18 @@ unsafe fn nothing_runnable<A: Arch>() -> ! {
     }
     #[cfg(target_arch = "x86_64")]
     {
+        // "Invalidated to completion" is the whole of the reclaim story: a frame goes back to
+        // the pool only after the unit has ACKNOWLEDGED that it holds no translation for it.
+        // The acknowledgement was being discarded at every call site.
+        let timeouts = *core::ptr::addr_of!(INVALIDATE_TIMEOUTS);
+        if timeouts > 0 {
+            let _ = writeln!(
+                con,
+                "\n[iommu] (bug) {timeouts} invalidation(s) were never acknowledged — frames may \
+                 have been reissued while the unit still held a translation"
+            );
+            A::exit(false);
+        }
         let n = *core::ptr::addr_of!(DMA_WITHDRAWN_AT_EXIT);
         let _ = writeln!(
             con,
@@ -2665,8 +2684,8 @@ unsafe fn withdraw_dma_slot(who: usize, slot: usize) -> bool {
 #[cfg(target_arch = "x86_64")]
 unsafe fn invalidate_all_domains(base: u64) {
     for di in 0..MAX_DOMAINS {
-        if (*core::ptr::addr_of!(DOMAIN_SLOTS[di])).id != 0 {
-            iommu_invalidate(base, di);
+        if (*core::ptr::addr_of!(DOMAIN_SLOTS[di])).id != 0 && !iommu_invalidate(base, di) {
+            INVALIDATE_TIMEOUTS += 1;
         }
     }
 }
@@ -2719,8 +2738,8 @@ unsafe fn unmap_dma(who: usize, domain: u64, region_id: u64) -> u64 {
     // Clearing the table is not revocation while the unit still holds a translation it has
     // already performed. Measured on the rig: without this the device kept reaching the frame.
     let base = *core::ptr::addr_of!(AMDVI_BASE);
-    if base != 0 {
-        iommu_invalidate(base, di);
+    if base != 0 && !iommu_invalidate(base, di) {
+        INVALIDATE_TIMEOUTS += 1;
     }
     abi::syserr::OK
 }
@@ -3110,7 +3129,9 @@ unsafe fn prove_containment<A: Arch>(
                 core::ptr::write_volatile((dst_phys + i * 8) as *mut u64, SENTINEL);
             }
             core::ptr::write_volatile(dte as *mut u64, deny);
-            iommu_invalidate(base, 0);
+            if !iommu_invalidate(base, 0) {
+                INVALIDATE_TIMEOUTS += 1;
+            }
             // TWO transfers, because the entry can fail in two different directions and each
             // is invisible to the other's address:
             //   - a root aimed at a LIVE table translates IOVA 0x1000 to this frame, so aiming
@@ -3124,7 +3145,9 @@ unsafe fn prove_containment<A: Arch>(
             let seen = first_disturbed(dst_phys, SENTINEL);
             // Put the device back before anything else runs, and tell the unit.
             core::ptr::write_volatile(dte as *mut u64, mine);
-            iommu_invalidate(base, 0);
+            if !iommu_invalidate(base, 0) {
+                INVALIDATE_TIMEOUTS += 1;
+            }
             if seen == SENTINEL {
                 let _ = writeln!(
                     con,
