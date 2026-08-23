@@ -580,6 +580,12 @@ fn drive_device(bar: u64) {
         );
     } else if !stray {
         dw!(b"dev: the ungranted-IOVA transfer never ran, so its refusal shows nothing (bug)\n");
+    } else if back != PAT {
+        // The GRANTED round-trip failed, which says nothing about the ungranted one. This used
+        // to fall into the breach branch below, so "an ungranted IOVA reached memory of ours"
+        // was printed for a run in which nothing of the sort happened — a breach message that
+        // is not evidence of a breach is worse than silence, because it is believed.
+        dw!(b"dev: the granted round-trip failed, so the ungranted result shows nothing (bug)\n");
     } else {
         dw!(b"dev: an ungranted IOVA reached memory of ours (bug)\n");
     }

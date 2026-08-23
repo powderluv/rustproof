@@ -319,7 +319,7 @@ pub unsafe fn find_dma_device() -> Option<Function> {
 
 /// Every PCI function present on ANY reachable bus, up to `out.len()`.
 ///
-/// Returns `(written, truncated)`. Bus 0 is where the scan starts; every bridge found is
+/// Returns `(written, truncated, buses_walked)`. Bus 0 is where the scan starts; every bridge found is
 /// followed to its secondary bus, because a device behind a bridge is exactly as capable of
 /// bus-mastering as one in front of it — and a function this never reaches gets no device-table
 /// entry, which this unit treats as PASSTHROUGH. Enumerating only bus 0 made "every function is
@@ -328,7 +328,7 @@ pub unsafe fn find_dma_device() -> Option<Function> {
 /// `truncated` matters as much as the count: silently dropping the tail would leave functions
 /// unbounded while the caller reported success over the ones it happened to see.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn enumerate(out: &mut [Function]) -> (usize, bool) {
+pub unsafe fn enumerate(out: &mut [Function]) -> (usize, bool, usize) {
     // Bridges are followed breadth-first through a fixed worklist. A malformed or looping
     // topology cannot run away: a bus already queued is never queued twice, and the list is
     // bounded, so the walk terminates whatever config space reports.
@@ -379,7 +379,7 @@ pub unsafe fn enumerate(out: &mut [Function]) -> (usize, bool) {
             }
         }
     }
-    (n, truncated)
+    (n, truncated, nbuses)
 }
 
 /// Could this function master the bus? `edu` by identity, anything Ethernet by class.

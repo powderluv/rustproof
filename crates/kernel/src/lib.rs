@@ -131,6 +131,12 @@ const MAX_DOMAINS: usize = 2;
 struct DomainSlot {
     /// 1..N, or 0 for a slot no device claimed.
     id: u64,
+    /// The exact device-table word written for this device, so the read-back can check a BOUND
+    /// entry against what it should be. It used to `continue` past them — checking only the
+    /// DENIED functions and exempting precisely the bus masters that have real access, which is
+    /// the opposite of the intended coverage and a regression against the `V|TV` test it
+    /// replaced.
+    w0: u64,
     /// The BDF whose device-table entry points at this domain's table. Reported at shutdown,
     /// so which device a domain bounds is inspectable rather than inferred from the order the
     /// bus scan happened to return.
@@ -142,6 +148,7 @@ struct DomainSlot {
 impl DomainSlot {
     const EMPTY: DomainSlot = DomainSlot {
         id: 0,
+        w0: 0,
         bdf: 0,
         l1: 0,
     };
@@ -2003,7 +2010,7 @@ unsafe fn program_dte<A: Arch>(
     // topology — and a function behind a bridge was in none of the answers, so it got no
     // device-table entry at all, which this unit reads as passthrough.
     let mut all = [pci::Function::EMPTY; 32];
-    let (present, truncated) = pci::enumerate(&mut all);
+    let (present, truncated, buses_walked) = pci::enumerate(&mut all);
     if truncated {
         let _ = writeln!(
             con,
@@ -2012,23 +2019,30 @@ unsafe fn program_dte<A: Arch>(
         );
         return;
     }
+    // An enumeration that found NOTHING would satisfy every later check trivially: no functions
+    // examined, none counted, "0 still passed through" printed over an empty set. A machine with
+    // an IOMMU has PCI functions, so finding none means the scan failed — the one case where
+    // reporting success is worst. Checked HERE: the version of this that lived further down sat
+    // behind an earlier `live == 0` return and could never fire.
+    if present == 0 {
+        let _ = writeln!(
+            con,
+            "\n[iommu] (bug) the PCI scan found no functions at all, so anything said about \
+             them is a statement about an empty set"
+        );
+        return;
+    }
     let total = all[..present]
         .iter()
         .filter(|f| pci::is_dma_capable(f))
         .count();
-    // How many BUSES the scan reached, not just how many functions. The read-back below can
-    // only check the set it wrote, so it is blind to whatever the scan never reached — and
-    // "every function is bounded" is exactly the claim a truncated scan makes vacuously true.
-    // The bus count is the one number that moves when the walk stops early.
-    let mut buses_seen = 0usize;
-    for i in 0..present {
-        if !all[..i].iter().any(|g| g.bus == all[i].bus) {
-            buses_seen += 1;
-        }
-    }
+    // How many buses the WALK REACHED — not how many held a function. `buses_seen` counted
+    // distinct buses among the functions FOUND, so a walk that queued a bus and enumerated
+    // nothing on it looked identical to one that never queued it, and the canary meant to catch
+    // a walk stopping early was reporting something else.
     let _ = writeln!(
         con,
-        "[iommu] {present} PCI function(s) across {buses_seen} bus(es), {total} DMA-capable; \
+        "[iommu] {present} PCI function(s) across {buses_walked} bus(es), {total} DMA-capable; \
          room to bound {}",
         MAX_DOMAINS
     );
@@ -2143,6 +2157,7 @@ unsafe fn program_dte<A: Arch>(
         // not yet hold a mapping.
         staged[i] = DomainSlot {
             id: (i + 1) as u64,
+            w0,
             bdf: f.bdf(),
             l1: l1.as_u64(),
         };
@@ -2209,8 +2224,9 @@ unsafe fn program_dte<A: Arch>(
                 let sl = staged[i];
                 sl.id != 0 && sl.bdf == bdf
             }) {
-                // A bound device carries its own root; an unbound one carries the deny root.
-                Some(_) => continue,
+                // A bound device carries its OWN root, an unbound one the deny root. Both are
+                // checked: skipping the bound ones exempted every device with real DMA access.
+                Some(i) => staged[i].w0,
                 None => deny_w0,
             };
             if w0 != want {
@@ -2222,18 +2238,6 @@ unsafe fn program_dte<A: Arch>(
             "[iommu] {denied} other function(s) given an EMPTY table; {present} present, \
              {passthrough} still passed through"
         );
-        // An enumeration that found nothing satisfies the loop above trivially: no functions
-        // examined, no passthrough counted, "0 still passed through" printed over an empty set.
-        // A machine with an IOMMU has PCI functions, so finding none means the scan failed —
-        // which is the one case where reporting success is worst.
-        if present == 0 {
-            let _ = writeln!(
-                con,
-                "\n[iommu] (bug) the PCI scan found no functions at all, so 'none passed \
-                 through' is a statement about an empty set"
-            );
-            A::exit(false);
-        }
         if passthrough > 0 {
             let _ = writeln!(
                 con,
@@ -3154,84 +3158,6 @@ unsafe fn prove_containment<A: Arch>(
     // it could — the stale-mapping hazard `crates/iommu`'s exhaustive search exists to
     // prevent, which would be a poor thing to demonstrate and then commit here.
     if let Some((_, _, dst_phys, ro)) = translated {
-        // ---- does the DENY entry actually DENY? ----
-        //
-        // The sweep hands every unbound function an entry it BELIEVES reaches nothing, and this
-        // boot never aimed a device at one — so the deny table's emptiness was demonstrated
-        // nowhere, and the check that it had been installed looked at two bits of the word.
-        // Point the device we CAN drive at that exact entry and find out. The frame and the
-        // IOVA are the pair TRANSLATED reached a moment ago, so the ONE thing that changed is
-        // the device-table entry.
-        let dte = *core::ptr::addr_of!(DEVICE_TABLE_ENTRY);
-        let deny = *core::ptr::addr_of!(DENY_DTE_W0);
-        let mine = *core::ptr::addr_of!(DEVICE_DTE_W0);
-        if dte != 0 && deny != 0 && mine != 0 {
-            for i in 0..8u64 {
-                core::ptr::write_volatile((dst_phys + i * 8) as *mut u64, SENTINEL);
-            }
-            core::ptr::write_volatile(dte as *mut u64, deny);
-            if !iommu_invalidate(base, 0) {
-                INVALIDATE_TIMEOUTS += 1;
-            }
-            // TWO transfers, because the entry can fail in two different directions and each
-            // is invisible to the other's address:
-            //   - a root aimed at a LIVE table translates IOVA 0x1000 to this frame, so aiming
-            //     there catches it;
-            //   - mode 0 is PASSTHROUGH, where an IOVA is a physical address and 0x1000 lands
-            //     nowhere near this frame — so that one is caught only by aiming at the frame's
-            //     OWN address, where passthrough is an identity map.
-            // Measured: with only the first, the mode-0 mutant passed and the boot said "0 still
-            // passed through", because the device wrote to physical 0x1000 instead.
-            let done = run(0x4_0000, IOVA, true) && run(0x4_0000, dst_phys, true);
-            let seen = first_disturbed(dst_phys, SENTINEL);
-            // Put the device back before anything else runs, and tell the unit.
-            core::ptr::write_volatile(dte as *mut u64, mine);
-            if !iommu_invalidate(base, 0) {
-                INVALIDATE_TIMEOUTS += 1;
-            }
-            if seen == SENTINEL {
-                let _ = writeln!(
-                    con,
-                    "[iommu] DENY WORKS: holding the entry every unbound function gets, the \
-                     device reached this frame through NEITHER the IOVA it had just reached NOR \
-                     the frame's own address (transfers {})",
-                    if done { "completed" } else { "stuck" }
-                );
-            } else {
-                let _ = writeln!(
-                    con,
-                    "[iommu] (bug) the DENY entry does not deny: the device still reached \
-                     {seen:#018x}"
-                );
-            }
-        }
-
-        let _ = writeln!(
-            con,
-            "[iommu] read-only grant: mapped {} | wider rights {} | device write {} | frame \
-             reads {:#018x} | event tail {:#x} -> {:#x}",
-            if ro.mapped { "yes (IR, no IW)" } else { "NO" },
-            if ro.wider_refused {
-                "refused"
-            } else {
-                "ALLOWED"
-            },
-            if ro.done { "completed" } else { "stuck" },
-            ro.seen,
-            ro.tail_before,
-            ro.tail_after
-        );
-        if ro.seen != SENTINEL {
-            let _ = writeln!(
-                con,
-                "[iommu] (bug) WRITE-THROUGH: a READ-only mapping accepted a device write"
-            );
-        } else {
-            let _ = writeln!(
-                con,
-                "[iommu] RIGHTS ENFORCED: the device could reach that page but not write it"
-            );
-        }
         if ro.ungranted_seen == SENTINEL {
             let _ = writeln!(
                 con,
@@ -3321,6 +3247,91 @@ unsafe fn prove_containment<A: Arch>(
                 con,
                 "[iommu] (bug) STALE MAPPING: a withdrawn IOVA still reached its frame \
                  ({after_withdraw:#018x}) — the table was cleared but the unit was not told"
+            );
+        }
+        // ---- does the DENY entry actually DENY? ----
+        //
+        // AFTER the withdrawal, deliberately. This probe invalidates twice — installing the deny
+        // entry and restoring the real one — and the REVOKED check above depends on a cached
+        // translation still being there for the invalidation to remove. Running first, it
+        // flushed that cache and disarmed the test: with the probe ahead of it, deleting
+        // REVOKED's invalidation left the boot GREEN. Measured. A test that quietly empties the
+        // state another test needs is worse than no test, because both then report success.
+        //
+        // The sweep hands every unbound function an entry it BELIEVES reaches nothing, and this
+        // boot never aimed a device at one — so the deny table's emptiness was demonstrated
+        // nowhere, and the check that it had been installed looked at two bits of the word.
+        // Point the device we CAN drive at that exact entry and find out. The frame and the
+        // IOVA are the pair TRANSLATED reached a moment ago, so the ONE thing that changed is
+        // the device-table entry.
+        let dte = *core::ptr::addr_of!(DEVICE_TABLE_ENTRY);
+        let deny = *core::ptr::addr_of!(DENY_DTE_W0);
+        let mine = *core::ptr::addr_of!(DEVICE_DTE_W0);
+        if dte != 0 && deny != 0 && mine != 0 {
+            for i in 0..8u64 {
+                core::ptr::write_volatile((dst_phys + i * 8) as *mut u64, SENTINEL);
+            }
+            core::ptr::write_volatile(dte as *mut u64, deny);
+            if !iommu_invalidate(base, 0) {
+                INVALIDATE_TIMEOUTS += 1;
+            }
+            // TWO transfers, because the entry can fail in two different directions and each
+            // is invisible to the other's address:
+            //   - a root aimed at a LIVE table translates IOVA 0x1000 to this frame, so aiming
+            //     there catches it;
+            //   - mode 0 is PASSTHROUGH, where an IOVA is a physical address and 0x1000 lands
+            //     nowhere near this frame — so that one is caught only by aiming at the frame's
+            //     OWN address, where passthrough is an identity map.
+            // Measured: with only the first, the mode-0 mutant passed and the boot said "0 still
+            // passed through", because the device wrote to physical 0x1000 instead.
+            let done = run(0x4_0000, IOVA, true) && run(0x4_0000, dst_phys, true);
+            let seen = first_disturbed(dst_phys, SENTINEL);
+            // Put the device back before anything else runs, and tell the unit.
+            core::ptr::write_volatile(dte as *mut u64, mine);
+            if !iommu_invalidate(base, 0) {
+                INVALIDATE_TIMEOUTS += 1;
+            }
+            if seen == SENTINEL {
+                let _ = writeln!(
+                    con,
+                    "[iommu] DENY WORKS: holding the entry every unbound function gets, the \
+                     device reached this frame through NEITHER the IOVA it had just reached NOR \
+                     the frame's own address (transfers {})",
+                    if done { "completed" } else { "stuck" }
+                );
+            } else {
+                let _ = writeln!(
+                    con,
+                    "[iommu] (bug) the DENY entry does not deny: the device still reached \
+                     {seen:#018x}"
+                );
+            }
+        }
+
+        let _ = writeln!(
+            con,
+            "[iommu] read-only grant: mapped {} | wider rights {} | device write {} | frame \
+             reads {:#018x} | event tail {:#x} -> {:#x}",
+            if ro.mapped { "yes (IR, no IW)" } else { "NO" },
+            if ro.wider_refused {
+                "refused"
+            } else {
+                "ALLOWED"
+            },
+            if ro.done { "completed" } else { "stuck" },
+            ro.seen,
+            ro.tail_before,
+            ro.tail_after
+        );
+        if ro.seen != SENTINEL {
+            let _ = writeln!(
+                con,
+                "[iommu] (bug) WRITE-THROUGH: a READ-only mapping accepted a device write"
+            );
+        } else {
+            let _ = writeln!(
+                con,
+                "[iommu] RIGHTS ENFORCED: the device could reach that page but not write it"
             );
         }
     }

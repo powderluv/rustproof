@@ -60,6 +60,40 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-23 (later) — five more, and two of them were tests I had just added
+
+The same review round, past the bridge-alias finding. Two of these are self-inflicted: checks
+added in the last few days that quietly weakened what was already there.
+
+**The deny probe disarmed the REVOKED assertion.** The probe invalidates twice — installing the
+deny entry and restoring the real one — and it ran BEFORE the withdrawal test, whose whole point
+is that clearing a page-table entry is not revocation while a cached translation survives. The
+probe emptied that cache first, so deleting REVOKED's invalidation left the boot GREEN. Measured
+both ways: green with the probe ahead of it, `STALE MAPPING` with the probe moved after. A test
+that quietly empties the state another test needs is worse than no test, because then both report
+success.
+
+**The whole-word read-back exempted exactly the bound bus masters.** `Some(_) => continue` — the
+devices with real DMA access were the ones not checked, which is the opposite of the intended
+coverage and a regression against the `V|TV` test it replaced. Each domain now carries the exact
+word written for it, and a corrupted bound entry is caught.
+
+**The empty-scan guard could never fire.** It sat behind an earlier `live == 0` return, which
+takes that case first. Hoisted to where the enumeration happens.
+
+**The bus canary counted the wrong thing.** `across N bus(es)` counted distinct buses among the
+functions FOUND, so a walk that queued a bus and enumerated nothing on it was indistinguishable
+from one that never queued it — the canary added to catch a walk stopping early was reporting
+something else. `enumerate` now returns how many buses it WALKED.
+
+**A breach message that was not evidence of a breach.** `dev: an ungranted IOVA reached memory of
+ours (bug)` was printed whenever the GRANTED round-trip had failed, which says nothing about the
+ungranted one. Those are now separate messages.
+
+Still open from this round, recorded rather than quietly dropped: the deny probe attempts only
+device WRITES, so a deny entry leaking READ access would pass it; and the DTE's DomainID is
+written blind — the traced step inspects the command stream, not the entry.
+
 ## 2026-08-23 — a domain bound to a BDF the unit never consults
 
 A PCI-to-PCI bridge forwards its children's transactions as ITSELF. So for a function behind a
