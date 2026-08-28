@@ -16,9 +16,17 @@ pub struct Perms {
     /// Device memory: the mapping must be UNCACHED.
     ///
     /// Not a permission, but it travels with them because it is a property of the mapping the
-    /// page tables must carry, and there is nowhere else to put it. Getting this wrong is
-    /// invisible under QEMU TCG and wrong on silicon: a cached mapping of a register aperture
-    /// reorders and coalesces stores the device is supposed to see in order.
+    /// page tables must carry, and there is nowhere else to put it. A cached mapping of a
+    /// register aperture reorders and coalesces stores the device is supposed to see in order.
+    ///
+    /// MEASURED 2026-08-28, and narrower than this comment used to claim. Zeroing these bits is
+    /// invisible under TCG — and equally invisible under KVM on a real AMD CPU. For an EMULATED
+    /// device the hypervisor marks the MMIO range as trapping in the nested page tables, so
+    /// every access exits to QEMU whatever the guest's PAT says; the attribute never gets a
+    /// chance to matter. "Invisible under TCG" implied a real CPU would catch it. It does not.
+    /// Only a device passed through with VFIO, where the guest's own page tables govern the
+    /// access, could show the runtime consequence. Until then the bits are pinned by a host
+    /// test and nothing else, and that is the whole of the evidence.
     ///
     /// docs/host-contract.md lists "installed uncached / device-memory" as a MAP_BAR
     /// precondition and this tree could not express it until now.

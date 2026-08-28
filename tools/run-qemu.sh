@@ -152,8 +152,19 @@ if [ -n "${QEMU_TRACE:-}" ]; then
     echo "== qemu trace: $QEMU_TRACE -> $QEMU_TRACE_FILE =="
 fi
 
+# KVM=1 runs on the real CPU instead of the interpreter. Everything this tree has measured so
+# far ran under TCG, which is forgiving in exactly the places it worries about: PAT/PCD are
+# ignored there, so an aperture mapped cacheable behaves identically to one mapped uncached, and
+# memory ordering is whatever the interpreter does. On a real AMD CPU those stop being free.
+ACCEL=()
+if [ "${KVM:-0}" = "1" ]; then
+    ACCEL=(-accel kvm -cpu host)
+    echo "== accelerator: KVM on the host CPU (not TCG) =="
+fi
+
 feed_console_byte | timeout 30 qemu-system-x86_64 \
     "${MACHINE[@]}" \
+    "${ACCEL[@]}" \
     "${TRACE[@]}" \
     -kernel "$KERNEL" \
     -m 512M \

@@ -60,6 +60,33 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-28 — off the interpreter: the containment rig on a real CPU
+
+Everything measured until now ran under QEMU TCG. shark-a is an AMD Threadripper PRO with SVM,
+KVM, and three real AMD-Vi units, so `KVM=1` runs the same rig on the real CPU instead of an
+interpreter. The whole containment story passes there — CONTAINED, TRANSLATED, RIGHTS ENFORCED,
+UNREACHABLE, REVOKED, PER-DEVICE, DENY WORKS, DENY BLOCKS READS, the real BAR, and ring 3 driving
+the device — with the IOMMU still emulated but the CPU, its paging, and its memory ordering no
+longer pretend.
+
+**And a claim I had repeated turns out to be narrower than stated.** The `Perms::device` comment
+said getting the uncached mapping wrong is "invisible under QEMU TCG and wrong on silicon", which
+implies a real CPU would catch it. It does not: zeroing `NO_CACHE` passes under TCG *and* under
+KVM on this Threadripper. For an EMULATED device the hypervisor marks the MMIO range as trapping
+in the nested page tables, so every access exits to QEMU whatever the guest's PAT says — the
+attribute never gets a chance to matter.
+
+Only a device passed through with VFIO, where the guest's own page tables actually govern the
+access, could show the runtime consequence. Until then those bits are pinned by a host test and
+by nothing else, and the comment now says exactly that.
+
+Worth naming the shape, because it is the same one this document keeps recording: a rig being
+"more real" is not the same as it being able to see the thing you care about. Moving from TCG to
+KVM made the CPU real and left this particular property exactly as unobservable as before.
+
+CI cannot run this — GitHub runners have no `/dev/kvm` — so `KVM=1` is a shark-a mode, and the
+TCG rigs remain what gates every push.
+
 ## 2026-08-23 (later still) — closing the two I had recorded as open
 
 Both were things the previous entry listed rather than fixed, so this is finishing them.
