@@ -2219,17 +2219,24 @@ unsafe fn program_dte<A: Arch>(
         let mut passthrough = 0usize;
         for f in all[..present].iter() {
             let bdf = f.bdf();
-            let w0 = core::ptr::read_volatile((dt + bdf as u64 * 32) as *const u64);
-            let want = match (0..MAX_DOMAINS).find(|&i| {
+            let entry = (dt + bdf as u64 * 32) as *const u64;
+            let w0 = core::ptr::read_volatile(entry);
+            // Word 1 too: it carries the DomainID, which decides which invalidation reaches this
+            // device. It was written and cross-checked by NOTHING — the traced step inspects the
+            // command stream, so it can see that a flush NAMED domain 1, and not that any entry
+            // agrees. An entry whose DomainID does not match the domain it was bound for is
+            // flushed by nobody, which is the stale-translation hazard one level down.
+            let w1 = core::ptr::read_volatile(entry.add(1));
+            let (want0, want1) = match (0..MAX_DOMAINS).find(|&i| {
                 let sl = staged[i];
                 sl.id != 0 && sl.bdf == bdf
             }) {
                 // A bound device carries its OWN root, an unbound one the deny root. Both are
                 // checked: skipping the bound ones exempted every device with real DMA access.
-                Some(i) => staged[i].w0,
-                None => deny_w0,
+                Some(i) => (staged[i].w0, i as u64),
+                None => (deny_w0, MAX_DOMAINS as u64),
             };
-            if w0 != want {
+            if w0 != want0 || w1 != want1 {
                 passthrough += 1;
             }
         }
@@ -3268,6 +3275,73 @@ unsafe fn prove_containment<A: Arch>(
         let deny = *core::ptr::addr_of!(DENY_DTE_W0);
         let mine = *core::ptr::addr_of!(DEVICE_DTE_W0);
         if dte != 0 && deny != 0 && mine != 0 {
+            // ---- and the READ direction, which nothing here had ever tested ----
+            //
+            // Both transfers below are device WRITES, so an entry that leaks READ access to
+            // kernel memory passes them. A read is observable only indirectly — it lands in the
+            // device's own buffer — so: park a known value in that buffer through a legitimate
+            // mapping, ask the device to read the frame under the DENY entry, then bring the
+            // buffer back out and see whether it changed.
+            const READMARK: u64 = 0x0BAD_0BAD_0BAD_0BAD;
+            let l1 = (*core::ptr::addr_of!(DOMAIN_SLOTS[0])).l1;
+            let mut read_leaked = false;
+            if l1 != 0 {
+                let rw = abi::CapRights(0b011);
+                let spfn = src.as_u64() >> abi::PAGE_SHIFT;
+                let slot = (IOVA_SRC >> abi::PAGE_SHIFT) & 0x1FF;
+                domain_at(0).grant(spfn, rw);
+                let staged_ok = domain_at(0).map(IOVA_SRC, spfn, rw).is_ok();
+                core::ptr::write_volatile(
+                    (l1 + slot * 8) as *mut u64,
+                    iopte::leaf(src.as_u64(), rw),
+                );
+                for i in 0..8u64 {
+                    core::ptr::write_volatile((src.as_u64() + i * 8) as *mut u64, SENTINEL);
+                    core::ptr::write_volatile((dst_phys + i * 8) as *mut u64, READMARK);
+                }
+                // Buffer := SENTINEL, through a mapping that is allowed.
+                let _ = run(IOVA_SRC, 0x4_0000, false);
+                // Now under the deny entry, ask it to READ the marked frame at its own address.
+                core::ptr::write_volatile(dte as *mut u64, deny);
+                if !iommu_invalidate(base, 0) {
+                    INVALIDATE_TIMEOUTS += 1;
+                }
+                let _ = run(dst_phys, 0x4_0000, false);
+                core::ptr::write_volatile(dte as *mut u64, mine);
+                if !iommu_invalidate(base, 0) {
+                    INVALIDATE_TIMEOUTS += 1;
+                }
+                // Bring the buffer back out and see what it holds.
+                let _ = run(0x4_0000, IOVA_SRC, true);
+                // The leak signal is READMARK ARRIVING, not the buffer merely changing. A
+                // REFUSED read perturbs it too — measured: the frame came back all zeroes, and
+                // an oracle of "differs from the sentinel" called that a leak. "Something
+                // happened" and "the marked bytes reached the device" are different facts.
+                read_leaked = (0..8u64).any(|i| {
+                    core::ptr::read_volatile((src.as_u64() + i * 8) as *const u64) == READMARK
+                });
+                let _ = staged_ok;
+                core::ptr::write_volatile((l1 + slot * 8) as *mut u64, 0);
+                domain_at(0).unmap(IOVA_SRC);
+                domain_at(0).revoke(spfn);
+                if !iommu_invalidate(base, 0) {
+                    INVALIDATE_TIMEOUTS += 1;
+                }
+            }
+            if read_leaked {
+                let _ = writeln!(
+                    con,
+                    "[iommu] (bug) the DENY entry leaked a READ: the device pulled a marked \
+                     frame into its buffer through an entry that should reach nothing"
+                );
+            } else {
+                let _ = writeln!(
+                    con,
+                    "[iommu] DENY BLOCKS READS: under that entry the device could not pull a \
+                     marked frame into its own buffer"
+                );
+            }
+
             for i in 0..8u64 {
                 core::ptr::write_volatile((dst_phys + i * 8) as *mut u64, SENTINEL);
             }

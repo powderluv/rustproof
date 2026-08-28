@@ -402,6 +402,13 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ]; then
         # for that reason alone, and the object would never be looked at.
         # The deny entry must actually DENY, shown with the device we can drive rather than
         # asserted from the word we wrote. Nothing else in the boot aims a device at one.
+        # Both directions: the write test cannot see an entry that leaks READ access, since a
+        # read lands in the device's own buffer and never touches ours.
+        if ! echo "$OUT" | grep -q '\[iommu\] DENY BLOCKS READS:'; then
+            echo "RESULT: FAIL — the deny entry was never tested against a device READ, or it"
+            echo "  let one through"
+            exit 1
+        fi
         if ! echo "$OUT" | grep -q '\[iommu\] DENY WORKS:'; then
             echo "RESULT: FAIL — the entry every unbound function gets was never shown to deny,"
             echo "  or a device holding it still reached memory"

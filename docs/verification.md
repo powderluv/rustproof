@@ -60,6 +60,30 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-23 (later still) — closing the two I had recorded as open
+
+Both were things the previous entry listed rather than fixed, so this is finishing them.
+
+**The DTE's DomainID was written and cross-checked by nothing.** Word 1 carries the id that
+decides which invalidation reaches a device; the read-back looked only at word 0, and the traced
+step inspects the COMMAND stream — it can see that a flush named domain 1, not that any entry
+agrees. An entry whose DomainID does not match the domain it was bound for is flushed by nobody,
+which is the stale-translation hazard one level down. Both words are checked now, against the
+value each device should carry, and the mutant that gives every device DomainID 0 is caught.
+
+**The deny probe attempted only device WRITES.** An entry leaking READ access passes a write
+test, because a read lands in the device's own buffer and never touches ours. The probe now parks
+a known value in that buffer through a legitimate mapping, asks the device to read a MARKED frame
+while holding the deny entry, brings the buffer back out, and looks for the mark. It blocks on
+the real entry and fires on the passthrough mutant.
+
+That test was wrong on its first run, in the way this keeps happening: it reported a LEAK. The
+frame came back all zeroes — not the mark — because a REFUSED read perturbs the buffer too, and
+the oracle was "differs from the sentinel". "Something happened" and "the marked bytes reached
+the device" are different facts, and only the second is a leak. Diagnosing before believing the
+verdict is what caught it; the first version would have reported a containment breach that had
+not occurred.
+
 ## 2026-08-23 (later) — five more, and two of them were tests I had just added
 
 The same review round, past the bridge-alias finding. Two of these are self-inflicted: checks
@@ -93,6 +117,7 @@ ungranted one. Those are now separate messages.
 Still open from this round, recorded rather than quietly dropped: the deny probe attempts only
 device WRITES, so a deny entry leaking READ access would pass it; and the DTE's DomainID is
 written blind — the traced step inspects the command stream, not the entry.
+(Both closed the same day; see the entry above.)
 
 ## 2026-08-23 — a domain bound to a BDF the unit never consults
 
