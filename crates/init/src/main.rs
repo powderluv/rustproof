@@ -229,6 +229,16 @@ const IRQ_HELPER_WAITS: u64 = 300;
 /// regression test for the kernel — its interrupt entry MUST `cld` before any `rep movs`
 /// (the trap-frame save), or entering with DF=1 corrupts kernel memory. DF is restored
 /// (`cld`) before returning so the rest of this program is unaffected.
+/// Give the scheduler a turn. Used where this process is WAITING for another to act.
+///
+/// A busy `spin` there is worse than useless: it burns the quantum of the process being waited
+/// FOR, so the wait's fixed budget measures wall time under contention rather than the other
+/// process's progress. Yielding makes each attempt a scheduling opportunity instead.
+fn yield_now() {
+    // SAFETY: YIELD takes no arguments and touches no user memory.
+    unsafe { syscall0(sysno::YIELD) };
+}
+
 fn spin(iters: u64) {
     // SAFETY: `std`/`cld` only toggle RFLAGS.DF (legal in ring 3); the loop between them
     // performs no string/`rep` operation, so a set DF cannot affect this program.
@@ -1829,12 +1839,12 @@ fn child(id: u64) -> ! {
         // otherwise the authority survives its capability. Watch for it to vanish.
         let mut gone = false;
         let mut k = 0u64;
-        while k < 60 {
+        while k < 4_000 {
             if mapped_probe(r.user_va) != syserr::OK {
                 gone = true;
                 break;
             }
-            spin(2_000_000);
+            yield_now();
             k = k.wrapping_add(1);
         }
         dw!(b"\n");
@@ -1842,7 +1852,8 @@ fn child(id: u64) -> ! {
         if gone {
             dw!(b"mmio: mapping torn down when the cap was REVOKED\n");
         } else {
-            dw!(b"mmio: mapping survived revocation (bug)\n");
+            // Same distinction as the region wait: not yet revoked is a scheduling fact.
+            dw!(b"mmio: the parent had not revoked within our budget (inconclusive)\n");
         }
         // Deliberately fault. A wild pointer is OUR bug, not the machine's: the kernel must
         // kill this process and keep running, and the boot must still reach BOOT OK. If a
@@ -1923,7 +1934,7 @@ fn child(id: u64) -> ! {
         let mut revoked = false;
         let mut exhausted = false;
         let mut i = 0u64;
-        while i < 60 {
+        while i < 4_000 {
             let c = make_region(0, 1);
             if c == syserr::NO_CAP {
                 revoked = true;
@@ -1934,7 +1945,7 @@ fn child(id: u64) -> ! {
                 break;
             }
             free_region(c);
-            spin(2_000_000);
+            yield_now();
             i = i.wrapping_add(1);
         }
         if exhausted {
@@ -1946,6 +1957,11 @@ fn child(id: u64) -> ! {
         tag(id);
         if revoked {
             dw!(b"revoke: delegated cap REVOKED by parent (no longer usable)\n");
+        } else if !exhausted {
+            // The parent had not revoked yet. That is a fact about SCHEDULING, not about
+            // revocation, and calling it "(bug)" accused the kernel of something that had not
+            // happened — which is what it did on a slow CI runner once the parent's work grew.
+            dw!(b"revoke: the parent had not revoked within our budget (inconclusive)\n");
         } else {
             dw!(b"revoke: delegated cap still usable after revoke (bug)\n");
         }
@@ -1976,7 +1992,10 @@ fn child(id: u64) -> ! {
         // the revoke keeps running (its own tagged output is the evidence), exactly as a
         // region minted before it stays alive.
         tag(id);
-        if spawn(0) == u64::MAX {
+        if !revoked {
+            // Nothing has been revoked yet, so a spawn succeeding says nothing.
+            dw!(b"revoke: no revocation observed, so the SPAWN half is inconclusive\n");
+        } else if spawn(0) == u64::MAX {
             dw!(b"revoke: the same revoked cap also refuses SPAWN (one story, not two)\n");
         } else {
             dw!(b"revoke: SPAWN still allowed through a revoked cap (bug)\n");

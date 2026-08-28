@@ -511,6 +511,17 @@ if [ "${PROVOKE_FAULT:-0}" != "1" ]; then
     fi
 fi
 
+# The revocation checks are a WAIT: the child polls until the parent revokes. A timeout is a
+# scheduling fact, not a violation, and the demo now says so instead of accusing the kernel — so
+# the RUNNER is what turns an inconclusive run into a failure, with an accurate message.
+if [ "${PROVOKE_FAULT:-0}" != "1" ] && echo "$OUT" | grep -q 'inconclusive'; then
+    echo "RESULT: FAIL — a revocation check never observed the revoke it was waiting for:"
+    echo "$OUT" | grep -a 'inconclusive' | sed 's/^/    /'
+    echo "  (this is a scheduling timeout, not a revocation defect — raise the budget or find"
+    echo "   out why the revoking process is not being scheduled)"
+    exit 1
+fi
+
 for want in 'share: a WRITABLE borrower still cannot destroy what it borrowed'; do
     if [ "${PROVOKE_FAULT:-0}" != "1" ] && ! echo "$OUT" | grep -qF "$want"; then
         echo "RESULT: FAIL — a required assertion never ran: $want"

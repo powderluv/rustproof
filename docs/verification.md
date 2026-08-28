@@ -60,6 +60,37 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-28 (later) — CI caught a test accusing the kernel of something that had not happened
+
+The KVM commit went red in CI, on the traced step only, with three revocation failures:
+`mmio: mapping survived revocation`, `delegated cap still usable after revoke`, `SPAWN still
+allowed through a revoked cap`. None of them was true. All three passed locally, four runs in a
+row.
+
+The revocation checks are a WAIT: a child polls until the parent revokes, on a fixed budget of 60
+attempts with a busy `spin` between them. Two things had gone wrong with that.
+
+The budget was calibrated against a much shorter parent. The parent is the process that runs the
+entire DMA and device demo — everything added over the last fortnight — so it now takes far
+longer to reach its `REVOKE`, and on a slower, traced, loaded runner the child ran out of
+attempts first. And the child was BUSY-SPINNING, which burns the quantum of the process it is
+waiting for: the wait measured wall time under contention rather than the parent's progress.
+
+Both fixed: the child yields instead of spinning, and the budget is far larger and now counts
+scheduling opportunities rather than wall time.
+
+**The part that matters more than the timing.** A timeout was reported as `(bug)` — the demo
+accused the kernel of letting a revoked capability survive, when what had actually happened was
+that no revocation had been attempted yet. "The thing has not happened" and "the property is
+violated" are different facts, and only the second is a defect. The demo now says which one it
+saw, and the RUNNER turns an inconclusive run into a failure with an accurate message, so nothing
+is silently weakened by the honesty.
+
+This is the third assertion in this tree found to be reporting a violation it had not observed —
+after the irq gate that fired at random, and the read-leak probe that called a refused read a
+leak. The common shape: a check with one branch for "good" and one for "everything else", where
+"everything else" contains outcomes that are not violations.
+
 ## 2026-08-28 — off the interpreter: the containment rig on a real CPU
 
 Everything measured until now ran under QEMU TCG. shark-a is an AMD Threadripper PRO with SVM,
