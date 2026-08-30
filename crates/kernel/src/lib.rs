@@ -2805,6 +2805,9 @@ struct RoProbe {
     /// fact "no PTE written" — so a defect that wrote the entry anyway would still have said
     /// "refused". This is the device's answer instead of the model's.
     ungranted_seen: u64,
+    /// Whether that transfer COMPLETED at the device. Without it, "the ungranted IOVA was
+    /// refused" and "the device never attempted it" are the same observation.
+    ungranted_done: bool,
     frame: u64,
     mapped: bool,
     wider_refused: bool,
@@ -3112,7 +3115,7 @@ unsafe fn prove_containment<A: Arch>(
         let _ = run(0x4_0000, IOVA_WIDER, true);
         let ro_seen = first_disturbed(ro.as_u64(), SENTINEL);
         // And aim one at the ungranted IOVA, so "refused" is something the DEVICE demonstrates.
-        let _ = run(0x4_0000, IOVA_UNGRANTED, true);
+        let ungranted_done = run(0x4_0000, IOVA_UNGRANTED, true);
         let ungranted_seen = first_disturbed(ungranted.as_u64(), SENTINEL);
         let tail_ro_after = core::ptr::read_volatile((base + 0x2018) as *const u64);
 
@@ -3122,6 +3125,7 @@ unsafe fn prove_containment<A: Arch>(
             dst.as_u64(),
             RoProbe {
                 ungranted_seen,
+                ungranted_done,
                 frame: ro.as_u64(),
                 mapped: ro_mapped,
                 wider_refused,
@@ -3165,7 +3169,13 @@ unsafe fn prove_containment<A: Arch>(
     // it could — the stale-mapping hazard `crates/iommu`'s exhaustive search exists to
     // prevent, which would be a poor thing to demonstrate and then commit here.
     if let Some((_, _, dst_phys, ro)) = translated {
-        if ro.ungranted_seen == SENTINEL {
+        if !ro.ungranted_done {
+            let _ = writeln!(
+                con,
+                "[iommu] (bug) the ungranted-IOVA transfer never ran, so its refusal shows \
+                 nothing"
+            );
+        } else if ro.ungranted_seen == SENTINEL {
             let _ = writeln!(
                 con,
                 "[iommu] UNREACHABLE: the ungranted IOVA was refused by the DEVICE, not just \
@@ -3285,6 +3295,7 @@ unsafe fn prove_containment<A: Arch>(
             const READMARK: u64 = 0x0BAD_0BAD_0BAD_0BAD;
             let l1 = (*core::ptr::addr_of!(DOMAIN_SLOTS[0])).l1;
             let mut read_leaked = false;
+            let mut read_conclusive = false;
             if l1 != 0 {
                 let rw = abi::CapRights(0b011);
                 let spfn = src.as_u64() >> abi::PAGE_SHIFT;
@@ -3300,19 +3311,19 @@ unsafe fn prove_containment<A: Arch>(
                     core::ptr::write_volatile((dst_phys + i * 8) as *mut u64, READMARK);
                 }
                 // Buffer := SENTINEL, through a mapping that is allowed.
-                let _ = run(IOVA_SRC, 0x4_0000, false);
+                let load_ok = run(IOVA_SRC, 0x4_0000, false);
                 // Now under the deny entry, ask it to READ the marked frame at its own address.
                 core::ptr::write_volatile(dte as *mut u64, deny);
                 if !iommu_invalidate(base, 0) {
                     INVALIDATE_TIMEOUTS += 1;
                 }
-                let _ = run(dst_phys, 0x4_0000, false);
+                let attempt_ok = run(dst_phys, 0x4_0000, false);
                 core::ptr::write_volatile(dte as *mut u64, mine);
                 if !iommu_invalidate(base, 0) {
                     INVALIDATE_TIMEOUTS += 1;
                 }
                 // Bring the buffer back out and see what it holds.
-                let _ = run(0x4_0000, IOVA_SRC, true);
+                let extract_ok = run(0x4_0000, IOVA_SRC, true);
                 // The leak signal is READMARK ARRIVING, not the buffer merely changing. A
                 // REFUSED read perturbs it too — measured: the frame came back all zeroes, and
                 // an oracle of "differs from the sentinel" called that a leak. "Something
@@ -3320,6 +3331,9 @@ unsafe fn prove_containment<A: Arch>(
                 read_leaked = (0..8u64).any(|i| {
                     core::ptr::read_volatile((src.as_u64() + i * 8) as *const u64) == READMARK
                 });
+                // All three legs have to have RUN, or "the mark did not arrive" is a statement
+                // about a device that was never asked rather than about the entry.
+                read_conclusive = load_ok && attempt_ok && extract_ok;
                 let _ = staged_ok;
                 core::ptr::write_volatile((l1 + slot * 8) as *mut u64, 0);
                 domain_at(0).unmap(IOVA_SRC);
@@ -3328,7 +3342,13 @@ unsafe fn prove_containment<A: Arch>(
                     INVALIDATE_TIMEOUTS += 1;
                 }
             }
-            if read_leaked {
+            if !read_conclusive {
+                let _ = writeln!(
+                    con,
+                    "[iommu] (bug) the READ probe's transfers did not all run, so it shows \
+                     nothing"
+                );
+            } else if read_leaked {
                 let _ = writeln!(
                     con,
                     "[iommu] (bug) the DENY entry leaked a READ: the device pulled a marked \
@@ -3365,7 +3385,13 @@ unsafe fn prove_containment<A: Arch>(
             if !iommu_invalidate(base, 0) {
                 INVALIDATE_TIMEOUTS += 1;
             }
-            if seen == SENTINEL {
+            if !done {
+                let _ = writeln!(
+                    con,
+                    "[iommu] (bug) neither transfer ran under the deny entry, so it was never \
+                     given the chance to fail"
+                );
+            } else if seen == SENTINEL {
                 let _ = writeln!(
                     con,
                     "[iommu] DENY WORKS: holding the entry every unbound function gets, the \
@@ -3397,7 +3423,14 @@ unsafe fn prove_containment<A: Arch>(
             ro.tail_before,
             ro.tail_after
         );
-        if ro.seen != SENTINEL {
+        if !ro.done {
+            // The device never attempted the write, so "it could not write" is not a fact
+            // about the mapping's rights. `done` was printed and never required.
+            let _ = writeln!(
+                con,
+                "[iommu] (bug) the read-only write never ran, so RIGHTS shows nothing"
+            );
+        } else if ro.seen != SENTINEL {
             let _ = writeln!(
                 con,
                 "[iommu] (bug) WRITE-THROUGH: a READ-only mapping accepted a device write"

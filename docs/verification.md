@@ -60,6 +60,40 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-30 (later) — the same sweep, applied to the kernel's own assertions
+
+The sweep covered the demo. The kernel has thirteen `(bug)` assertions of its own and they had
+never been through the same lens. Four of them — every one of the containment REFUSALS — claimed
+a refusal without requiring that the device had actually attempted anything.
+
+`UNREACHABLE`, `DENY WORKS`, `DENY BLOCKS READS` and `RIGHTS ENFORCED` all rested on a frame
+still holding its sentinel. A frame holds its sentinel just as well when no transfer was ever
+issued. Two of them PRINTED whether the transfer completed, in the same line as the verdict, and
+neither REQUIRED it — the evidence was on screen and unused.
+
+This is the `stray` finding from the demo side, which the review found and I fixed there without
+looking for it here: the witness that separates "the device was refused" from "the device never
+ran" was already being computed and thrown away.
+
+Fixed, and the mutant is the demonstration. Making the device's completion signal always report
+"stuck" now produces four distinct failures:
+
+```
+(bug) the ungranted-IOVA transfer never ran, so its refusal shows nothing
+(bug) the READ probe's transfers did not all run, so it shows nothing
+(bug) neither transfer ran under the deny entry, so it was never given the chance to fail
+(bug) the read-only write never ran, so RIGHTS shows nothing
+```
+
+Before the fix that same mutant reported UNREACHABLE, DENY BLOCKS READS, DENY WORKS and RIGHTS
+ENFORCED — four confident claims of successful containment from a device that had not moved a
+byte. Nothing was broken; the tree would simply have said the opposite of the truth if it had
+been.
+
+Worth stating what generalises, since this is the second half of the same lesson: a refusal is
+only evidence when the thing refused was attempted. Any check whose good news is "nothing
+happened" needs a separate witness that something was tried.
+
 ## 2026-08-30 — hunting the shape instead of waiting for it
 
 Three assertions in this tree have now been caught reporting a violation they never observed: the
