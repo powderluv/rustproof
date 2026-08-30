@@ -60,6 +60,38 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-30 — hunting the shape instead of waiting for it
+
+Three assertions in this tree have now been caught reporting a violation they never observed: the
+irq gate that fired at random, the read-leak probe that called a refused read a leak, and the
+revocation checks that called a scheduling timeout a surviving capability. Rather than wait for
+the fourth to bite in CI, this is a deliberate sweep for the shape.
+
+The shape, stated so it can be looked for: **a check with one branch for "good" and one for
+"everything else", where "everything else" contains outcomes that are not violations.** Two
+sources of it here — a bounded WAIT whose exhaustion means "not yet", and a comparison that folds
+an error sentinel or an unrelated difference into a wrong-answer verdict.
+
+Every bounded wait in the demo was enumerated and inspected. One more of exactly the fixed kind
+turned up: a borrower waiting 90 busy-spin rounds for the owner's `REVOKE`, reporting the timeout
+as `kept the window after revocation (bug)`. It now yields, has a far larger budget, and says
+"the owner had not revoked within our budget (inconclusive)" — which the runner turns into a
+failure with an accurate message.
+
+Three conflations of the second kind:
+
+- the timer-interrupt wait treated "we hold no authority for this line" as "no interrupts
+  delivered" — a missing capability and a quiet line are different defects;
+- `UNMAP_REGION` returning an error was reported as "left the window mapped";
+- re-mapping a region folded THREE facts into one message: the call failing, the kernel choosing
+  a different address, and the contents being lost. Only the first is "could not re-map", and a
+  report that names the wrong one sends you looking in the wrong place.
+
+None of these was failing. That is the point: a message is read when something breaks, which is
+the moment it is least convenient for it to be wrong. The sweep found no case where the tree was
+actually broken — it found four places where, had it broken, the boot would have said the wrong
+thing about why.
+
 ## 2026-08-28 (later) — CI caught a test accusing the kernel of something that had not happened
 
 The KVM commit went red in CI, on the traced step only, with three revocation failures:

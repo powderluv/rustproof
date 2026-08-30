@@ -965,7 +965,10 @@ fn compute(id: u64) -> ! {
         // UNMAP_REGION, then map again: the window goes and comes back, contents intact.
         tag(id);
         let un = unmap_region(mbox);
-        if un == syserr::OK && mapped_probe(mva) != syserr::OK {
+        if un != syserr::OK {
+            // The call failed. That is not the same defect as a window that survived it.
+            dw!(b"share: UNMAP_REGION returned an error on a region we hold (bug)\n");
+        } else if mapped_probe(mva) != syserr::OK {
             dw!(b"share: UNMAP_REGION dropped the window\n");
         } else {
             dw!(b"share: UNMAP_REGION left the window mapped (bug)\n");
@@ -1134,10 +1137,17 @@ fn compute(id: u64) -> ! {
 
         tag(id);
         let again = map_region(mbox);
-        if again == mva && unsafe { core::ptr::read_volatile(mva as *const u8) } == b'B' {
-            dw!(b"share: re-mapped it, same address, contents intact\n");
-        } else {
+        // THREE facts shared one message here: the call failing, the kernel choosing a
+        // different address, and the contents being lost. Only the first is "could not
+        // re-map", and a report that names the wrong one sends you looking in the wrong place.
+        if again == syserr::NO_CAP || again == syserr::NO_MEM {
             dw!(b"share: could not re-map a region we still hold (bug)\n");
+        } else if again != mva {
+            dw!(b"share: re-mapping a region moved it to a different address (bug)\n");
+        } else if unsafe { core::ptr::read_volatile(mva as *const u8) } != b'B' {
+            dw!(b"share: re-mapped a region and its contents were gone (bug)\n");
+        } else {
+            dw!(b"share: re-mapped it, same address, contents intact\n");
         }
         // Scrub-on-destroy, tested against RECYCLED memory. Fresh frames are zero anyway on
         // an early boot, so zeroing only a NEW region proves nothing: poison one, destroy
@@ -1215,6 +1225,7 @@ fn compute(id: u64) -> ! {
     // for its own device's line.
     let mut ticks = 0u64;
     let mut rounds = 0u64;
+    let mut lost_cap = false;
     while ticks < 3 && rounds < 10 {
         // BLOCK until the line fires. This is the path a real driver takes, and it puts
         // the kernel in its idle park whenever no other process is runnable — so this also
@@ -1223,7 +1234,11 @@ fn compute(id: u64) -> ! {
         // otherwise wrap the total past the threshold and PASS this test for the wrong
         // reason. Only a real, non-error count is accumulated.
         let n = wait_irq(6);
-        if n == syserr::NO_CAP || n == 0 {
+        if n == syserr::NO_CAP {
+            lost_cap = true;
+            break;
+        }
+        if n == 0 {
             break;
         }
         ticks = ticks.wrapping_add(n);
@@ -1234,6 +1249,10 @@ fn compute(id: u64) -> ! {
         dw!(b"irq: blocked and woke on real device interrupts (");
         dbg_dec(ticks);
         dw!(b")\n");
+    } else if lost_cap {
+        // A capability we should hold resolved to nothing. That is a different defect from
+        // the line being quiet, and the two shared a message.
+        dw!(b"irq: we hold no authority for the timer line (bug)\n");
     } else {
         dw!(b"irq: no interrupts delivered (bug)\n");
     }
@@ -1769,19 +1788,23 @@ fn child(id: u64) -> ! {
         // only go away because the REVOKE tore it down.
         let mut gone = false;
         let mut k = 0u64;
-        while k < 90 {
+        while k < 4_000 {
             if mapped_probe(rva) != syserr::OK {
                 gone = true;
                 break;
             }
-            spin(2_000_000);
+            // YIELD, not spin: this is a wait on the OWNER, and burning the quantum of the
+            // process being waited for makes the budget measure contention instead of progress.
+            yield_now();
             k = k.wrapping_add(1);
         }
         tag(id);
         if gone {
             dw!(b"share: REVOKE alone tore the window down\n");
         } else {
-            dw!(b"share: kept the window after revocation (bug)\n");
+            // Not "the window survived revocation" — the owner may simply not have revoked
+            // yet. Third instance of the same shape in this file; see the 2026-08-28 entry.
+            dw!(b"share: the owner had not revoked within our budget (inconclusive)\n");
         }
         exit(id);
     }
