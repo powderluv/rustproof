@@ -69,6 +69,21 @@ MUTATIONS = [
      "if rights.contains(CapRights::READ) =>", "if true =>"),
     ("hostcontract: a BAR window is writable regardless of WRITE", "crates/hostcontract/src/lib.rs",
      "            (base, rights.contains(CapRights::WRITE))", "            (base, true)"),
+    ("abi: from_user does not mask undefined right bits", "crates/abi/src/lib.rs",
+     "        CapRights((word as u8) & CapRights::ALL.0)", "        CapRights(word as u8)"),
+    ("capabilities: revoke ignores an out-of-range slot id", "crates/capabilities/src/lib.rs",
+     "        if cap.0 >= N {\n            return;\n        }", "        if cap.0 >= N + 1 {\n            return;\n        }"),
+    ("iommu: an IOVA can be silently repointed", "crates/iommu/src/lib.rs",
+     "        if self.maps.iter().any(|m| m.live && m.iova == iova) {", "        if false {"),
+    ("mm: alloc_frame ignores the general floor", "crates/mm/src/lib.rs",
+     "        let frame = self.first_free(self.cursor.max(self.general_floor))?;",
+     "        let frame = self.first_free(self.cursor)?;"),
+    ("mm: free_frame accepts a frame below the reserve floor", "crates/mm/src/lib.rs",
+     "        if frame.as_u64() < self.reserve_below {\n            return;\n        }",
+     "        if false {\n            return;\n        }"),
+    ("runstate: well_formed misses a sender parked beside a live receiver", "crates/runstate/src/lib.rs",
+     "            if find_recv(slots, ep).is_some() {\n                return false;\n            }",
+     "            if false {\n                return false;\n            }"),
 ]
 
 

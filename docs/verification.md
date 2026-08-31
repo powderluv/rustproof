@@ -60,6 +60,33 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-31 (third) — twenty-four mutations, and a boundary nobody had asked for
+
+Six more entries, into `abi`, `capabilities`, `iommu`, `mm` and `runstate`. One survivor, and it
+is a different shape from the loader's.
+
+`CapSpace::revoke` guards `if cap.0 >= N`. Widening that to `>= N + 1` survived the whole suite —
+but the existing test DOES revoke an out-of-range slot, `CapId(99)`. The mutation only changes
+behaviour at exactly `cap.0 == N`, and `99` passes any plausible off-by-one. So the property was
+tested with a value chosen to be obviously outside rather than the one that distinguishes the two
+possible bounds.
+
+It matters because that id comes straight off a syscall argument: `CapId(A::frame_arg(&f, 0))`.
+A process asking to revoke exactly slot `N` is the first thing an out-of-range id hits, and
+without the guard it indexes one past the end. Rust panics there rather than corrupting anything,
+so the consequence is a kernel panic reachable from ring 3, not memory corruption — still worth
+refusing, which is what the guard is for. The boundary and `usize::MAX` are both pinned now.
+
+Worth naming the general point, since "far outside" is a natural value to reach for when writing
+this kind of test: a bound is a claim about ONE value, and a test that steps well past it never
+asks the question. The mutation is what noticed, because a mutant is by construction the smallest
+edit that could matter.
+
+The other five were killed, including two that pin claims the source makes about itself: `abi`'s
+`from_user` mask, whose doc calls it load-bearing for the exhaustive searches, and `mm`'s
+`general_floor`, whose comment records that this partition was once enforced three ways over and
+no single one could be shown to matter. Both are now shown to matter.
+
 ## 2026-08-31 (later) — the harness found one on its first expansion
 
 The mutation table started at ten entries, all in code this session had already been over. Widening

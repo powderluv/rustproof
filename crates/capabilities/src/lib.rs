@@ -271,6 +271,15 @@ mod tests {
         // Out of range: no panic, no change.
         cs.revoke(CapId(99));
         assert_eq!(cs.len(), 1);
+        // And the BOUNDARY, exactly one past the end. `99` is far outside and passes any
+        // plausible off-by-one; `N` itself is the value that distinguishes `>= N` from
+        // `> N`, and it is the one an out-of-range id from a syscall argument would hit
+        // first. Found by tools/mutate.py: widening the bound to `>= N + 1` survived the
+        // whole suite, because nothing ever asked for exactly this slot.
+        cs.revoke(CapId(4));
+        assert_eq!(cs.len(), 1);
+        cs.revoke(CapId(usize::MAX));
+        assert_eq!(cs.len(), 1);
         // Already-free slot.
         cs.revoke(CapId(2));
         assert_eq!(cs.len(), 1);
