@@ -17,6 +17,13 @@ jobs:
         run: cargo fmt --all --check
       - name: Host unit tests (portable + paging crates)
         run: tools/host-tests.sh
+      # A test that never fails is worth nothing, and this repo has shipped two such: contained()
+      # returned a constant and passed all 221 tests, and NO_CACHE could be zeroed with the suite
+      # green. Both were found by accident. This mutates load-bearing predicates on purpose and
+      # fails if the suite does not notice.
+      - name: Mutation sweep (the host suite must notice a broken predicate)
+        run: tools/mutate.py
+
       - name: Boot + ring-3 userland smoke
         run: tools/run-qemu.sh          # boots, loads init into ring 3, runs the host contract
       - name: Fault-dump smoke (forced #PF -> exception handler dumps cleanly)

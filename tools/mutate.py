@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Mutate load-bearing predicates and report which mutations the host suite does not notice.
+
+A test that never fails is worth nothing, and this repository has already shipped two of them:
+`Domain::contained` was `fn contained() -> bool { true }` for a while and passed all 221 tests,
+and `PageFlags::NO_CACHE` could be zeroed with the whole suite still green. Both were found by
+accident. This finds them on purpose.
+
+Each entry is a small, PLAUSIBLE edit — the kind a careless change would make — applied to one
+file, with the suite run against it. A mutation the suite still passes is a SURVIVOR: some
+property is stated somewhere and checked nowhere. Survivors are not automatically defects; some
+are equivalent mutants that cannot change behaviour on any reachable input, and the report says
+to check that before acting. What they are never is noise to skip.
+
+Usage:  tools/mutate.py            # run them all
+        tools/mutate.py <substr>   # only mutations whose label contains <substr>
+"""
+
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+# (label, file, find, replace) — `find` must occur EXACTLY once, or the mutation is reported as
+# STALE rather than silently skipped. A mutation that did not apply looks exactly like one the
+# suite killed, which is the failure mode this whole file exists to avoid.
+MUTATIONS = [
+    ("capabilities: rights check always passes", "crates/abi/src/lib.rs",
+     "self.0 & other.0 == other.0", "true"),
+    ("capabilities: a freed slot still resolves", "crates/capabilities/src/lib.rs",
+     "if idx < N && !self.slots[idx].is_free() {", "if idx < N {"),
+    ("iommu: contained() cannot fail", "crates/iommu/src/lib.rs",
+     "self.maps.iter().filter(|m| m.live).all(|m| {", "self.maps.iter().take(0).all(|m| {"),
+    ("iommu: granted() scans only the first slot", "crates/iommu/src/lib.rs",
+     "        self.grants\n            .iter()\n            .find(|g| g.live && g.frame == frame)",
+     "        self.grants\n            .iter()\n            .take(1)\n            .find(|g| g.live && g.frame == frame)"),
+    ("iommu: revoke drops the grant but keeps the mappings", "crates/iommu/src/lib.rs",
+     "        for m in self.maps.iter_mut() {\n            if m.live && m.frame == frame {",
+     "        for m in self.maps.iter_mut() {\n            if false && m.live && m.frame == frame {"),
+    ("vspace: NO_CACHE is not uncached", "crates/vspace/src/lib.rs",
+     "PageFlags((1 << 3) | (1 << 4))", "PageFlags(0)"),
+    ("regions: a borrower counts as the owner", "crates/regions/src/lib.rs",
+     "let owned = regions.iter().any(|x| x.live && x.id == r && x.owner == id);",
+     "let owned = regions.iter().any(|x| x.live && x.id == r);"),
+    ("deleg: revoke_from finds no grandchildren", "crates/deleg/src/lib.rs",
+     "        loop {\n            let mut progress = false;", "        for _ in 0..1 {\n            let mut progress = false;"),
+    ("mm: alloc_contiguous returns overlapping runs", "crates/mm/src/lib.rs",
+     "        if pages == 0 || pages > self.total {", "        if pages == 0 {"),
+    ("runstate: classify counts dead slots as live", "crates/runstate/src/lib.rs",
+     "    for (i, s) in slots.iter().enumerate() {\n        if !s.live {",
+     "    for (i, s) in slots.iter().enumerate() {\n        if false {"),
+]
+
+
+def run_suite() -> bool:
+    """True if the host suite passes."""
+    r = subprocess.run(["bash", "tools/host-tests.sh"], cwd=ROOT,
+                       capture_output=True, text=True)
+    return r.returncode == 0
+
+
+def main() -> int:
+    only = sys.argv[1] if len(sys.argv) > 1 else None
+    picked = [m for m in MUTATIONS if only is None or only in m[0]]
+    if not picked:
+        print(f"no mutation matches {only!r}")
+        return 2
+
+    print("baseline: ", end="", flush=True)
+    if not run_suite():
+        print("the suite FAILS before any mutation — fix that first")
+        return 2
+    print("suite passes")
+
+    survivors, stale = [], []
+    for label, rel, find, repl in picked:
+        path = ROOT / rel
+        original = path.read_text()
+        if original.count(find) != 1:
+            stale.append((label, original.count(find)))
+            print(f"  STALE   {label} (pattern occurs {original.count(find)}x)")
+            continue
+        path.write_text(original.replace(find, repl, 1))
+        try:
+            survived = run_suite()
+        finally:
+            path.write_text(original)
+        print(f"  {'SURVIVED' if survived else 'killed  '} {label}")
+        if survived:
+            survivors.append(label)
+
+    print()
+    print(f"{len(picked)} mutations: {len(survivors)} survived, {len(stale)} stale")
+    for s in survivors:
+        print(f"  SURVIVOR: {s}")
+    if stale:
+        print("  stale patterns no longer match the source — update tools/mutate.py")
+    # A survivor FAILS. The table stands at zero, so any new one is a coverage regression, and
+    # "look at it later" is how the two historical vacuous tests survived as long as they did.
+    # If a survivor turns out to be an EQUIVALENT mutant — unable to change behaviour on any
+    # reachable input — delete it from the table with a note saying why, rather than leaving it
+    # to be re-triaged every run. Stale patterns fail too: a mutation that did not apply looks
+    # exactly like one the suite killed.
+    return 1 if (survivors or stale) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

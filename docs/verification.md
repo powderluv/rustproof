@@ -60,6 +60,40 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-31 — mutating the predicates on purpose instead of by accident
+
+Two vacuous tests have been found in this tree, both by accident: `Domain::contained` returned a
+constant and passed all 221 tests, and `PageFlags::NO_CACHE` could be zeroed with the suite
+green. Each was noticed only because someone happened to try that exact edit. `tools/mutate.py`
+does it deliberately: ten small, plausible edits to load-bearing predicates, each applied in turn
+with the host suite run against it.
+
+All ten are killed. The suite notices a rights check that always passes, a freed capability slot
+that still resolves, `contained` that cannot fail, a grant scan truncated to one slot, a revoke
+that drops the grant and keeps the mappings, an uncached flag that is not uncached, a borrower
+counting as an owner, a delegation revoke that never reaches grandchildren, an allocator handing
+out overlapping runs, and a scheduler counting dead slots as live.
+
+The harness reports two outcomes besides "killed", and both matter:
+
+- A SURVIVOR fails the run. The table stands at zero, so a new one is a coverage regression, and
+  "look at it later" is precisely how the two historical cases lasted as long as they did. An
+  equivalent mutant — one that cannot change behaviour on any reachable input — should be
+  DELETED from the table with a note, not left to be re-triaged every run.
+- A STALE pattern fails too. A mutation that did not apply looks exactly like one the suite
+  killed, which is the failure this whole file exists to prevent. Five of the ten were stale on
+  the first run because I had guessed at the source; the harness said so rather than quietly
+  reporting ten kills.
+
+And the harness got the same treatment it applies. Fed a mutation nothing covers, it reports
+SURVIVED and exits non-zero — so it is not itself a checker that cannot fail. It runs in eighteen
+seconds and is now a CI step.
+
+What this does NOT cover, stated because the boundary is easy to lose: it mutates code the HOST
+suite can see. Kernel-target code reached only by the boot is outside it — the self-test above
+used exactly such a constant to prove the survivor path works. The boot's own assertions are
+covered by the rig modes, and by having been mutated one at a time throughout this log.
+
 ## 2026-08-30 (later) — the same sweep, applied to the kernel's own assertions
 
 The sweep covered the demo. The kernel has thirteen `(bug)` assertions of its own and they had
