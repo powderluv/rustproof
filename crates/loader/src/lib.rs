@@ -470,6 +470,59 @@ mod tests {
     }
 
     #[test]
+    /// A program-header table that runs past the end of the image must be REFUSED.
+    ///
+    /// Found by `tools/mutate.py`: deleting the whole-phdr guard left every test green. It is
+    /// not an equivalent mutant, and the difference is the interesting part — the per-field
+    /// reads below it are individually bounds-checked, so a truncated header whose `p_type` is
+    /// still readable and is NOT `PT_LOAD` gets SKIPPED rather than rejected. The loader would
+    /// accept a malformed image instead of refusing it.
+    ///
+    /// Constructed so it can only fail for that reason: the first header is a well-formed
+    /// PT_LOAD that maps a zero-filled page and needs no file bytes, and only the SECOND runs
+    /// off the end.
+    #[test]
+    fn rejects_a_program_header_running_past_the_image() {
+        let mut img = vec![0u8; EHDR_SIZE + PHDR_SIZE + 4];
+        img[0..4].copy_from_slice(&ELF_MAGIC);
+        img[EI_CLASS] = ELFCLASS64;
+        img[5] = 1;
+        img[6] = 1;
+        img[OFF_E_TYPE..OFF_E_TYPE + 2].copy_from_slice(&ET_EXEC.to_le_bytes());
+        img[OFF_E_MACHINE..OFF_E_MACHINE + 2].copy_from_slice(&EM_X86_64.to_le_bytes());
+        img[20..24].copy_from_slice(&1u32.to_le_bytes());
+        img[OFF_E_ENTRY..OFF_E_ENTRY + 8].copy_from_slice(&0x1000u64.to_le_bytes());
+        img[OFF_E_PHOFF..OFF_E_PHOFF + 8].copy_from_slice(&(EHDR_SIZE as u64).to_le_bytes());
+        img[52..54].copy_from_slice(&(EHDR_SIZE as u16).to_le_bytes());
+        img[OFF_E_PHENTSIZE..OFF_E_PHENTSIZE + 2]
+            .copy_from_slice(&(PHDR_SIZE as u16).to_le_bytes());
+        // TWO headers declared; the image holds one and four bytes of the next.
+        img[OFF_E_PHNUM..OFF_E_PHNUM + 2].copy_from_slice(&2u16.to_le_bytes());
+
+        let p = EHDR_SIZE;
+        img[p + OFF_P_TYPE..p + OFF_P_TYPE + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        img[p + OFF_P_FLAGS..p + OFF_P_FLAGS + 4].copy_from_slice(&4u32.to_le_bytes()); // R
+        img[p + OFF_P_OFFSET..p + OFF_P_OFFSET + 8].copy_from_slice(&0u64.to_le_bytes());
+        img[p + OFF_P_VADDR..p + OFF_P_VADDR + 8].copy_from_slice(&0x1000u64.to_le_bytes());
+        img[p + 24..p + 32].copy_from_slice(&0x1000u64.to_le_bytes());
+        img[p + OFF_P_FILESZ..p + OFF_P_FILESZ + 8].copy_from_slice(&0u64.to_le_bytes());
+        img[p + OFF_P_MEMSZ..p + OFF_P_MEMSZ + 8].copy_from_slice(&PAGE_SIZE.to_le_bytes());
+        img[p + 48..p + 56].copy_from_slice(&PAGE_SIZE.to_le_bytes());
+
+        // The four readable bytes of the second header say "not PT_LOAD", which is exactly the
+        // value that gets skipped rather than rejected once the guard is gone.
+        let q = EHDR_SIZE + PHDR_SIZE;
+        img[q..q + 4].copy_from_slice(&(PT_LOAD + 1).to_le_bytes());
+
+        let (mut fa, mut aspace) = fresh_space();
+        assert_eq!(
+            load_elf(&img, &mut aspace, &mut fa),
+            Err(LoadError::Truncated),
+            "a program-header table extending past the image was accepted"
+        );
+    }
+
+    #[test]
     fn rejects_bad_magic() {
         let mut img = valid_image();
         img[1] = b'X'; // corrupt magic

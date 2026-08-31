@@ -50,6 +50,25 @@ MUTATIONS = [
     ("runstate: classify counts dead slots as live", "crates/runstate/src/lib.rs",
      "    for (i, s) in slots.iter().enumerate() {\n        if !s.live {",
      "    for (i, s) in slots.iter().enumerate() {\n        if false {"),
+    # --- crates that predate this session's scrutiny ---
+    ("abi: delegation INTERSECT becomes union (rights can be gained)", "crates/abi/src/lib.rs",
+     "        CapRights(self.0 & other.0)", "        CapRights(self.0 | other.0)"),
+    ("capabilities: a Null capability can be inserted", "crates/capabilities/src/lib.rs",
+     "        if cap_type == CapType::Null {\n            return None;\n        }",
+     "        if false {\n            return None;\n        }"),
+    ("sched: the run queue accepts duplicates", "crates/sched/src/lib.rs",
+     "        if self.len == N || self.contains(tid) {", "        if self.len == N {"),
+    ("sched: next() never advances (one thread starves the rest)", "crates/sched/src/lib.rs",
+     "        self.cur = (self.cur + 1) % self.len;", "        self.cur %= self.len;"),
+    ("ipc: a direct delivery also wakes a sender that never blocked", "crates/ipc/src/lib.rs",
+     "                words: buf,\n                wake_sender: false,\n            };",
+     "                words: buf,\n                wake_sender: true,\n            };"),
+    ("loader: a program header may run past the image", "crates/loader/src/lib.rs",
+     "        if ph_end > elf.len() {", "        if false {"),
+    ("hostcontract: MAP_BAR no longer requires READ", "crates/hostcontract/src/lib.rs",
+     "if rights.contains(CapRights::READ) =>", "if true =>"),
+    ("hostcontract: a BAR window is writable regardless of WRITE", "crates/hostcontract/src/lib.rs",
+     "            (base, rights.contains(CapRights::WRITE))", "            (base, true)"),
 ]
 
 

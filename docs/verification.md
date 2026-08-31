@@ -60,6 +60,33 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-08-31 (later) — the harness found one on its first expansion
+
+The mutation table started at ten entries, all in code this session had already been over. Widening
+it to the crates that predate that scrutiny — `abi`, `capabilities`, `sched`, `ipc`, `loader`,
+`hostcontract` — turned up a SURVIVOR immediately.
+
+**The loader's whole-phdr bounds check was covered by nothing.** Deleting `if ph_end > elf.len()`
+left every test green. It is not an equivalent mutant, and the difference is the interesting
+part: the per-field reads below it are individually bounds-checked, so a truncated program header
+whose `p_type` is still readable and is NOT `PT_LOAD` gets SKIPPED rather than rejected — the
+loader would accept a malformed image instead of refusing it. Every existing loader test fed it a
+well-formed ELF, so the branch had never been taken.
+
+A test now pins it, built so it can only fail for that reason: the first program header is a
+well-formed `PT_LOAD` mapping a zero page and needing no file bytes, and only the second runs off
+the end, with its four readable bytes set to exactly the non-`PT_LOAD` value that would be
+skipped. Eighteen mutations now, none surviving.
+
+Two smaller things the run is worth recording for:
+
+- My survey of "which crates have tests" said six of them had ZERO. That was a measurement
+  error — `grep -c` over a single-file glob prints a bare count, and the `awk -F:` summing it
+  read a field that was not there. Every crate has substantial tests. Checking before believing
+  a surprising number cost one command; acting on it would have cost a redesign.
+- One mutation was STALE because its pattern occurred twice. The harness refused it rather than
+  reporting a kill, which is the behaviour that makes the other seventeen results mean anything.
+
 ## 2026-08-31 — mutating the predicates on purpose instead of by accident
 
 Two vacuous tests have been found in this tree, both by accident: `Domain::contained` returned a
