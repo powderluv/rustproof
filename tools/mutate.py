@@ -84,6 +84,17 @@ MUTATIONS = [
     ("runstate: well_formed misses a sender parked beside a live receiver", "crates/runstate/src/lib.rs",
      "            if find_recv(slots, ep).is_some() {\n                return false;\n            }",
      "            if false {\n                return false;\n            }"),
+    ("vspace: map accepts an unaligned virtual address", "crates/vspace/src/lib.rs",
+     "        if !va.is_page_aligned() {", "        if false {"),
+    ("vspace: map walks THROUGH a huge page instead of refusing", "crates/vspace/src/lib.rs",
+     "                if entry.is_huge() {\n                    return Err(MapError::HugePagePresent);",
+     "                if false {\n                    return Err(MapError::HugePagePresent);"),
+    ("vspace: unmap treats a huge entry as a table", "crates/vspace/src/lib.rs",
+     "            if !entry.is_present() || entry.is_huge() {", "            if !entry.is_present() {"),
+    ("deleg: splice_out never re-parents a grandchild", "crates/deleg/src/lib.rs",
+     "                if out.live && out.parent == inc.child {", "                if false {"),
+    ("regions: a plan may free a region before unmapping it", "crates/regions/src/lib.rs",
+     "                        if r == region {", "                        if false {"),
 ]
 
 

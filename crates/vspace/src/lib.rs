@@ -605,6 +605,92 @@ mod tests {
         assert_eq!(space.unmap(va), None);
     }
 
+    /// A HUGE entry anywhere in the walk must be REFUSED, not walked through.
+    ///
+    /// Nothing in this tree ever SETS the huge bit — the kernel creates 4 KiB mappings only and
+    /// builds its tables from scratch — so both guards are unreachable through the public API
+    /// and were covered by nothing: `tools/mutate.py` deleted each in turn and the suite stayed
+    /// green. They are defensive, for the day a huge page arrives or a table this kernel did not
+    /// build is walked, and a defence nothing exercises is indistinguishable from one that is
+    /// absent. Constructing the state directly is the only way to test a check written for a
+    /// state the API cannot produce — the same reason `Domain::force_mapping` exists.
+    #[test]
+    fn a_huge_entry_in_the_walk_is_refused_rather_than_walked_through() {
+        let mut fa = MockAlloc::new(16);
+        let phys_offset = fa.phys_offset();
+        let pml4 = fa.alloc_frame().unwrap();
+        let mut space = AddressSpace::new(pml4, phys_offset);
+
+        let va = VirtAddr(0x0000_7F00_1234_5000);
+        let pa = fa.alloc_frame().unwrap();
+        let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER;
+
+        // Plant it at the top level of this address's walk.
+        let idx = ((va.as_u64() >> 39) & 0x1FF) as usize;
+        let huge = PageTableEntry::new(pa, PageFlags::PRESENT | PageFlags::HUGE);
+        // SAFETY: the mock allocator's frames live for the whole test and are reachable at
+        // `phys + phys_offset` — exactly how `AddressSpace` itself reaches them.
+        unsafe {
+            let table = (pml4.as_u64() + phys_offset) as *mut PageTableEntry;
+            core::ptr::write(table.add(idx), huge);
+        }
+
+        assert_eq!(
+            space.map(va, pa, flags, &mut fa),
+            Err(MapError::HugePagePresent),
+            "map walked through a huge entry instead of refusing it"
+        );
+    }
+
+    /// The same guard on the UNMAP side, and it needs a sharper setup than the one above.
+    ///
+    /// Asserting `unmap == None` against a huge entry planted at the TOP level passes whether
+    /// or not the guard is there: without it the walk descends into the entry's target frame,
+    /// finds it zeroed, and returns `None` anyway — the right answer for the wrong reason, in a
+    /// test written to catch exactly that. So the frame walked into has to hold a PRESENT leaf.
+    /// Here the huge bit is set on the last table entry of a mapping that already exists, so a
+    /// walk that ignores it lands on a real leaf and returns `Some`.
+    #[test]
+    fn unmap_refuses_a_huge_entry_rather_than_walking_into_a_live_table() {
+        let mut fa = MockAlloc::new(16);
+        let phys_offset = fa.phys_offset();
+        let pml4 = fa.alloc_frame().unwrap();
+        let mut space = AddressSpace::new(pml4, phys_offset);
+
+        let va = VirtAddr(0x0000_7F00_1234_5000);
+        let pa = fa.alloc_frame().unwrap();
+        let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER;
+        space.map(va, pa, flags, &mut fa).unwrap();
+        assert_eq!(
+            space.translate(va),
+            Some(pa),
+            "the mapping must exist first"
+        );
+
+        // SAFETY: every table below is a live mock frame reachable at `phys + phys_offset`,
+        // which is how `AddressSpace` reaches them too.
+        unsafe {
+            let read_e = |t: PhysAddr, i: usize| -> PageTableEntry {
+                core::ptr::read(((t.as_u64() + phys_offset) as *const PageTableEntry).add(i))
+            };
+            let pdpt = read_e(pml4, ((va.as_u64() >> 39) & 0x1FF) as usize).addr();
+            let pd = read_e(pdpt, ((va.as_u64() >> 30) & 0x1FF) as usize).addr();
+            let idx = ((va.as_u64() >> 21) & 0x1FF) as usize;
+            let e = read_e(pd, idx);
+            // Same address, HUGE now set: a walk that ignores the bit reaches the live leaf.
+            core::ptr::write(
+                ((pd.as_u64() + phys_offset) as *mut PageTableEntry).add(idx),
+                PageTableEntry::new(e.addr(), e.flags() | PageFlags::HUGE),
+            );
+        }
+
+        assert_eq!(
+            space.unmap(va),
+            None,
+            "unmap treated a huge entry as a table and walked into a live one"
+        );
+    }
+
     #[test]
     fn map_rejects_unaligned() {
         let mut fa = MockAlloc::new(8);

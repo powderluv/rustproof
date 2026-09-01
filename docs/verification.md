@@ -60,6 +60,34 @@ Scope reminder (do not re-litigate): the guarantee we verify is **isolation / DM
 
 ---
 
+## 2026-09-01 — a defence nothing exercises, and a test that passed for the wrong reason
+
+Five more mutations, into `vspace`, `deleg` and `regions`. Two survivors, both in `vspace`, and
+both the same underlying gap: **nothing in this tree ever sets the HUGE bit.** The kernel creates
+4 KiB mappings only and builds its tables from scratch, so `map`'s `HugePagePresent` refusal and
+`unmap`'s huge-entry check are unreachable through the public API — and were covered by nothing.
+
+They are not dead code. They are defences for the day a huge page arrives, or a table this kernel
+did not build is walked. But a defence nothing exercises is indistinguishable from one that is
+absent, so deleting them from the mutation table as "equivalent" would have been the wrong call:
+they can be tested, by constructing the state the API cannot produce. That is the same reasoning
+that gave `Domain::force_mapping` its existence.
+
+**Then the first test passed for the wrong reason.** Planting a huge entry at the TOP of the walk
+and asserting `unmap == None` is satisfied whether or not the guard is there: without it the walk
+descends into the entry's target frame, finds it zeroed, and returns `None` anyway. The right
+answer, arrived at by walking somewhere it should never have gone — in a test written to catch
+exactly that class of thing. The mutation caught it, because the mutant still survived.
+
+The second version sets the huge bit on the last table entry of a mapping that ALREADY EXISTS, so
+a walk that ignores the bit lands on a live leaf and returns `Some`. Both mutants die now.
+
+Twenty-nine mutations, none surviving, 231 tests. The pattern across three expansions is worth
+noting: every one has found something, and each was a different flavour — a bounds check no test
+reached, a bound tested only from far outside it, and now a guard against a state the API cannot
+produce. None of them was a bug in shipped behaviour. All of them were places where the tree
+believed something it had never checked.
+
 ## 2026-08-31 (third) — twenty-four mutations, and a boundary nobody had asked for
 
 Six more entries, into `abi`, `capabilities`, `iommu`, `mm` and `runstate`. One survivor, and it
