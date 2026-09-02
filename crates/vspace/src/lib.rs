@@ -374,11 +374,6 @@ impl AddressSpace {
         Some(pa)
     }
 
-    /// Translate `va` to a physical address by walking the tables. Handles 4 KiB
-    /// leaves and huge (2 MiB / 1 GiB) leaves; returns `None` if unmapped.
-    ///
-    // PROOF(later): `translate` reflects the last `map`/`unmap` on `va` — i.e.
-    // the concrete page-walk is a refinement of the abstract va→pa mapping.
     /// Flags of the leaf entry mapping `va`, or `None` if `va` is unmapped.
     ///
     /// The kernel uses this to check that a user pointer is not merely inside the user
@@ -403,6 +398,11 @@ impl AddressSpace {
         None
     }
 
+    /// Translate `va` to a physical address by walking the tables. Handles 4 KiB
+    /// leaves and huge (2 MiB / 1 GiB) leaves; returns `None` if unmapped.
+    //
+    // PROOF(later): `translate` reflects the last `map`/`unmap` on `va` — i.e.
+    // the concrete page-walk is a refinement of the abstract va→pa mapping.
     pub fn translate(&self, va: VirtAddr) -> Option<PhysAddr> {
         let mut table_pa = self.pml4;
         // Levels PML4=3, PDPT=2, PD=1, PT=0.

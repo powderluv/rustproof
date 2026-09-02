@@ -652,4 +652,92 @@ mod tests {
         // A successful translate + read confirms the leaf is present.
         assert_eq!(peek(&aspace, phys_offset, 0x40_0000), 9);
     }
+
+    /// The loader's W^X intent, read back off the leaf it actually installed.
+    ///
+    /// Every test above states its segment's permissions in a comment and then checks
+    /// only that the bytes arrived. `peek` goes through `translate`, which returns a
+    /// physical address and discards the flags — so a segment mapped executable when
+    /// it asked not to be, or writable when it asked not to be, read back identically.
+    /// `leaf_flags` is the observation that can tell those apart.
+    fn leaf_of(img: &[u8], seg: Seg, va: u64) -> PageFlags {
+        let mut fa = MockAlloc::new(16);
+        let phys_offset = fa.phys_offset();
+        let mut aspace = AddressSpace::create(phys_offset, &mut fa).unwrap();
+        let _ = seg;
+        load_elf(img, &mut aspace, &mut fa).expect("load ok");
+        aspace
+            .leaf_flags(VirtAddr(va))
+            .expect("segment should be mapped")
+    }
+
+    #[test]
+    fn a_code_segment_is_executable_and_not_writable() {
+        let seg = Seg {
+            vaddr: 0x40_0000,
+            offset: 0x1000,
+            filesz: 4,
+            memsz: 4,
+            flags: PF_X | 0x4, // R+X, no write
+        };
+        let img = make_elf(0x40_0000, &seg, &[1, 2, 3, 4]);
+        let f = leaf_of(&img, seg, 0x40_0000);
+        assert!(f.contains(PageFlags::PRESENT) && f.contains(PageFlags::USER));
+        assert!(
+            !f.contains(PageFlags::NO_EXEC),
+            "a PF_X segment must not be mapped no-execute"
+        );
+        assert!(
+            !f.contains(PageFlags::WRITABLE),
+            "a segment without PF_W must not be writable — W^X is the whole point"
+        );
+    }
+
+    #[test]
+    fn a_data_segment_is_writable_and_not_executable() {
+        let seg = Seg {
+            vaddr: 0x40_0000,
+            offset: 0x1000,
+            filesz: 4,
+            memsz: 4,
+            flags: PF_W | 0x4, // RW, not executable
+        };
+        let img = make_elf(0x40_0000, &seg, &[9, 8, 7, 6]);
+        let f = leaf_of(&img, seg, 0x40_0000);
+        assert!(
+            f.contains(PageFlags::WRITABLE),
+            "a PF_W segment must be writable"
+        );
+        assert!(
+            f.contains(PageFlags::NO_EXEC),
+            "a segment without PF_X must be mapped no-execute, or a data page is a code page"
+        );
+    }
+
+    #[test]
+    fn a_zero_length_segment_at_an_unaligned_address_maps_nothing() {
+        // `p_memsz == 0` returns early. Without that early return the page walk starts at
+        // `p_vaddr & !0xfff`, which for an UNALIGNED vaddr is strictly below `seg_end_va`
+        // — so the loop runs once and an empty segment quietly gets a frame and a mapping.
+        // Aligned vaddrs cannot see this: there the loop is empty either way.
+        let seg = Seg {
+            vaddr: 0x40_0004,
+            offset: 0x1000,
+            filesz: 0,
+            memsz: 0,
+            flags: PF_W | 0x4,
+        };
+        let img = make_elf(0x40_0004, &seg, &[]);
+        let mut fa = MockAlloc::new(16);
+        let phys_offset = fa.phys_offset();
+        let mut aspace = AddressSpace::create(phys_offset, &mut fa).unwrap();
+        let before = fa.next;
+        load_elf(&img, &mut aspace, &mut fa).expect("load ok");
+        assert_eq!(
+            aspace.translate(VirtAddr(0x40_0000)),
+            None,
+            "an empty segment must not map the page its unaligned vaddr sits in"
+        );
+        assert_eq!(fa.next, before, "an empty segment must not consume a frame");
+    }
 }

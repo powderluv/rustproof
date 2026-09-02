@@ -95,6 +95,22 @@ MUTATIONS = [
      "                if out.live && out.parent == inc.child {", "                if false {"),
     ("regions: a plan may free a region before unmapping it", "crates/regions/src/lib.rs",
      "                        if r == region {", "                        if false {"),
+    # --- fourth expansion: the syscall clamps, the ELF segment guards, the run-state verdict ---
+    ("hostcontract: DEBUG_WRITE's output cap is not a cap", "crates/hostcontract/src/lib.rs",
+     "    let total = len.min(DEBUG_MAX_TOTAL);", "    let total = len.max(DEBUG_MAX_TOTAL);"),
+    ("loader: p_filesz > p_memsz copies past the segment", "crates/loader/src/lib.rs",
+     "    let copy_end_va = file_end_va.min(seg_end_va);",
+     "    let copy_end_va = file_end_va.max(seg_end_va);"),
+    ("loader: a non-executable segment is mapped executable", "crates/loader/src/lib.rs",
+     "    if p_flags & PF_X == 0 {", "    if p_flags & PF_X != 0 {"),
+    ("loader: a read-only segment is mapped writable", "crates/loader/src/lib.rs",
+     "    if p_flags & PF_W != 0 {", "    if p_flags & PF_W == 0 {"),
+    ("loader: a zero-length segment is mapped anyway", "crates/loader/src/lib.rs",
+     "    if p_memsz == 0 {\n        return Ok(());", "    if false {\n        return Ok(());"),
+    ("runstate: a live-but-unparked state reports Park, not Deadlock", "crates/runstate/src/lib.rs",
+     "    } else if any_live {\n        Next::Deadlock", "    } else if any_live {\n        Next::Park"),
+    ("sched: remove() compacts one slot short (a stale duplicate survives)", "crates/sched/src/lib.rs",
+     "        for i in idx..self.len - 1 {", "        for i in idx + 1..self.len - 1 {"),
 ]
 
 
