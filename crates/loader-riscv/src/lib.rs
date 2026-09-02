@@ -609,4 +609,129 @@ mod tests {
         // A successful translate + read confirms the leaf is present.
         assert_eq!(peek(&aspace, phys_offset, 0x40_0000), 9);
     }
+
+    /// These four mirror `crates/loader`. The riscv side had the same GUARDS -- they were
+    /// kept in sync -- but none of the tests, so nothing had ever asked whether its
+    /// truncated-header rejection, its empty-segment early return or its W^X mapping
+    /// could fail. The mutation table reached only x86 until now.
+    #[test]
+    fn rejects_a_program_header_running_past_the_image() {
+        let mut img = vec![0u8; EHDR_SIZE + PHDR_SIZE + 4];
+        img[0..4].copy_from_slice(&ELF_MAGIC);
+        img[EI_CLASS] = ELFCLASS64;
+        img[5] = 1;
+        img[6] = 1;
+        img[OFF_E_TYPE..OFF_E_TYPE + 2].copy_from_slice(&ET_EXEC.to_le_bytes());
+        img[OFF_E_MACHINE..OFF_E_MACHINE + 2].copy_from_slice(&EM_RISCV.to_le_bytes());
+        img[20..24].copy_from_slice(&1u32.to_le_bytes());
+        img[OFF_E_ENTRY..OFF_E_ENTRY + 8].copy_from_slice(&0x1000u64.to_le_bytes());
+        img[OFF_E_PHOFF..OFF_E_PHOFF + 8].copy_from_slice(&(EHDR_SIZE as u64).to_le_bytes());
+        img[52..54].copy_from_slice(&(EHDR_SIZE as u16).to_le_bytes());
+        img[OFF_E_PHENTSIZE..OFF_E_PHENTSIZE + 2]
+            .copy_from_slice(&(PHDR_SIZE as u16).to_le_bytes());
+        // TWO headers declared; the image holds one and four bytes of the next.
+        img[OFF_E_PHNUM..OFF_E_PHNUM + 2].copy_from_slice(&2u16.to_le_bytes());
+
+        let p = EHDR_SIZE;
+        img[p + OFF_P_TYPE..p + OFF_P_TYPE + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        img[p + OFF_P_FLAGS..p + OFF_P_FLAGS + 4].copy_from_slice(&4u32.to_le_bytes()); // R
+        img[p + OFF_P_OFFSET..p + OFF_P_OFFSET + 8].copy_from_slice(&0u64.to_le_bytes());
+        img[p + OFF_P_VADDR..p + OFF_P_VADDR + 8].copy_from_slice(&0x1000u64.to_le_bytes());
+        img[p + 24..p + 32].copy_from_slice(&0x1000u64.to_le_bytes());
+        img[p + OFF_P_FILESZ..p + OFF_P_FILESZ + 8].copy_from_slice(&0u64.to_le_bytes());
+        img[p + OFF_P_MEMSZ..p + OFF_P_MEMSZ + 8].copy_from_slice(&PAGE_SIZE.to_le_bytes());
+        img[p + 48..p + 56].copy_from_slice(&PAGE_SIZE.to_le_bytes());
+
+        // The four readable bytes of the second header say "not PT_LOAD" -- exactly the
+        // value that gets skipped rather than rejected once the guard is gone.
+        let q = EHDR_SIZE + PHDR_SIZE;
+        img[q..q + 4].copy_from_slice(&(PT_LOAD + 1).to_le_bytes());
+
+        let (mut fa, mut aspace) = fresh_space();
+        assert_eq!(
+            load_elf(&img, &mut aspace, &mut fa),
+            Err(LoadError::Truncated),
+            "a header declared but not present must be rejected, not skipped"
+        );
+    }
+
+    /// On riscv permissions are POSITIVE (`R`/`W`/`X` bits present on the leaf), where x86
+    /// spells the same policy as an absence (`NO_EXEC`). Both are read back off the leaf
+    /// the loader actually installed -- `translate` returns a PhysAddr and discards them.
+    fn leaf_of(img: &[u8], va: u64) -> PageFlags {
+        let mut fa = MockAlloc::new(16);
+        let phys_offset = fa.phys_offset();
+        let mut aspace = AddressSpace::create(phys_offset, &mut fa).unwrap();
+        load_elf(img, &mut aspace, &mut fa).expect("load ok");
+        aspace
+            .leaf_flags(VirtAddr(va))
+            .expect("segment should be mapped")
+    }
+
+    #[test]
+    fn a_code_segment_is_executable_and_not_writable() {
+        let seg = Seg {
+            vaddr: 0x40_0000,
+            offset: 0x1000,
+            filesz: 4,
+            memsz: 4,
+            flags: PF_X | 0x4, // R+X, no write
+        };
+        let img = make_elf(0x40_0000, &seg, &[1, 2, 3, 4]);
+        let f = leaf_of(&img, 0x40_0000);
+        assert!(f.contains(PageFlags::V) && f.contains(PageFlags::U));
+        assert!(
+            f.contains(PageFlags::X),
+            "a PF_X segment must be mapped executable"
+        );
+        assert!(
+            !f.contains(PageFlags::W),
+            "a segment without PF_W must not be writable -- W^X is the whole point"
+        );
+    }
+
+    #[test]
+    fn a_data_segment_is_writable_and_not_executable() {
+        let seg = Seg {
+            vaddr: 0x40_0000,
+            offset: 0x1000,
+            filesz: 4,
+            memsz: 4,
+            flags: PF_W | 0x4, // RW, not executable
+        };
+        let img = make_elf(0x40_0000, &seg, &[9, 8, 7, 6]);
+        let f = leaf_of(&img, 0x40_0000);
+        assert!(f.contains(PageFlags::W), "a PF_W segment must be writable");
+        assert!(
+            !f.contains(PageFlags::X),
+            "a segment without PF_X must not be executable, or a data page is a code page"
+        );
+    }
+
+    #[test]
+    fn a_zero_length_segment_at_an_unaligned_address_maps_nothing() {
+        // `p_memsz == 0` returns early. Without it the page walk starts at
+        // `p_vaddr & !0xfff`, which for an UNALIGNED vaddr is strictly below `seg_end_va`
+        // -- so the loop runs once and an empty segment quietly gets a frame and a mapping.
+        // Aligned vaddrs cannot see this: there the loop is empty either way.
+        let seg = Seg {
+            vaddr: 0x40_0004,
+            offset: 0x1000,
+            filesz: 0,
+            memsz: 0,
+            flags: PF_W | 0x4,
+        };
+        let img = make_elf(0x40_0004, &seg, &[]);
+        let mut fa = MockAlloc::new(16);
+        let phys_offset = fa.phys_offset();
+        let mut aspace = AddressSpace::create(phys_offset, &mut fa).unwrap();
+        let before = fa.next;
+        load_elf(&img, &mut aspace, &mut fa).expect("load ok");
+        assert_eq!(
+            aspace.translate(VirtAddr(0x40_0000)),
+            None,
+            "an empty segment must not map the page its unaligned vaddr sits in"
+        );
+        assert_eq!(fa.next, before, "an empty segment must not consume a frame");
+    }
 }

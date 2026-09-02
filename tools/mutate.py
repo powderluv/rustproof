@@ -111,6 +111,30 @@ MUTATIONS = [
      "    } else if any_live {\n        Next::Deadlock", "    } else if any_live {\n        Next::Park"),
     ("sched: remove() compacts one slot short (a stale duplicate survives)", "crates/sched/src/lib.rs",
      "        for i in idx..self.len - 1 {", "        for i in idx + 1..self.len - 1 {"),
+    # --- fifth expansion: riscv64 is a supported architecture and the table had NEVER
+    # --- touched it. Its crates are in the host suite, so they are TESTED; nothing had
+    # --- ever asked whether those tests can FAIL. Same shape as CI never running FIRMWARE=1.
+    ("loader-riscv: a program header may run past the image", "crates/loader-riscv/src/lib.rs",
+     "        if ph_end > elf.len() {", "        if false {"),
+    ("loader-riscv: p_filesz > p_memsz copies past the segment", "crates/loader-riscv/src/lib.rs",
+     "    let copy_end_va = file_end_va.min(seg_end_va);",
+     "    let copy_end_va = file_end_va.max(seg_end_va);"),
+    ("loader-riscv: a zero-length segment is mapped anyway", "crates/loader-riscv/src/lib.rs",
+     "    if p_memsz == 0 {\n        return Ok(());", "    if false {\n        return Ok(());"),
+    ("loader-riscv: a non-executable segment is mapped executable", "crates/loader-riscv/src/lib.rs",
+     "    if p_flags & PF_X != 0 {", "    if p_flags & PF_X == 0 {"),
+    ("loader-riscv: a read-only segment is mapped writable", "crates/loader-riscv/src/lib.rs",
+     "    if p_flags & PF_W != 0 {", "    if p_flags & PF_W == 0 {"),
+    ("vspace-riscv: map accepts an unaligned virtual address", "crates/vspace-riscv/src/lib.rs",
+     "        if !va.is_page_aligned() {\n            return Err(MapError::UnalignedVirt);",
+     "        if false {\n            return Err(MapError::UnalignedVirt);"),
+    ("vspace-riscv: a leaf with no R/W/X is written (it decodes as a POINTER)",
+     "crates/vspace-riscv/src/lib.rs",
+     "        if !flags.intersects(PageFlags::RWX) {", "        if false {"),
+    ("vspace-riscv: map walks THROUGH a superpage instead of refusing",
+     "crates/vspace-riscv/src/lib.rs",
+     "                if entry.is_leaf() {\n                    return Err(MapError::SuperpagePresent);",
+     "                if false {\n                    return Err(MapError::SuperpagePresent);"),
 ]
 
 

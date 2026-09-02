@@ -807,4 +807,40 @@ mod tests {
         );
         assert_eq!((satp >> 44) & 0xffff, 0, "ASID field == 0");
     }
+
+    /// A superpage in the walk must be REFUSED, not walked through.
+    ///
+    /// Nothing in this tree ever creates one -- the kernel maps 4 KiB pages and builds its
+    /// tables from scratch -- so this guard is unreachable through the public API and was
+    /// covered by nothing. That does not make it dead code: it is the defence for the day a
+    /// superpage arrives or a foreign table is walked, and a defence nothing exercises is
+    /// indistinguishable from one that is absent. So construct the state the API cannot
+    /// produce. (On riscv a superpage is simply a leaf -- any of R/W/X -- at level 2 or 1.)
+    #[test]
+    fn a_superpage_in_the_walk_is_refused_rather_than_walked_through() {
+        let mut fa = MockAlloc::new(16);
+        let phys_offset = fa.phys_offset();
+        let root = fa.alloc_frame().unwrap();
+        let mut space = AddressSpace::new(root, phys_offset);
+
+        let va = VirtAddr(0x0000_003F_1234_5000);
+        let pa = fa.alloc_frame().unwrap();
+        let flags = PageFlags::V | PageFlags::R | PageFlags::W | PageFlags::U;
+
+        // Plant a level-2 leaf on this address's path: V + R/W/X makes it a superpage.
+        let idx = va.table_index(2);
+        let superpage = Pte::new(pa, PageFlags::V | PageFlags::R | PageFlags::W);
+        // SAFETY: the mock allocator's frames live for the whole test and are reachable at
+        // `phys + phys_offset` — exactly how `AddressSpace` itself reaches them.
+        unsafe {
+            let table = (root.as_u64() + phys_offset) as *mut Pte;
+            core::ptr::write(table.add(idx), superpage);
+        }
+
+        assert_eq!(
+            space.map(va, pa, flags, &mut fa),
+            Err(MapError::SuperpagePresent),
+            "map walked through a superpage instead of refusing it"
+        );
+    }
 }
