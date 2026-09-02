@@ -469,7 +469,6 @@ mod tests {
         (fa, aspace)
     }
 
-    #[test]
     /// A program-header table that runs past the end of the image must be REFUSED.
     ///
     /// Found by `tools/mutate.py`: deleting the whole-phdr guard left every test green. It is

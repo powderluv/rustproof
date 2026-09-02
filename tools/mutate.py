@@ -16,6 +16,7 @@ Usage:  tools/mutate.py            # run them all
         tools/mutate.py <substr>   # only mutations whose label contains <substr>
 """
 
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -155,8 +156,21 @@ def main() -> int:
     print("baseline: ", end="", flush=True)
     if not run_suite():
         print("the suite FAILS before any mutation — fix that first")
+        print("  (if a previous sweep was interrupted, the tree may still hold a mutation:")
+        print("   check `git diff` on the crates this table names)")
         return 2
     print("suite passes")
+
+    # `finally` below restores the source -- but only if the interpreter gets to run it.
+    # A SIGTERM (what `timeout` sends, and what killed a sweep of mine mid-mutation) ends the
+    # process without unwinding, leaving a MUTATED tree behind: `capabilities::revoke` sat at
+    # `cap.0 >= N + 1` in the working tree afterwards, and the next commit would have shipped
+    # it. Turn the signal into an exception so the restore path runs.
+    def _unwind(signum, _frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    signal.signal(signal.SIGTERM, _unwind)
+    signal.signal(signal.SIGINT, _unwind)
 
     survivors, stale = [], []
     for label, rel, find, repl in picked:

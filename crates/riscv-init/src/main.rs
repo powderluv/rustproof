@@ -128,6 +128,13 @@ fn map_bar(cap: CapId, bar: u64) -> Result<MapBarResp, u64> {
 }
 
 /// Terminate this process with `code`. Never returns.
+fn yield_now() {
+    // SAFETY: YIELD takes no arguments and touches no user memory.
+    unsafe {
+        syscall(sysno::YIELD, 0, 0, 0, 0, 0);
+    }
+}
+
 fn exit(code: u64) -> ! {
     // SAFETY: EXIT does not return to user mode.
     unsafe {
@@ -1034,15 +1041,31 @@ fn compute(id: u64) -> ! {
     // clear another's" was true purely because there was no other line. The timer has been
     // firing throughout; the console has not fired at all. So CapId(7) must read ZERO while
     // CapId(6) reads a real count, and neither may drain the other.
-    let ticks = poll_irq(6);
+    //
+    // The claim has a PREMISE: the timer must actually have fired. With `ticks == 0` there is
+    // nothing for the console line to have leaked FROM, so a verdict of "leaked" then accuses
+    // the kernel of contamination when the only observation is a quiet line. Wait (yielding)
+    // for the premise, and let the leak verdict rest on the one thing that IS a violation —
+    // a nonzero count on a line that never fired.
+    let mut ticks = poll_irq(6);
+    let mut w = 0u64;
+    while ticks == 0 && w < 4_000 {
+        yield_now();
+        ticks = poll_irq(6);
+        w = w.wrapping_add(1);
+    }
     let bytes = poll_irq(7);
     tag(id);
-    if ticks > 0 && ticks != syserr::NO_CAP && bytes == 0 {
-        debug_write(b"irq: two lines stay separate (timer counted, console still quiet)\n");
-    } else if bytes == syserr::NO_CAP {
+    if bytes == syserr::NO_CAP {
         debug_write(b"irq: no authority for the console line (bug)\n");
-    } else {
+    } else if bytes != 0 {
         debug_write(b"irq: one line's count leaked into the other (bug)\n");
+    } else if ticks > 0 && ticks != syserr::NO_CAP {
+        debug_write(b"irq: two lines stay separate (timer counted, console still quiet)\n");
+    } else {
+        debug_write(
+            b"irq: the timer line never fired, so separation was untested (inconclusive)\n",
+        );
     }
 
     // A BOUNDED wait, built from what already exists rather than from a new syscall.
@@ -1239,19 +1262,24 @@ fn child(id: u64) -> ! {
         // only go away because the REVOKE tore it down.
         let mut gone = false;
         let mut k = 0u64;
-        while k < 90 {
+        while k < 4_000 {
             if mapped_probe(rva) != syserr::OK {
                 gone = true;
                 break;
             }
-            spin(2_000_000);
+            // YIELD, not spin: this is a wait on the OWNER, and burning the quantum of the
+            // process being waited for makes the budget measure contention instead of progress.
+            yield_now();
             k = k.wrapping_add(1);
         }
         tag(id);
         if gone {
             debug_write(b"share: REVOKE alone tore the window down\n");
         } else {
-            debug_write(b"share: kept the window after revocation (bug)\n");
+            // Not "the window survived revocation" — the owner may simply not have revoked
+            // yet. A scheduling timeout is not a containment defect; the runner turns this
+            // into a FAIL with an accurate message.
+            debug_write(b"share: the owner had not revoked within our budget (inconclusive)\n");
         }
         exit(id);
     }
@@ -1309,12 +1337,13 @@ fn child(id: u64) -> ! {
         // otherwise the authority survives its capability. Watch for it to vanish.
         let mut gone = false;
         let mut k = 0u64;
-        while k < 60 {
+        while k < 4_000 {
             if mapped_probe(r.user_va) != syserr::OK {
                 gone = true;
                 break;
             }
-            spin(2_000_000);
+            // YIELD, not spin — see the owner-revocation wait above.
+            yield_now();
             k = k.wrapping_add(1);
         }
         debug_write(b"\n");
@@ -1322,7 +1351,7 @@ fn child(id: u64) -> ! {
         if gone {
             debug_write(b"mmio: mapping torn down when the cap was REVOKED\n");
         } else {
-            debug_write(b"mmio: mapping survived revocation (bug)\n");
+            debug_write(b"mmio: the parent had not revoked within our budget (inconclusive)\n");
         }
         // Deliberately fault. A wild pointer is OUR bug, not the machine's: the kernel must
         // kill this process and keep running, and the boot must still reach BOOT OK. If a
@@ -1405,7 +1434,7 @@ fn child(id: u64) -> ! {
         let mut revoked = false;
         let mut exhausted = false;
         let mut i = 0u64;
-        while i < 60 {
+        while i < 4_000 {
             let c = make_region(0, 1);
             if c == syserr::NO_CAP {
                 revoked = true;
@@ -1416,20 +1445,31 @@ fn child(id: u64) -> ! {
                 break;
             }
             free_region(c);
-            spin(2_000_000);
+            // YIELD, not spin: this waits on the PARENT to revoke, and burning the quantum of
+            // the process being waited for makes the budget measure contention, not progress.
+            yield_now();
             i = i.wrapping_add(1);
         }
         if exhausted {
             tag(id);
-            debug_write(b"revoke: could not test revocation -- out of regions (bug)\n");
+            // Running out of region slots is a fact about this interleaving, not a defect —
+            // and it means the loop never got to OBSERVE a revocation, so the verdict below
+            // must not claim one way or the other.
+            debug_write(
+                b"revoke: out of region slots, so revocation was never tested (inconclusive)\n",
+            );
         }
         // DA3: the refusal must be exactly NO_CAP. That holds only because the capability
         // gate precedes the quota check in the kernel, an ordering nothing else pins.
         tag(id);
         if revoked {
             debug_write(b"revoke: delegated cap REVOKED by parent (no longer usable)\n");
+        } else if exhausted {
+            // Already reported above; saying "still usable after revoke" here would be a
+            // fabrication — the loop stopped before it could see a revocation at all.
         } else {
-            debug_write(b"revoke: delegated cap still usable after revoke (bug)\n");
+            // Not "the cap survived revocation" — the parent may simply not have revoked yet.
+            debug_write(b"revoke: the parent had not revoked within our budget (inconclusive)\n");
         }
 
         // DA2 continued: the region we minted BEFORE the revoke must still be ours, still

@@ -114,6 +114,19 @@ fi
 # each process, so losing the tail of a demo fails the run.
 # Scoped off under PROVOKE_FAULT, which kills the guest long before the demo gets here —
 # the same scoping the clock gate above needs, and for the same reason.
+# The revocation checks are a WAIT: the child polls until the owner revokes. A timeout is a
+# scheduling fact, not a violation, and the demo says so instead of accusing the kernel — so the
+# RUNNER is what turns an inconclusive run into a failure, with an accurate message. Without
+# this gate the demo's honest "inconclusive" would simply PASS, which is worse than the "(bug)"
+# it replaced: a check that cannot fail, wearing the words of one that can.
+if [ "${PROVOKE_FAULT:-0}" != "1" ] && echo "$OUT" | grep -q 'inconclusive'; then
+    echo "RESULT: FAIL — a check never observed the condition it was waiting for:"
+    echo "$OUT" | grep -a 'inconclusive' | sed 's/^/    /'
+    echo "  (this is a scheduling or resource outcome, not a containment defect — raise the"
+    echo "   budget, or find out why the process being waited for is not making progress)"
+    exit 1
+fi
+
 for want in 'share: a WRITABLE borrower still cannot destroy what it borrowed'; do
     if [ "${PROVOKE_FAULT:-0}" != "1" ] && ! echo "$OUT" | grep -qF "$want"; then
         echo "RESULT: FAIL — a required assertion never ran: $want"
