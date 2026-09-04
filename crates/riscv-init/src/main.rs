@@ -350,6 +350,14 @@ fn free_region(cap: u64) -> u64 {
 /// whether the page is still present and user-readable. (It emits that byte to the console,
 /// which is why the probe is one byte of the device signature.)
 fn mapped_probe(va: u64) -> u64 {
+    // NOTE: this PRINTS. Asking DEBUG_WRITE for one byte is how we get the kernel to validate
+    // an address without faulting, but the byte reaches the console -- so a probe loop emits
+    // one character per iteration, of whatever lives at `va`. A wait on the shared region
+    // therefore prints a run of 'R's, the first byte of "RUSTPROOF-SHARED". That run is
+    // legitimate output, not corruption: it cost a wrong diagnosis once, when a budget raised
+    // from 90 to 4000 turned a short run into a 4000-byte one and it got mistaken for a
+    // damaged console stream. Keep probe budgets modest for this reason.
+    //
     // SAFETY: the kernel validates `va` itself; a bad address returns FAULT, not a fault.
     unsafe { syscall(sysno::DEBUG_WRITE, va, 1, 0, 0, 0) }
 }
@@ -1049,7 +1057,7 @@ fn compute(id: u64) -> ! {
     // a nonzero count on a line that never fired.
     let mut ticks = poll_irq(6);
     let mut w = 0u64;
-    while ticks == 0 && w < 4_000 {
+    while ticks == 0 && w < 400 {
         yield_now();
         ticks = poll_irq(6);
         w = w.wrapping_add(1);
@@ -1262,7 +1270,7 @@ fn child(id: u64) -> ! {
         // only go away because the REVOKE tore it down.
         let mut gone = false;
         let mut k = 0u64;
-        while k < 4_000 {
+        while k < 400 {
             if mapped_probe(rva) != syserr::OK {
                 gone = true;
                 break;
@@ -1337,7 +1345,7 @@ fn child(id: u64) -> ! {
         // otherwise the authority survives its capability. Watch for it to vanish.
         let mut gone = false;
         let mut k = 0u64;
-        while k < 4_000 {
+        while k < 400 {
             if mapped_probe(r.user_va) != syserr::OK {
                 gone = true;
                 break;
@@ -1434,7 +1442,7 @@ fn child(id: u64) -> ! {
         let mut revoked = false;
         let mut exhausted = false;
         let mut i = 0u64;
-        while i < 4_000 {
+        while i < 400 {
             let c = make_region(0, 1);
             if c == syserr::NO_CAP {
                 revoked = true;

@@ -648,6 +648,11 @@ fn free_region(cap: u64) -> u64 {
 /// whether the page is still present and user-readable. (It emits that byte to the console,
 /// which is why the probe is one byte of the device signature.)
 fn mapped_probe(va: u64) -> u64 {
+    // NOTE: this PRINTS. Asking DEBUG_WRITE for one byte is how we get the kernel to validate
+    // an address without faulting, but the byte reaches the console -- so a probe loop emits
+    // one character per iteration, of whatever lives at `va`. See the riscv twin for the
+    // wrong diagnosis this caused once. Keep probe budgets modest for this reason.
+    //
     // SAFETY: the kernel validates `va` itself; a bad address returns FAULT, not a fault.
     unsafe { syscall2(sysno::DEBUG_WRITE, va, 1) }
 }
@@ -1788,7 +1793,7 @@ fn child(id: u64) -> ! {
         // only go away because the REVOKE tore it down.
         let mut gone = false;
         let mut k = 0u64;
-        while k < 4_000 {
+        while k < 400 {
             if mapped_probe(rva) != syserr::OK {
                 gone = true;
                 break;
@@ -1862,7 +1867,7 @@ fn child(id: u64) -> ! {
         // otherwise the authority survives its capability. Watch for it to vanish.
         let mut gone = false;
         let mut k = 0u64;
-        while k < 4_000 {
+        while k < 400 {
             if mapped_probe(r.user_va) != syserr::OK {
                 gone = true;
                 break;
@@ -1957,7 +1962,7 @@ fn child(id: u64) -> ! {
         let mut revoked = false;
         let mut exhausted = false;
         let mut i = 0u64;
-        while i < 4_000 {
+        while i < 400 {
             let c = make_region(0, 1);
             if c == syserr::NO_CAP {
                 revoked = true;
