@@ -1497,8 +1497,25 @@ fn child(id: u64) -> ! {
         // and this is what makes it ONE story rather than two. A grandchild spawned BEFORE
         // the revoke keeps running (its own tagged output is the evidence), exactly as a
         // region minted before it stays alive.
+        //
+        // This claim has the same PREMISE as the one above: the cap must actually have been
+        // revoked. Run unguarded it lies in BOTH directions — with no revocation yet, a
+        // successful spawn is reported as "still allowed through a revoked cap" (an
+        // accusation the run has not earned) and a failed one as "also refuses SPAWN" (a
+        // confirmation it has not earned either). Observed at ICOUNT=6, where all four
+        // processes printed "had not revoked within our budget" and then made this claim
+        // anyway, one of them as a "(bug)".
+        //
+        // Note what the positive branch can and cannot say: SPAWN returns `u64::MAX` for
+        // EVERY failure — no authority, undeliverable delegation, full ledger, no free
+        // process slot — so a refusal here is consistent with the revocation but not
+        // attributable to it. Distinguishing them needs a distinct errno from the ABI.
         tag(id);
-        if spawn(0) == u64::MAX {
+        if !revoked {
+            debug_write(
+                b"revoke: never observed the revoke, so SPAWN was untested (inconclusive)\n",
+            );
+        } else if spawn(0) == u64::MAX {
             debug_write(b"revoke: the same revoked cap also refuses SPAWN (one story, not two)\n");
         } else {
             debug_write(b"revoke: SPAWN still allowed through a revoked cap (bug)\n");
