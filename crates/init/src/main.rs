@@ -30,7 +30,7 @@
 //! pointers handed to the kernel are addresses of stack locals passed as syscall
 //! out-buffers, plus `&'static` bytes passed to DEBUG_WRITE.
 
-use abi::{syserr, sysno, CapId, GpuInfo, MapBarResp, REGION_QUOTA};
+use abi::{spawnerr, syserr, sysno, CapId, GpuInfo, MapBarResp, REGION_QUOTA};
 
 // ----------------------------------------------------------------- syscall stubs
 //
@@ -892,7 +892,7 @@ fn compute(id: u64) -> ! {
         // the idle path has, which is how it went unexercised for this long.
         let helper = spawn_delegating(2, 6, 0b001);
         tag(id);
-        if helper == u64::MAX {
+        if spawnerr::failed(helper) {
             dw!(b"irq: could NOT spawn the interrupt helper (bug)\n");
         } else {
             dw!(b"irq: spawned an interrupt helper -> pid ");
@@ -942,7 +942,7 @@ fn compute(id: u64) -> ! {
         let reader = spawn_delegating(2, rcap, 0b001); // READ only
         let writer = spawn_delegating(2, mbox, 0b011); // READ|WRITE
         tag(id);
-        if reader == u64::MAX || writer == u64::MAX {
+        if spawnerr::failed(reader) || spawnerr::failed(writer) {
             dw!(b"share: could not spawn the borrowers (bug)\n");
         } else {
             dw!(b"share: lent one region READ-only and one READ-WRITE\n");
@@ -1394,8 +1394,14 @@ fn compute(id: u64) -> ! {
         dw!(b"caps: region via WRITE-less Untyped ALLOWED (bug)\n");
     }
     tag(id);
-    if spawn(4) == u64::MAX {
+    // Three outcomes, not two. Refused for lack of authority is the claim; refused for a
+    // different reason (an exhausted process table) is NOT a violation and must not be
+    // reported as one; a pid coming back is the violation.
+    let s4 = spawn(4);
+    if s4 == spawnerr::NO_CAP {
         dw!(b"caps: spawn via WRITE-less Untyped -> refused\n");
+    } else if spawnerr::failed(s4) {
+        dw!(b"caps: spawn refused, but not on authority, so nothing was tested (inconclusive)\n");
     } else {
         dw!(b"caps: spawn via WRITE-less Untyped ALLOWED (bug)\n");
     }
@@ -1506,7 +1512,7 @@ fn compute(id: u64) -> ! {
         // faulting process. Printing the u64::MAX sentinel as a pid, as this used to, meant
         // a boot that silently tested four fewer things still said BOOT OK. On riscv it did
         // exactly that.
-        if late == u64::MAX {
+        if spawnerr::failed(late) {
             dw!(b"late spawn into a recycled slot REFUSED -- no free process slot (bug)\n");
         } else {
             dw!(b"late spawn into a recycled slot -> pid ");
@@ -1922,7 +1928,7 @@ fn child(id: u64) -> ! {
     if have {
         let g = spawn_delegating(0, 0, 0b111);
         tag(id);
-        if g == u64::MAX {
+        if g == spawnerr::NO_SLOT {
             dw!(b"deleg: no free slot to pass it on\n");
         } else {
             dw!(b"deleg: passed our cap on to pid ");
@@ -2019,12 +2025,20 @@ fn child(id: u64) -> ! {
         // and this is what makes it ONE story rather than two. A grandchild spawned BEFORE
         // the revoke keeps running (its own tagged output is the evidence), exactly as a
         // region minted before it stays alive.
+        let mut spawn0 = 0u64;
         tag(id);
         if !revoked {
             // Nothing has been revoked yet, so a spawn succeeding says nothing.
             dw!(b"revoke: no revocation observed, so the SPAWN half is inconclusive\n");
-        } else if spawn(0) == u64::MAX {
+        } else if {
+            // Attempted only on this path: a spawn costs a process slot, and the branch
+            // above has not established the premise that would make spending one meaningful.
+            spawn0 = spawn(0);
+            spawn0 == spawnerr::NO_CAP
+        } {
             dw!(b"revoke: the same revoked cap also refuses SPAWN (one story, not two)\n");
+        } else if spawnerr::failed(spawn0) {
+            dw!(b"revoke: SPAWN refused, but not on authority, so nothing was tested (inconclusive)\n");
         } else {
             dw!(b"revoke: SPAWN still allowed through a revoked cap (bug)\n");
         }

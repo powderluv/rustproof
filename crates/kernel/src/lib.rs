@@ -4499,15 +4499,24 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
             // Load the embedded image into a free slot, add it to the run queue, and return
             // the child's id (or u64::MAX on failure). The spawner keeps running (CURRENT
             // unchanged).
-            let free = if authorized && deleg_ok {
-                (0..MAX_PROCS).find(|&i| proc_at(i).state == ProcState::Free)
+            // Three different refusals, and a single sentinel made them indistinguishable
+            // from outside: "a WRITE-less Untyped cannot spawn" read exactly the same as
+            // "the process table is full". Name the reason so a refusal is evidence of what
+            // the caller claimed, not merely consistent with it.
+            let free: Result<usize, u64> = if !authorized {
+                Err(abi::spawnerr::NO_CAP)
+            } else if !deleg_ok {
+                Err(abi::spawnerr::NO_DELEGATE)
             } else {
-                None
+                match (0..MAX_PROCS).find(|&i| proc_at(i).state == ProcState::Free) {
+                    Some(slot) => Ok(slot),
+                    None => Err(abi::spawnerr::NO_SLOT),
+                }
             };
             let elf = *core::ptr::addr_of!(USER_ELF);
             let ktoken = *core::ptr::addr_of!(KTOKEN);
             let ret = match free {
-                Some(slot) => {
+                Ok(slot) => {
                     // A spawned process gets `Role::Child` — an EMPTY grant table — chosen
                     // HERE rather than derived from the slot. Slots are recycled, so
                     // `boot_role(slot)` would hand a child the exited occupant's authority
@@ -4558,10 +4567,10 @@ pub unsafe fn syscall_trap<A: Arch>(frame: *mut u64) -> ! {
                         );
                         child_id
                     } else {
-                        u64::MAX
+                        abi::spawnerr::NO_MEM
                     }
                 }
-                None => u64::MAX,
+                Err(why) => why,
             };
             A::frame_set_ret(&mut f, ret);
         }

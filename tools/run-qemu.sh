@@ -535,10 +535,10 @@ fi
 # scheduling fact, not a violation, and the demo now says so instead of accusing the kernel — so
 # the RUNNER is what turns an inconclusive run into a failure, with an accurate message.
 if [ "${PROVOKE_FAULT:-0}" != "1" ] && echo "$OUT" | grep -q 'inconclusive'; then
-    echo "RESULT: FAIL — a revocation check never observed the revoke it was waiting for:"
+    echo "RESULT: FAIL — a check never observed the condition it was waiting for:"
     echo "$OUT" | grep -a 'inconclusive' | sed 's/^/    /'
-    echo "  (this is a scheduling timeout, not a revocation defect — raise the budget or find"
-    echo "   out why the revoking process is not being scheduled)"
+    echo "  (a scheduling or resource outcome, not a containment defect — raise the budget, or"
+    echo "   find out why the process being waited for is not making progress)"
     exit 1
 fi
 

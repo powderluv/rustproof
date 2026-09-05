@@ -395,6 +395,36 @@ pub mod syserr {
     pub const FAULT: u64 = u64::MAX - 3;
 }
 
+/// Why a `SPAWN` was refused.
+///
+/// `SPAWN` returns the child's pid on success, so every failure has to be a value no pid can
+/// take — hence the top of the range. One sentinel for all of them is not enough: a probe
+/// asserting "a capability without WRITE cannot spawn" is satisfied just as well by an
+/// exhausted process table, so the refusal is consistent with the claim rather than evidence
+/// for it. Naming the reason is what makes it evidence.
+///
+/// `NO_CAP` deliberately keeps the historical `u64::MAX`, so a caller that tested for it was
+/// already asking the authority question and stays correct. Callers that only wanted "did
+/// this fail" must use [`spawnerr::failed`] — `== u64::MAX` now misses a resource refusal.
+pub mod spawnerr {
+    /// The capability named does not authorize spawning.
+    pub const NO_CAP: u64 = u64::MAX;
+    /// A capability was asked to be delegated that the caller does not hold, or the
+    /// delegation ledger is full.
+    pub const NO_DELEGATE: u64 = u64::MAX - 1;
+    /// The process table has no free slot.
+    pub const NO_SLOT: u64 = u64::MAX - 2;
+    /// The image could not be loaded (out of frames).
+    pub const NO_MEM: u64 = u64::MAX - 3;
+    /// Lowest value that is a failure rather than a pid.
+    pub const FIRST: u64 = NO_MEM;
+
+    /// Did this `SPAWN` fail, for any reason?
+    pub const fn failed(ret: u64) -> bool {
+        ret >= FIRST
+    }
+}
+
 /// GPU device info returned by `GET_INFO` (host contract).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[repr(C)]
@@ -534,5 +564,45 @@ mod tests {
         assert!(!CapRights::READ.contains(CapRights(CapRights::READ.0 | CapRights::WRITE.0)));
         assert!(CapRights::ALL.contains(CapRights::WRITE));
         assert!(!CapRights::WRITE.contains(CapRights::READ));
+    }
+
+    /// `failed` is a BOUND, and a bound is a claim about ONE value. Testing it from far
+    /// outside — pid 3 is not a failure, u64::MAX is — never asks the question. The values
+    /// that matter are the two either side of the edge.
+    #[test]
+    fn spawnerr_failed_is_exact_at_its_boundary() {
+        assert!(spawnerr::failed(spawnerr::FIRST));
+        assert!(
+            !spawnerr::failed(spawnerr::FIRST - 1),
+            "the value just below the failure range is a valid pid"
+        );
+        assert!(spawnerr::failed(u64::MAX));
+        assert!(!spawnerr::failed(0), "pid 0 is a pid");
+    }
+
+    /// Four distinct reasons, or the attribution they exist for is worthless: the whole point
+    /// is that "refused for lack of authority" and "the process table is full" stop reading
+    /// the same. Every one must also be a failure.
+    #[test]
+    fn spawnerr_reasons_are_distinct_and_all_are_failures() {
+        let all = [
+            spawnerr::NO_CAP,
+            spawnerr::NO_DELEGATE,
+            spawnerr::NO_SLOT,
+            spawnerr::NO_MEM,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            assert!(spawnerr::failed(*a), "reason {i} must count as a failure");
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "reasons {i} and {j} collide");
+                }
+            }
+        }
+        assert_eq!(
+            spawnerr::NO_CAP,
+            u64::MAX,
+            "NO_CAP keeps the historical sentinel so an old authority test stays correct"
+        );
     }
 }

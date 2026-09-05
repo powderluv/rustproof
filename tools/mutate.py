@@ -136,6 +136,15 @@ MUTATIONS = [
      "crates/vspace-riscv/src/lib.rs",
      "                if entry.is_leaf() {\n                    return Err(MapError::SuperpagePresent);",
      "                if false {\n                    return Err(MapError::SuperpagePresent);"),
+    # --- sixth expansion: SPAWN's refusal REASON. One sentinel made "refused for lack of
+    # --- authority" indistinguishable from "the process table is full", so every capability
+    # --- claim resting on a spawn refusal was consistent with itself rather than evidence.
+    ("abi: spawnerr::failed is off by one at its boundary", "crates/abi/src/lib.rs",
+     "        ret >= FIRST", "        ret > FIRST"),
+    ("abi: a spawn failure reason collides with another", "crates/abi/src/lib.rs",
+     "    pub const NO_SLOT: u64 = u64::MAX - 2;", "    pub const NO_SLOT: u64 = u64::MAX - 1;"),
+    ("abi: NO_CAP stops being the historical sentinel", "crates/abi/src/lib.rs",
+     "    pub const NO_CAP: u64 = u64::MAX;", "    pub const NO_CAP: u64 = u64::MAX - 4;"),
 ]
 
 

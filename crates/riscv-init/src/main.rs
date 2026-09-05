@@ -27,7 +27,7 @@
 //! the only pointers handed to the kernel are addresses of stack locals passed as
 //! syscall out-buffers, plus `&'static` bytes passed to DEBUG_WRITE.
 
-use abi::{syserr, sysno, CapId, GpuInfo, MapBarResp, REGION_QUOTA};
+use abi::{spawnerr, syserr, sysno, CapId, GpuInfo, MapBarResp, REGION_QUOTA};
 
 // ----------------------------------------------------------------- syscall stub
 //
@@ -588,7 +588,7 @@ fn compute(id: u64) -> ! {
         // the idle path has, which is how it went unexercised for this long.
         let helper = spawn_delegating(2, 6, 0b001);
         tag(id);
-        if helper == u64::MAX {
+        if spawnerr::failed(helper) {
             debug_write(b"irq: could NOT spawn the interrupt helper (bug)\n");
         } else {
             debug_write(b"irq: spawned an interrupt helper -> pid ");
@@ -638,7 +638,7 @@ fn compute(id: u64) -> ! {
         let reader = spawn_delegating(2, rcap, 0b001); // READ only
         let writer = spawn_delegating(2, mbox, 0b011); // READ|WRITE
         tag(id);
-        if reader == u64::MAX || writer == u64::MAX {
+        if spawnerr::failed(reader) || spawnerr::failed(writer) {
             debug_write(b"share: could not spawn the borrowers (bug)\n");
         } else {
             debug_write(b"share: lent one region READ-only and one READ-WRITE\n");
@@ -888,8 +888,16 @@ fn compute(id: u64) -> ! {
         debug_write(b"caps: region via WRITE-less Untyped ALLOWED (bug)\n");
     }
     tag(id);
-    if spawn(4) == u64::MAX {
+    // Three outcomes, not two. Refused for lack of authority is the claim; refused for a
+    // different reason (an exhausted process table) is NOT a violation and must not be
+    // reported as one; a pid coming back is the violation.
+    let s4 = spawn(4);
+    if s4 == spawnerr::NO_CAP {
         debug_write(b"caps: spawn via WRITE-less Untyped -> refused\n");
+    } else if spawnerr::failed(s4) {
+        debug_write(
+            b"caps: spawn refused, but not on authority, so nothing was tested (inconclusive)\n",
+        );
     } else {
         debug_write(b"caps: spawn via WRITE-less Untyped ALLOWED (bug)\n");
     }
@@ -974,7 +982,7 @@ fn compute(id: u64) -> ! {
         // faulting process. Printing the u64::MAX sentinel as a pid, as this used to, meant
         // a boot that silently tested four fewer things still said BOOT OK. On riscv it did
         // exactly that.
-        if late == u64::MAX {
+        if spawnerr::failed(late) {
             debug_write(b"late spawn into a recycled slot REFUSED -- no free process slot (bug)\n");
         } else {
             debug_write(b"late spawn into a recycled slot -> pid ");
@@ -1402,7 +1410,7 @@ fn child(id: u64) -> ! {
     if have {
         let g = spawn_delegating(0, 0, 0b111);
         tag(id);
-        if g == u64::MAX {
+        if g == spawnerr::NO_SLOT {
             debug_write(b"deleg: no free slot to pass it on\n");
         } else {
             debug_write(b"deleg: passed our cap on to pid ");
@@ -1518,13 +1526,21 @@ fn child(id: u64) -> ! {
         // EVERY failure — no authority, undeliverable delegation, full ledger, no free
         // process slot — so a refusal here is consistent with the revocation but not
         // attributable to it. Distinguishing them needs a distinct errno from the ABI.
+        let mut spawn0 = 0u64;
         tag(id);
         if !revoked {
             debug_write(
                 b"revoke: never observed the revoke, so SPAWN was untested (inconclusive)\n",
             );
-        } else if spawn(0) == u64::MAX {
+        } else if {
+            // Attempted only on this path: a spawn costs a process slot, and the branch
+            // above has not established the premise that would make spending one meaningful.
+            spawn0 = spawn(0);
+            spawn0 == spawnerr::NO_CAP
+        } {
             debug_write(b"revoke: the same revoked cap also refuses SPAWN (one story, not two)\n");
+        } else if spawnerr::failed(spawn0) {
+            debug_write(b"revoke: SPAWN refused, but not on authority, so nothing was tested (inconclusive)\n");
         } else {
             debug_write(b"revoke: SPAWN still allowed through a revoked cap (bug)\n");
         }
