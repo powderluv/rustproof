@@ -16,6 +16,7 @@ Usage:  tools/mutate.py            # run them all
         tools/mutate.py <substr>   # only mutations whose label contains <substr>
 """
 
+import os
 import signal
 import subprocess
 import sys
@@ -145,6 +146,20 @@ MUTATIONS = [
      "    pub const NO_SLOT: u64 = u64::MAX - 2;", "    pub const NO_SLOT: u64 = u64::MAX - 1;"),
     ("abi: NO_CAP stops being the historical sentinel", "crates/abi/src/lib.rs",
      "    pub const NO_CAP: u64 = u64::MAX;", "    pub const NO_CAP: u64 = u64::MAX - 4;"),
+    # --- seventh expansion: the KERNEL, whose containment behaviour lives behind a boot and
+    # --- was therefore outside this tool's reach entirely. These three use a rig as oracle.
+    ("kernel: SPAWN no longer requires WRITE on the minting capability",
+     "crates/kernel/src/lib.rs",
+     "                is_mint_source(s.cap_type) && s.rights.contains(abi::CapRights::WRITE)",
+     "                is_mint_source(s.cap_type)", "rig"),
+    ("kernel: a READ-only loan is mapped WRITABLE (rights amplification)",
+     "crates/kernel/src/lib.rs",
+     "    let perms = if rights.contains(abi::CapRights::WRITE) {",
+     "    let perms = if true {", "rig"),
+    ("kernel: an I/O page-table leaf ignores WRITE (a device gets more than granted)",
+     "crates/kernel/src/lib.rs",
+     "        if rights.contains(abi::CapRights::WRITE) {\n            pte |= IW;\n        }\n        pte\n    }",
+     "        pte |= IW;\n        pte\n    }", "rig-iommu"),
 ]
 
 
@@ -153,6 +168,30 @@ def run_suite() -> bool:
     r = subprocess.run(["bash", "tools/host-tests.sh"], cwd=ROOT,
                        capture_output=True, text=True)
     return r.returncode == 0
+
+
+# Oracles. The host suite cannot see the kernel: its containment behaviour lives behind a
+# boot, so until now the most security-critical component in the tree sat OUTSIDE the
+# standard this tool exists to enforce. A rig mutant costs ~30s against the suite's ~1s,
+# which is the whole reason to keep them a short, deliberate list rather than a sweep.
+RIGS = {
+    "rig": ("tools/run-qemu.sh", {}),
+    "rig-iommu": ("tools/run-qemu.sh", {"IOMMU": "1", "FIRMWARE": "1"}),
+    "rig-riscv": ("tools/run-qemu-riscv.sh", {}),
+}
+
+
+def run_rig(oracle: str) -> bool:
+    """True if the named rig PASSES (i.e. the mutant survived it)."""
+    script, extra = RIGS[oracle]
+    env = {**os.environ, **extra}
+    r = subprocess.run(["bash", script], cwd=ROOT, capture_output=True,
+                       text=True, env=env, timeout=300)
+    return r.returncode == 0
+
+
+def run_oracle(oracle: str) -> bool:
+    return run_suite() if oracle == "host" else run_rig(oracle)
 
 
 def main() -> int:
@@ -181,8 +220,19 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _unwind)
     signal.signal(signal.SIGINT, _unwind)
 
+    # Rig baselines are only worth their ~30s if a rig mutant is actually selected.
+    needed = {m[4] if len(m) > 4 else "host" for m in picked} - {"host"}
+    for oracle in sorted(needed):
+        print(f"baseline ({oracle}): ", end="", flush=True)
+        if not run_rig(oracle):
+            print("FAILS before any mutation — fix that first")
+            return 2
+        print("passes")
+
     survivors, stale = [], []
-    for label, rel, find, repl in picked:
+    for entry in picked:
+        label, rel, find, repl = entry[:4]
+        oracle = entry[4] if len(entry) > 4 else "host"
         path = ROOT / rel
         original = path.read_text()
         if original.count(find) != 1:
@@ -191,10 +241,11 @@ def main() -> int:
             continue
         path.write_text(original.replace(find, repl, 1))
         try:
-            survived = run_suite()
+            survived = run_oracle(oracle)
         finally:
             path.write_text(original)
-        print(f"  {'SURVIVED' if survived else 'killed  '} {label}")
+        tag = "" if oracle == "host" else f"  [{oracle}]"
+        print(f"  {'SURVIVED' if survived else 'killed  '} {label}{tag}")
         if survived:
             survivors.append(label)
 

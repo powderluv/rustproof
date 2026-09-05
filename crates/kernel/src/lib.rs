@@ -3034,13 +3034,14 @@ unsafe fn prove_containment<A: Arch>(
             if dom.map(iova, frame >> abi::PAGE_SHIFT, rights).is_err() {
                 return false;
             }
-            let mut pte = (frame & 0x000F_FFFF_FFFF_F000) | PR | LEAF;
-            if rights.contains(abi::CapRights::READ) {
-                pte |= IR;
-            }
-            if rights.contains(abi::CapRights::WRITE) {
-                pte |= IW;
-            }
+            // Build the entry with `iopte::leaf` — the SAME function MAP_DMA uses — rather
+            // than a copy of its logic. This closure used to reimplement it, so the
+            // "RIGHTS ENFORCED" gate below proved its property about the copy while the
+            // function a ring-3 process actually reaches went unexercised: a mutant that made
+            // `iopte::leaf` set IW unconditionally (every device gets WRITE, granted or not)
+            // survived the whole containment rig. A demo that does not run the production
+            // path is not evidence about the production path.
+            let pte = iopte::leaf(frame, rights);
             let idx = ((iova >> 12) & 0x1FF) as u64;
             core::ptr::write_volatile((l1.as_u64() + idx * 8) as *mut u64, pte);
             true

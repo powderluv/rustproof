@@ -21,7 +21,13 @@ jobs:
       # returned a constant and passed all 221 tests, and NO_CACHE could be zeroed with the suite
       # green. Both were found by accident. This mutates load-bearing predicates on purpose and
       # fails if the suite does not notice.
-      - name: Mutation sweep (the host suite must notice a broken predicate)
+      # The sweep now also uses the RIG as an oracle for kernel predicates. Those live behind
+      # a boot, so until this existed the most security-critical component in the tree sat
+      # outside the standard this step enforces -- and the first three kernel mutants found a
+      # gap: the containment demo proved its rights property about a COPY of the page-table
+      # logic while the function MAP_DMA actually calls went unexercised. Needs the QEMU
+      # installed above, which is why this step sits after it.
+      - name: Mutation sweep (host suite AND rig must notice a broken predicate)
         run: tools/mutate.py
 
       - name: Boot + ring-3 userland smoke
