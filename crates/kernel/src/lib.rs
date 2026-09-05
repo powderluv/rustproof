@@ -3160,6 +3160,16 @@ unsafe fn prove_containment<A: Arch>(
 
     // ---- withdraw: the model AND the hardware, in that order ----
     //
+    // This clears entries DIRECTLY rather than calling `withdraw_region_from_domain`, which is
+    // what UNMAP_DMA and process exit use. That is the same shape as the `leaf` closure above,
+    // and it was worth checking rather than assuming: mutants covering the production
+    // withdrawal path — `clear_io_mappings_in` leaving the entry present, the region
+    // withdrawal skipping the hardware, exit withdrawing nothing at all — are all KILLED, by
+    // the boot's walk of the real I/O page table rather than by the gate below. So the
+    // production path is covered; it is just not covered HERE. Kept direct because this
+    // demo revokes a single frame to make one property visible, where the production
+    // function works a whole region at a time.
+    //
     // The proof's grants are not a standing authority — the device has no business reaching
     // those frames afterwards, and the boot's own consistency check (grants must equal live
     // DMA pages) would otherwise fail, correctly, because two grants would be outstanding with
